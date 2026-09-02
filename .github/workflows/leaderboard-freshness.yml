@@ -82,6 +82,24 @@ jobs:
         run: |
           set -euo pipefail
           title="⚠️ Leaderboard snapshot stale"
+
+          # Repos with Issues disabled fail every gh issue call. Detect once
+          # and degrade to a step-summary warning instead of a red build.
+          if ! gh issue list --state open --limit 1 >/dev/null 2>&1; then
+            echo "::warning::Repository Issues are disabled; cannot file stale-snapshot alert. Enable Issues in repo Settings → General → Features."
+            {
+              echo "### Leaderboard freshness alert (Issues disabled)"
+              echo
+              echo "Repository Issues are disabled, so the watchdog could not file or update an alert issue."
+              echo "Enable Issues in repo Settings → General → Features to restore alerting."
+              echo
+              echo "Detected stale snapshots:"
+              echo
+              echo -e "$BODY"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           body=$(printf 'The leaderboard freshness watchdog detected stale snapshot(s):\n\n%b\nRun: %s/%s/actions/runs/%s\n\n_This is auto-generated. It closes itself once freshness recovers._' \
             "$BODY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
@@ -100,6 +118,11 @@ jobs:
         run: |
           set -euo pipefail
           title="⚠️ Leaderboard snapshot stale"
+          # If Issues are disabled there is nothing to close; skip silently.
+          if ! gh issue list --state open --limit 1 >/dev/null 2>&1; then
+            echo "::notice::Repository Issues are disabled; nothing to auto-close."
+            exit 0
+          fi
           gh issue list --state open --search "$title in:title" --json number --jq '.[].number' | while read -r n; do
             [ -n "$n" ] && gh issue close "$n" --comment "Freshness recovered — all periods within budget. Auto-closing."
           done
