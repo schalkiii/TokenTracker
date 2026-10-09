@@ -7,14 +7,21 @@ window, and keeps a tray icon alive.
 
 Two distribution paths are supported:
 
-- **AppImage** — the released artifact, built by CI. Self-contained (it carries
-  its own Node runtime and the built dashboard) and runs on any reasonably
-  current glibc distro without a package manager.
+- **Release packages** — an **AppImage**, a **`.deb`** and an **`.rpm`**, built
+  by CI and attached to every release.
 - **Arch package** — a `PKGBUILD` for building from a local checkout.
 
-## Install (AppImage)
+## Install
 
-Download `TokenTracker-linux-x86_64.AppImage` from the
+All three release packages carry the same embedded Node runtime and dashboard.
+
+### AppImage
+
+Self-contained — besides the Node runtime and the built dashboard it carries
+GTK3, WebKitGTK (including the `WebKitWebProcess` / `WebKitNetworkProcess`
+helpers) and appindicator, so it runs on any reasonably current glibc distro
+with no package manager and no GUI dependencies. Download
+`TokenTracker-linux-x86_64.AppImage` from the
 [latest release](https://github.com/xiufengsun/TokenTracker/releases/latest),
 then:
 
@@ -31,6 +38,28 @@ run without FUSE at all:
 ./TokenTracker-linux-x86_64.AppImage --appimage-extract
 ./squashfs-root/AppRun
 ```
+
+### Debian / Ubuntu (apt)
+
+```bash
+sudo apt install ./TokenTracker-linux-x86_64.deb
+```
+
+Needs `libappindicator3-1`, which lives in Ubuntu's **universe** component and
+is absent from Debian 12; use the AppImage there, which carries its own copy.
+
+### Fedora / RHEL (dnf)
+
+```bash
+sudo dnf install ./TokenTracker-linux-x86_64.rpm
+```
+
+The `.deb` and `.rpm` link against the system GTK/WebKit rather than bundling
+them — ~55MB against the AppImage's ~120MB, at the cost of a real dependency
+list. The `.deb` declares `libwebkit2gtk-4.1-0`, `libgtk-3-0`,
+`libayatana-appindicator3-1` and `libappindicator3-1`; the `.rpm` requires the
+equivalent `libwebkit2gtk-4.1.so.0`, `libgtk-3.so.0` and
+`libappindicator3.so.1`.
 
 ## Build the Arch package
 
@@ -91,6 +120,36 @@ Until the extension is installed, closing the window hides the app with no way t
 get it back from the tray — quit it from the launcher or with `pkill
 tokentracker-linux`.
 
+### Dashboard zoom
+
+The dashboard is a web UI, so everything in it is sized in CSS pixels and does
+not vary with the desktop's own scaling. On a display running at 125% or 150% it
+reads smaller than the native windows around it.
+
+Pick a level for the machine once — either through `TOKENTRACKER_UI_ZOOM` or with
+the hotkeys, which now remember what they apply:
+
+```bash
+TOKENTRACKER_UI_ZOOM=1.5 tokentracker-linux
+```
+
+```ini
+# ~/.local/share/applications/tokentracker.desktop
+Exec=env TOKENTRACKER_UI_ZOOM=1.5 tokentracker-linux %u
+```
+
+| Gesture | Effect |
+|---|---|
+| `Ctrl` + `=` or `Ctrl` + `+` | Zoom in one step (`0.1`) |
+| `Ctrl` + `-` | Zoom out one step (`0.1`) |
+| `Ctrl` + `0` | Back to the level this launch started at |
+| `Ctrl` + wheel | Same as `+` / `-` |
+
+The level lives in `${XDG_CONFIG_HOME:-$HOME/.config}/tokentracker/ui-zoom` and
+is applied on the next launch; `TOKENTRACKER_UI_ZOOM` takes precedence over it.
+Levels are clamped to `0.5`–`3.0`, and a value that cannot be parsed is ignored
+instead of being treated as zero.
+
 ### The window is blank, or the app exits immediately
 
 WebKitGTK renders through DMA-BUF by default. On some Wayland setups — most
@@ -146,10 +205,14 @@ single `server.log.1` generation.
 
 ```bash
 npm ci --prefix TokenTrackerLinux
-npm run dashboard:build                        # from the repo root
+TOKENTRACKER_BUILD_PET=1 npm run dashboard:build   # from the repo root; includes pet.html
 npm --prefix TokenTrackerLinux run bundle:node # stages EmbeddedServer/
 npm --prefix TokenTrackerLinux run dev
 ```
+
+`TOKENTRACKER_BUILD_PET=1` adds `pet.html`, the page the floating desktop pet
+loads (tray → **Show Pet**, or the dashboard's Pet page). Without it the pet
+window has nothing to show.
 
 `bundle:node` must run before any bundling build: `tauri.bundle.conf.json`
 declares `EmbeddedServer` as a bundle resource and `tauri-build` fails on a

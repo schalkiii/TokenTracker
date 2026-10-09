@@ -1,7 +1,8 @@
 /**
  * Bridge helpers for talking to the macOS TokenTrackerBar host via WKWebView's
- * `window.webkit.messageHandlers.nativeBridge`. The native side dispatches a
- * `native:settings` CustomEvent on `window` whenever state changes.
+ * `window.webkit.messageHandlers.nativeBridge` or the Windows WebView2 host via
+ * `window.chrome.webview`. The native side dispatches a `native:settings`
+ * CustomEvent on `window` whenever state changes.
  *
  * Safe no-ops in browser/cloud mode.
  */
@@ -75,37 +76,79 @@ export function isNativeWindowsApp() {
   return Boolean(window.chrome?.webview) && isNativeApp();
 }
 
+/**
+ * True when running inside the Linux Tauri app. Tauri injects
+ * `__TAURI_INTERNALS__` into every webview it hosts, and the Linux app loads
+ * the dashboard without `?app=1`, so this can't key off `isNativeApp()`.
+ */
+export function isNativeLinuxApp() {
+  if (typeof window === "undefined") return false;
+  return Boolean(window.__TAURI_INTERNALS__);
+}
+
+/**
+ * Set by the Linux app (`desktop.rs`) on GNOME Shell when the top-bar
+ * extension is installed but not turned on.
+ */
+export function canOfferTopBarExtension() {
+  if (typeof window === "undefined") return false;
+  return window.__TOKENTRACKER_OFFER_TOP_BAR__ === true;
+}
+
+/**
+ * The handler that opens OAuth in the system browser, or null in a normal
+ * browser. macOS and Windows expose `webkit.messageHandlers.nativeOAuth`. The
+ * Linux shell's copy of it may never attach to WebKitGTK's host object, so
+ * there the Tauri command is called directly.
+ */
+export function getNativeOAuthBridge() {
+  if (typeof window === "undefined") return null;
+  const handler = window.webkit?.messageHandlers?.nativeOAuth;
+  if (handler) return handler;
+  const invoke = window.__TAURI_INTERNALS__?.invoke;
+  if (typeof invoke !== "function") return null;
+  return { postMessage: (url) => invoke("open_oauth", { url }) };
+}
+
 function getHandler() {
   if (typeof window === "undefined") return null;
   return window.webkit?.messageHandlers?.nativeBridge ?? null;
 }
 
 export function isBridgeAvailable() {
-  return Boolean(getHandler());
+  if (typeof window === "undefined") return false;
+  return Boolean(getHandler() || window.chrome?.webview);
 }
 
 function post(message) {
   const handler = getHandler();
-  if (!handler) return false;
-  try {
-    handler.postMessage(message);
-    return true;
-  } catch (err) {
-    console.warn("[tokentracker] nativeBridge post failed:", err);
-    return false;
+  if (handler) {
+    try {
+      handler.postMessage(message);
+      return true;
+    } catch (err) {
+      console.warn("[tokentracker] nativeBridge post failed:", err);
+      return false;
+    }
   }
+
+  // WebView2 exposes a single JSON message channel instead of WKWebView's
+  // messageHandlers namespace. Keep the public bridge API identical so native
+  // settings work on both desktop platforms.
+  if (typeof window !== "undefined" && window.chrome?.webview) {
+    try {
+      window.chrome.webview.postMessage(typeof message === "string" ? message : JSON.stringify(message));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /** Post a generic message to either native host. */
 export function postNativeMessage(message) {
-  if (post(message)) return true;
-  if (typeof window === "undefined" || !window.chrome?.webview) return false;
-  try {
-    window.chrome.webview.postMessage(JSON.stringify(message));
-    return true;
-  } catch {
-    return false;
-  }
+  return post(message);
 }
 
 export function notifyNative({ title, body, id }) {
@@ -155,10 +198,12 @@ export function onNativeSettings(handler) {
   return () => window.removeEventListener("native:settings", listener);
 }
 
-/** Desktop-pet settings are supported by both the macOS and Windows native hosts. */
+/** Desktop-pet settings are supported by the macOS, Windows and Linux native hosts. */
 export function isPetBridgeAvailable() {
   if (typeof window === "undefined") return false;
-  return Boolean(window.webkit?.messageHandlers?.nativeBridge || window.chrome?.webview);
+  return Boolean(
+    window.webkit?.messageHandlers?.nativeBridge || window.chrome?.webview || isNativeLinuxApp(),
+  );
 }
 
 function postPetMessage(message) {
@@ -173,6 +218,13 @@ function postPetMessage(message) {
   if (window.chrome?.webview) {
     try {
       window.chrome.webview.postMessage(JSON.stringify(message));
+      return true;
+    } catch { return false; }
+  }
+  // Linux Tauri host: replies arrive as `native:petSettings` events, same as the others.
+  if (isNativeLinuxApp()) {
+    try {
+      window.__TAURI_INTERNALS__.invoke("pet_bridge", { message })?.catch?.(() => {});
       return true;
     } catch { return false; }
   }
