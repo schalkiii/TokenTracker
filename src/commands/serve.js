@@ -381,7 +381,25 @@ function startNativeBackgroundSync({
 // `-sTCP:LISTEN` matters: `lsof -i tcp:<port>` matches any socket with that
 // port as its LOCAL *or* REMOTE endpoint, so without it a browser merely
 // connected to the dashboard is reported alongside the server that owns it.
+//
+// Windows has no lsof/ps. Spawning them there only produces ENOENT — and under
+// endpoint-security filter drivers (observed with Sangfor Endpoint Secure; see
+// docs/ops/sangfor-endpoint-interference.md) the failed spawn can wedge
+// execFileSync indefinitely, freezing `serve` before it binds its port. Use
+// the native Windows tools instead; real binaries do not hit that wedge path.
 function findPidOnPort(port) {
+  if (process.platform === "win32") {
+    try {
+      const out = cp.execFileSync("netstat", ["-ano", "-p", "tcp"], {
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true,
+      });
+      return parseNetstatListeningPids(out, port);
+    } catch (_e) {
+      return [];
+    }
+  }
   try {
     const out = cp.execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], {
       encoding: "utf8",
@@ -394,10 +412,46 @@ function findPidOnPort(port) {
   }
 }
 
+// Pure parser for `netstat -ano -p tcp` output, kept separate so it can be
+// unit-tested on any platform. Local-address forms covered: IPv4
+// `127.0.0.1:7681` and IPv6 `[::1]:7681`. Malformed lines are skipped.
+function parseNetstatListeningPids(netstatOutput, port) {
+  const wanted = Number(port);
+  if (!Number.isInteger(wanted) || wanted <= 0) return [];
+  const pids = [];
+  for (const line of String(netstatOutput || "").split(/\r?\n/)) {
+    const match = /^\s*TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/.exec(line);
+    if (match && Number(match[2]) === wanted) {
+      const pid = Number(match[3]);
+      if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+    }
+  }
+  return [...new Set(pids)];
+}
+
 function readProcessCommand(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return "";
+  if (process.platform === "win32") {
+    try {
+      return cp
+        .execFileSync(
+          "powershell",
+          ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId=${numericPid}').CommandLine`],
+          {
+            encoding: "utf8",
+            timeout: 5000,
+            windowsHide: true,
+          },
+        )
+        .trim();
+    } catch (_e) {
+      return "";
+    }
+  }
   try {
     return cp
-      .execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+      .execFileSync("ps", ["-p", String(numericPid), "-o", "command="], {
         encoding: "utf8",
         timeout: 5000,
       })
@@ -786,6 +840,7 @@ function parseArgs(argv, env = process.env) {
 
 module.exports = {
   cmdServe,
+  parseNetstatListeningPids,
   buildPortInUseHint,
   NPM_PACKAGE_NAME,
   LOCAL_BIND_HOST,

@@ -8,6 +8,7 @@ const { cmdServe } = require("./commands/serve");
 const { cmdDeviceLogin } = require("./commands/device-login");
 const { cmdWrapped } = require("./commands/wrapped");
 const { cmdSessions } = require("./commands/sessions");
+const { cmdWebdav } = require("./commands/webdav");
 
 async function run(argv) {
   // Best-effort Sentry init (no-op without DSN / when telemetry opted out).
@@ -70,6 +71,9 @@ async function run(argv) {
     case "sessions":
       await cmdSessions(rest);
       return;
+    case "webdav":
+      await cmdWebdav(rest);
+      return;
     default:
       throw new Error(`Unknown command: ${command}`);
   }
@@ -94,6 +98,7 @@ function printHelp() {
       "  npx tokentracker [--debug] device-login [--json] [--base-url <url>]",
       "  npx tokentracker [--debug] wrapped [--year 2026] [--json]",
       "  npx tokentracker sessions [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--format json|csv] [--out file] [--refresh] [--no-git]",
+      "  npx tokentracker webdav [config|push|pull|status|ui]   WebDAV backup & cross-machine sync",
       "",
       "Notes:",
       "  - init: consent first, local setup next, browser sign-in last.",

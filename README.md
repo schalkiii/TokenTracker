@@ -108,6 +108,7 @@ tokentracker status       # Check hook status
 tokentracker status --json     # Machine-readable summary (pipe to jq, ingest from AI agents)
 tokentracker status --light    # Plain ASCII table (CI / SSH, no spinner)
 tokentracker doctor       # Health check
+tokentracker webdav       # WebDAV backup & cross-machine sync (config/push/pull/status/ui)
 ```
 
 ### 🍺 Homebrew (macOS)
@@ -396,6 +397,57 @@ In the local dashboard, open **Settings → App → Local data**. Export usage o
 Preview totals and device contributions follow the dashboard's current display metric; the original counters remain in the snapshot. Context breakdown is available with this device selected. Project, session and outcome analyses remain local to this computer, with a scope notice when offline sources are present.
 
 A newer complete snapshot replaces that computer's previous snapshot; importing the same file again does not add usage. Exports contain only this computer's retained device-level history, including token counts, tools, models, time buckets and its device label. They exclude imported sources, credentials, prompts, project/session data, and account-level Cursor/TRAE CN usage. Imported snapshots stay local and never enter the cloud upload queue. Transfer files only between computers with independent histories: copied sessions cannot be deduplicated from aggregated usage. Legacy `tokentracker-sync` synthetic queues require separate migration. Files are limited to 5 MiB, with up to 32 imported computers.
+
+### WebDAV backup & multi-machine sync
+
+The manual export/import flow above is automated by the `tokentracker webdav` command over any WebDAV provider (坚果云, Nextcloud, Synology DSM, Alist, …). Each machine pushes its own snapshot to `<dav-url>/tokentracker/snapshots/<machine-id>.json` and pulls the other machines' files — one file per machine means no locks and no merge conflicts, the dashboard's own import guards (`outdated` / `unchanged` / sequence checks) make every pull idempotent, and imported snapshots still never enter the cloud upload queue. It complements cloud sync rather than replacing it: cross-machine history keeps flowing when the free tier's single-machine limit or a lapsed membership pauses cloud uploads.
+
+Only the lowest-common WebDAV verbs are used (`PUT` / `GET` / `MKCOL` / `PROPFIND`). Pushes are gated by a row-content hash — an idle machine uploads nothing — and pulls by `ETag`, so metered providers are fine (坚果云's free tier allows ~1 GB of uploads per month; a snapshot every couple of hours fits easily, and `-IntervalHours` can stretch it further).
+
+**Prerequisites (on every machine):**
+
+- This repo checked out, Node ≥ 20, and the local dashboard running (v1.5.3+ — the command drives its `POST /api/local-usage` API).
+- A WebDAV account over HTTPS. For 坚果云, generate an **application password** under 账户信息 → 安全选项 — the account login password will not work.
+
+**1. Configure (once per machine):**
+
+```powershell
+node bin\tracker.js webdav config --url https://dav.example.com/dav --username <user> --password <app-password>
+# optional at-rest encryption (AES-256-GCM) — the same passphrase on every machine:
+node bin\tracker.js webdav config --encrypt <passphrase>
+# or fill the form in the local settings page:
+node bin\tracker.js webdav ui
+```
+
+Credentials live in `~/.tokentracker/webdav.json` (mode 0600); `TT_WEBDAV_URL` / `TT_WEBDAV_USERNAME` / `TT_WEBDAV_PASSWORD` / `TT_WEBDAV_ENCRYPT` override them for headless use. Run `webdav push` and `webdav pull` once by hand and check the dashboard's device selector — the other computer should appear after the pull. Your own snapshot answers `self_import` on every pull; that is the expected skip, not an error.
+
+**2. Automate (Windows):**
+
+```powershell
+powershell -File scripts\setup-webdav-sync-task.ps1 -StartHour 10 -IntervalHours 2
+```
+
+This registers the hidden `TokenTrackerWebDavSync` scheduled task (catches up after sleep/reboot, never overlaps itself) and logs to `~/.tokentracker/webdav-sync.log`. Stagger `-StartHour` between the machines (e.g. 10 on one, 11 on the other) so they take turns. On macOS/Linux a cron line does the same:
+
+```
+0 */2 * * * cd /path/to/TokenTracker && node bin/tracker.js webdav push && node bin/tracker.js webdav pull
+```
+
+**3. Optional — free-tier cloud rotation.** The cloud free tier keeps a single active machine per account. `scripts/setup-cloud-rotate-task.ps1` lets two machines take turns uploading instead of blocking each other:
+
+```powershell
+powershell -File scripts\setup-cloud-rotate-task.ps1 -StartHour 12
+```
+
+Every hour the task first honors the local daily upload window, then swaps the cloud's active device through the billing API and drains the queue. A deterministic per-hostname jitter (≤15 min), an account-wide ~20 h backoff after any `429`, and a graceful no-op when the swap race is lost keep the two machines alternating rather than thrashing. Give the two machines different `-StartHour` values here as well.
+
+**Troubleshooting**
+
+- `401` on every request — almost always the wrong password kind; providers like 坚果云 require an application password, not the login password.
+- Toggled the `--encrypt` passphrase — delete `~/.tokentracker/webdav.state.json` before the next push, or the content-hash gate will keep seeing "unchanged rows" and never replace the remote file written in the other format.
+- `404` on `/api/local-usage` — the running dashboard predates v1.5.3; update it first.
+- A quiet machine uploads nothing — by design; `webdav status` shows the gate state.
+- Corporate endpoint-security software can swallow node output or encrypt files on disk — see [docs/ops/sangfor-endpoint-interference.md](docs/ops/sangfor-endpoint-interference.md).
 
 ### 🐧 Windows Subsystem for Linux (WSL) Auto-Discovery
 
