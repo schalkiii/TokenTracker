@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
+const { fetchZcodeResetCredits } = require("./zcode-reset-credits");
 
 const DEFAULT_BILLING_BASE_URL = "https://zcode.z.ai/api/v1/zcode-plan";
 const DEFAULT_ZAI_MONITOR_BASE_URL = "https://api.z.ai";
@@ -9,6 +10,10 @@ const DEFAULT_BIGMODEL_MONITOR_BASE_URL = "https://bigmodel.cn";
 const ZCODE_MONITOR_QUOTA_PATH = "/api/monitor/usage/quota/limit";
 const DEFAULT_ZCODE_APP_VERSION = "3.2.5";
 const DEFAULT_ZCODE_LOG_FALLBACK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const ZCODE_LIMITS_CACHE_FILE = "zcode-usage-limits-cache.json";
+// Windows without a usable reset_at cannot be checked against a quota rollover,
+// so they are only served while the snapshot is young enough to trust.
+const ZCODE_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS = 12 * 60 * 60 * 1000;
 
 function resolveZcodeHome({ home, env = process.env } = {}) {
   if (typeof env.TOKENTRACKER_ZCODE_HOME === "string" && env.TOKENTRACKER_ZCODE_HOME.trim()) {
@@ -150,6 +155,16 @@ function loadZcodeSelectedPlans({ home, env } = {}) {
 }
 
 /**
+ * Plan class ("start" | "coding") a plan id like "start-plan" or
+ * "individual-coding-plan" serves; null for anything else. Per-account
+ * spellings (`individual-`/`team-coding-plan`) and the builtin
+ * `coding-plan` both serve the same coding plan.
+ */
+function zcodePlanKindFromPlanId(planId) {
+  return /coding-plan$/.test(planId) ? "coding" : planId === "start-plan" ? "start" : null;
+}
+
+/**
  * ZCode 3.14+ records the chosen plan per family as `providerFamilyConnectionSelections`
  * (`{ zai: { kind: "individual-coding-plan" } }`) instead of `modelProviderFamilySelectedKeys`.
  * Team scope for these selections lives on the account credential, not here.
@@ -160,7 +175,7 @@ function loadZcodeConnectionSelectedPlans(selections, domain) {
   const out = [];
   for (const family of families) {
     const kind = typeof selections[family]?.kind === "string" ? selections[family].kind : "";
-    const planKind = /coding-plan$/.test(kind) ? "coding" : kind === "start-plan" ? "start" : null;
+    const planKind = zcodePlanKindFromPlanId(kind);
     if (!planKind) continue;
     const providerKey = `builtin:${family}-${planKind}-plan`;
     if (out.some((plan) => plan.providerKey === providerKey)) continue;
@@ -248,14 +263,15 @@ function resolveZcodeCredentialAuth(providerKey, { home, env } = {}) {
  *   account-provider:coding-plan:account:<family>-individual-coding-plan:account:<id>:api-key
  *   account-provider:team:<providerId>:<productId>:<orgId>:<projectId>:account:<id>:api-key
  * Team segments are URI-encoded by ZCode. Start-plan balances use the zcodejwttoken instead.
- * @returns {{ providerKey: string, teamContext: { organizationId: string, projectId: string } | null } | null}
+ * @returns {{ providerKey: string, accountId: string, teamContext: { organizationId: string, projectId: string } | null } | null}
  */
 function parseZcodeAccountProviderCredentialName(name) {
-  const match = typeof name === "string" ? name.match(/^account-provider:(.+):account:[^:]+:api-key$/) : null;
+  const match = typeof name === "string" ? name.match(/^account-provider:(.+):account:([^:]+):api-key$/) : null;
   if (!match) return null;
   const scope = match[1];
+  const accountId = match[2];
   const individual = scope.match(/^coding-plan:account:(bigmodel|zai)-individual-coding-plan$/);
-  if (individual) return { providerKey: `builtin:${individual[1]}-coding-plan`, teamContext: null };
+  if (individual) return { providerKey: `builtin:${individual[1]}-coding-plan`, accountId, teamContext: null };
   if (!scope.startsWith("team:")) return null;
   const parts = scope.slice("team:".length).split(":");
   if (parts.length !== 4) return null;
@@ -263,7 +279,72 @@ function parseZcodeAccountProviderCredentialName(name) {
     const [providerId, productId, organizationId, projectId] = parts.map((part) => decodeURIComponent(part).trim());
     const team = providerId.match(/^account:(bigmodel|zai)-team-coding-plan$/);
     if (!team || !productId || !organizationId || !projectId) return null;
-    return { providerKey: `builtin:${team[1]}-coding-plan`, teamContext: { organizationId, projectId } };
+    return { providerKey: `builtin:${team[1]}-coding-plan`, accountId, teamContext: { organizationId, projectId } };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Region ("bigmodel" | "zai") a built-in plan provider belongs to. */
+function zcodeProviderFamily(providerKey) {
+  return providerKey === "builtin:zai-coding-plan" || providerKey === "builtin:zai-start-plan" ? "zai" : "bigmodel";
+}
+
+/**
+ * Region ("bigmodel" | "zai") for any ZCode provider id, or null when the id
+ * names neither region. Covers the built-in plan keys and the 3.14+ per-account
+ * ids ZCode writes into its own logs (`account:<family>-<plan>…`).
+ * @returns {"bigmodel" | "zai" | null}
+ */
+function zcodeRegionFromProviderId(providerKey) {
+  const match = typeof providerKey === "string" ? providerKey.match(/^(?:builtin|account):(bigmodel|zai)-/) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Plan class ("start" | "coding") for any ZCode provider id, or null when the
+ * id names no known plan. Mirrors {@link zcodeRegionFromProviderId}: covers the
+ * built-in plan keys and the 3.14+ per-account ids ZCode writes into its own
+ * logs (`account:<family>-<plan>…`).
+ * @returns {"start" | "coding" | null}
+ */
+function zcodePlanKindFromProviderId(providerKey) {
+  const match = typeof providerKey === "string"
+    ? providerKey.match(/^(?:builtin|account):(bigmodel|zai)-(.+)$/)
+    : null;
+  return match ? zcodePlanKindFromPlanId(match[2]) : null;
+}
+
+/**
+ * Region whose plan should be served first. The model settings' domain is the
+ * region the user actually picked, so it wins; the OAuth login region only
+ * backs installs that never recorded a domain (API-key-only setups).
+ */
+function loadZcodeActiveRegion({ home, env } = {}) {
+  try {
+    const settingPath = path.join(resolveZcodeHome({ home, env }), "v2", "setting.json");
+    if (fs.existsSync(settingPath)) {
+      const setting = JSON.parse(fs.readFileSync(settingPath, "utf8"));
+      const domain = typeof setting?.providerFamilyDomain === "string" ? setting.providerFamilyDomain.trim() : "";
+      if (domain === "bigmodel" || domain === "zai") return domain;
+    }
+  } catch (_error) {
+    // Fall through to the login region below.
+  }
+  const active = loadZcodeActiveProvider({ home, env });
+  return active === "bigmodel" || active === "zai" ? active : "";
+}
+
+/**
+ * Account id of the signed-in login for a region, from `oauth:<family>:user_info`.
+ * Reset cards and Start Plan grants are personal to this login, so their
+ * credentials may only ride along with quota keys that provably share it.
+ */
+function loadZcodeLoginAccountId(family, { home, env } = {}) {
+  const raw = loadZcodeCredential(`oauth:${family}:user_info`, { home, env });
+  try {
+    const id = JSON.parse(raw)?.id;
+    return typeof id === "string" && id.trim() ? id.trim() : null;
   } catch (_error) {
     return null;
   }
@@ -279,7 +360,7 @@ function loadZcodeAccountProviderAuths({ home, env } = {}) {
     const decrypted = decryptZcodeCredentialValue(credentials[name], { home, env });
     const apiKey = typeof decrypted === "string" ? decrypted.trim() : "";
     if (!apiKey) continue;
-    (out[parsed.providerKey] ||= []).push({ apiKey, teamContext: parsed.teamContext });
+    (out[parsed.providerKey] ||= []).push({ apiKey, accountId: parsed.accountId, teamContext: parsed.teamContext });
   }
   return out;
 }
@@ -346,8 +427,11 @@ function resolveZcodeProviderQuotaUrl(providerKey, provider, env = process.env) 
 
 /**
  * Build quota/billing candidates from enabled providers and their existing keys.
- * Selected plans take precedence; team scope stays attached to its own provider.
- * ZCode 3.14+ dropped v2/config.json: there, candidates come from credentials.json
+ * Coding plans precede promotional Start Plan grants, and within each plan kind
+ * the active region's providers come first so switching regions never keeps
+ * serving the previously saved other-region plan. Selected plans take
+ * precedence; team scope stays attached to its own provider. ZCode 3.14+
+ * dropped v2/config.json: there, candidates come from credentials.json
  * alone (the active family's zcodejwttoken for start plans, per-account coding-plan keys).
  */
 function loadZcodeAuthCandidates({ home, env } = {}) {
@@ -358,8 +442,11 @@ function loadZcodeAuthCandidates({ home, env } = {}) {
     const config = hasConfig ? JSON.parse(fs.readFileSync(configPath, "utf8")) : {};
     if (!config || typeof config !== "object") return [];
     const providers = config.provider || {};
-    // Per-account keys are a 3.14+ concept; a legacy config.json stays the only key source there.
-    const accountAuths = hasConfig ? {} : loadZcodeAccountProviderAuths({ home, env });
+    // Per-account keys are a 3.14+ concept; a legacy config.json stays the only
+    // quota-key source there. The account keys are still read in mixed layouts
+    // (config.json + newer credentials.json) purely to prove key ownership.
+    const accountAuths = loadZcodeAccountProviderAuths({ home, env });
+    const accountAuthsAsKeys = hasConfig ? {} : accountAuths;
     const defaultCandidates = [
       "builtin:bigmodel-start-plan",
       "builtin:zai-start-plan",
@@ -372,11 +459,16 @@ function loadZcodeAuthCandidates({ home, env } = {}) {
     const selectedCandidates = selectedPlans.map((plan) => plan.providerKey)
       .filter((key) => defaultCandidates.includes(key));
     const availableCandidates = defaultCandidates.filter((key) => availability?.[key]?.status === "available");
+    const activeFamily = loadZcodeActiveRegion({ home, env });
+    const regionRank = (key) => activeFamily && zcodeProviderFamily(key) === activeFamily ? 0 : 1;
     const candidates = [
       ...selectedCandidates,
       ...availableCandidates,
       ...defaultCandidates,
-    ].filter((key, index, all) => all.indexOf(key) === index);
+    ].filter((key, index, all) => all.indexOf(key) === index)
+      .sort((a, b) =>
+        (Number(isZcodeCodingPlanProvider(b)) - Number(isZcodeCodingPlanProvider(a)))
+        || (regionRank(a) - regionRank(b)));
     const auths = [];
     for (const key of candidates) {
       const configured = providers[key];
@@ -389,15 +481,36 @@ function loadZcodeAuthCandidates({ home, env } = {}) {
       const teamContext = selectedPlans.find((plan) => plan.providerKey === key)?.teamContext;
       // Legacy layouts only trust the shared JWT for providers config.json still lists.
       const credentialApiKey = provider || !hasConfig ? resolveZcodeCredentialAuth(key, { home, env }) : "";
-      const accountEntries = (accountAuths[key] || []).map((entry) => ({
-        apiKey: entry.apiKey,
-        authSource: "credential:account-provider",
-        teamContext: entry.teamContext,
-      }));
+      // A config.json key that byte-equals a per-account credential inherits
+      // that credential's account identity, so ownership stays provable for
+      // keys the ZCode app wrote into config.json for the current login.
+      const owningAccount = Object.values(accountAuths).flat()
+        .find((entry) => entry.apiKey === apiKey) || null;
+      // Leftover keys from previously signed-in accounts stay as fallbacks but
+      // never outrank the current login's key, so the primary window cannot
+      // show account A's quota while login-scoped extras show account B's.
+      const family = zcodeProviderFamily(key);
+      const loginAccountId = loadZcodeLoginAccountId(family, { home, env });
+      const accountEntries = (accountAuthsAsKeys[key] || [])
+        .slice()
+        .sort((a, b) => (loginAccountId
+          ? Number(a.accountId !== loginAccountId) - Number(b.accountId !== loginAccountId)
+          : 0))
+        .map((entry) => ({
+          apiKey: entry.apiKey,
+          authSource: "credential:account-provider",
+          teamContext: entry.teamContext,
+          accountId: entry.accountId,
+        }));
       const authEntries = [
         credentialApiKey ? { apiKey: credentialApiKey, authSource: "credential:zcodejwttoken", teamContext } : null,
         ...accountEntries,
-        apiKey ? { apiKey, authSource: "provider:config", teamContext } : null,
+        apiKey ? {
+          apiKey,
+          authSource: "provider:config",
+          teamContext,
+          ...(owningAccount ? { accountId: owningAccount.accountId } : {}),
+        } : null,
       ].filter(Boolean);
       const seenKeys = new Set();
       for (const entry of authEntries) {
@@ -412,6 +525,7 @@ function loadZcodeAuthCandidates({ home, env } = {}) {
           billingBaseUrl,
           quotaUrl,
           ...(entry.teamContext ? { teamContext: entry.teamContext } : {}),
+          ...(entry.accountId ? { accountId: entry.accountId } : {}),
           availability: availability?.[key]?.status || null,
         });
       }
@@ -599,7 +713,7 @@ function normalizeZcodeBalanceResponse(body) {
   };
 }
 
-async function fetchZcodeBilling(apiKey, { fetchImpl = fetch, baseUrl, env, home } = {}) {
+async function fetchZcodeBilling(apiKey, { fetchImpl = fetch, baseUrl, env, home, signal } = {}) {
   const root = (baseUrl || resolveZcodeBillingBaseUrl(env)).replace(/\/$/, "");
   const url = new URL(`${root}/billing/balance`);
   const appVersion = resolveZcodeAppVersion({ home, env });
@@ -614,9 +728,13 @@ async function fetchZcodeBilling(apiKey, { fetchImpl = fetch, baseUrl, env, home
   const res = await fetchImpl(url.toString(), {
     method: "GET",
     headers,
+    signal,
   });
   if (res.status === 401 || res.status === 403) {
-    throw new Error("Not authenticated with ZCode. Run `zcode` in Terminal to log in.");
+    const error = new Error("Not authenticated with ZCode. Run `zcode` in Terminal to log in.");
+    // Tagged so the failure chain surfaces re-login instead of stale cache bars.
+    error.authError = true;
+    throw error;
   }
   if (!res.ok) {
     let detail = "";
@@ -633,6 +751,43 @@ async function fetchZcodeBilling(apiKey, { fetchImpl = fetch, baseUrl, env, home
     throw new Error(`ZCode billing API returned ${res.status}${detail}`);
   }
   return res.json();
+}
+
+/**
+ * Read the signed-in login's Start Plan grants (bonus buckets) from billing/balance.
+ * Read-only; a timed-out request aborts its connection so the optional read
+ * never drags on the primary quota windows.
+ */
+async function fetchZcodeStartPlanGrants({ zcodeToken, fetchImpl = fetch, env, home, timeoutMs = 2000 } = {}) {
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      (async () => {
+        const body = await fetchZcodeBilling(zcodeToken, {
+          fetchImpl,
+          baseUrl: resolveZcodeBillingBaseUrl(env),
+          env,
+          home,
+          signal: controller.signal,
+        });
+        // An HTTP 200 with a nonzero business code and empty data must surface
+        // as a failed read, not silently pose as "no grants".
+        if (body && typeof body.code === "number" && body.code !== 0) {
+          throw new Error(`ZCode start plan grants API error: code=${body.code} msg=${body?.msg || "unknown"}`);
+        }
+        return normalizeZcodeBalanceResponse(body);
+      })(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("ZCode start plan grants request timed out"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -657,7 +812,10 @@ async function fetchZcodeCodingPlanQuota(apiKey, { fetchImpl = fetch, quotaUrl, 
     headers,
   });
   if (res.status === 401 || res.status === 403) {
-    throw new Error("Not authenticated with ZCode coding plan. Run `zcode` in Terminal to log in.");
+    const error = new Error("Not authenticated with ZCode coding plan. Run `zcode` in Terminal to log in.");
+    // Tagged so the failure chain surfaces re-login instead of stale cache bars.
+    error.authError = true;
+    throw error;
   }
   let body = null;
   try {
@@ -685,10 +843,11 @@ function quotaTimestampToIso(value) {
 
 function findZcodeQuotaLimit(limits, type, unit, number = null) {
   if (!Array.isArray(limits)) return null;
+  const types = Array.isArray(type) ? type : [type];
   return (
     limits.find((limit) => {
       if (!limit || typeof limit !== "object") return false;
-      if (limit.type !== type) return false;
+      if (!types.includes(limit.type)) return false;
       if (zcodeValNumber(limit.unit) !== unit) return false;
       if (number == null) return true;
       return zcodeValNumber(limit.number) === number;
@@ -748,8 +907,10 @@ function normalizeZcodeCodingPlanQuotaResponse(body) {
   const limits = Array.isArray(data.limits) ? data.limits : [];
   // Match ZCode's own sidebar: TOKENS_LIMIT(unit=3,number=5)=5h,
   // TOKENS_LIMIT(unit=6)=weekly, TIME_LIMIT(unit=5,number=1)=tool calls.
-  const fiveHourLimit = findZcodeQuotaLimit(limits, "TOKENS_LIMIT", 3, 5);
-  const weeklyLimit = findZcodeQuotaLimit(limits, "TOKENS_LIMIT", 6);
+  // ZCode 3.17.1 renamed the token-window rows to CREDIT_LIMIT while keeping
+  // the unit/number convention, so both names anchor the named windows (#937).
+  const fiveHourLimit = findZcodeQuotaLimit(limits, ["TOKENS_LIMIT", "CREDIT_LIMIT"], 3, 5);
+  const weeklyLimit = findZcodeQuotaLimit(limits, ["TOKENS_LIMIT", "CREDIT_LIMIT"], 6);
   const toolsLimit = findZcodeQuotaLimit(limits, "TIME_LIMIT", 5, 1);
   const hasNamedWindows = Boolean(fiveHourLimit || weeklyLimit || toolsLimit);
 
@@ -831,18 +992,31 @@ function extractZcodeBalanceLogRecord(line) {
   }
 }
 
-function loadLatestZcodeBalanceFromLogs({
-  home,
-  env = process.env,
-  providerKeys = [],
-  nowMs = Date.now(),
-  requireProviderMatch = false,
-} = {}) {
-  if (env.TOKENTRACKER_ZCODE_DISABLE_LOG_FALLBACK === "1") return null;
+/**
+ * One backward pass over the recent ZCode logs (today + yesterday), collecting:
+ *   preferred — freshest record matching the candidate providers. Built-in ids
+ *     must byte-equal a candidate key; the 3.14+ per-account ids
+ *     (`account:<family>-<plan>…`) never do, so they match the exact
+ *     (region, plan kind) pair of one candidate — never the cross product of
+ *     the two traits, so a bigmodel-coding + zai-start candidate list cannot
+ *     adopt a zai coding-plan record.
+ *   fallback  — freshest record of any provider.
+ *   byRegion  — freshest record per region ("bigmodel" | "zai"), for the
+ *     other-region snapshot.
+ * Records outside the age window count nowhere. Every eligible line of both
+ * files is visited and buckets keep the max-timestamp record, since log lines
+ * can land out of timestamp order.
+ */
+function scanZcodeBalanceLogs({ home, env = process.env, providerKeys = [], nowMs = Date.now() } = {}) {
+  const scan = { preferred: null, fallback: null, byRegion: new Map() };
+  if (env.TOKENTRACKER_ZCODE_DISABLE_LOG_FALLBACK === "1") return scan;
   const maxAgeMs = parsePositiveInteger(env.TOKENTRACKER_ZCODE_LOG_MAX_AGE_MS, DEFAULT_ZCODE_LOG_FALLBACK_MAX_AGE_MS);
   const preferredProviders = new Set(providerKeys.filter(Boolean));
-  let preferred = null;
-  let fallback = null;
+  const preferredPairs = new Set(providerKeys.map((key) => {
+    const region = zcodeRegionFromProviderId(key);
+    const planKind = zcodePlanKindFromProviderId(key);
+    return region && planKind ? `${region}:${planKind}` : null;
+  }).filter(Boolean));
   for (const logPath of recentZcodeLogPaths({ home, env, nowMs })) {
     if (!fs.existsSync(logPath)) continue;
     let text = "";
@@ -857,14 +1031,36 @@ function loadLatestZcodeBalanceFromLogs({
       if (!record) continue;
       const ageMs = nowMs - record.timestampMs;
       if (ageMs < 0 || ageMs > maxAgeMs) continue;
-      if (!fallback || record.timestampMs > fallback.timestampMs) fallback = record;
-      if (preferredProviders.has(record.providerKey) && (!preferred || record.timestampMs > preferred.timestampMs)) {
-        preferred = record;
+      if (!scan.fallback || record.timestampMs > scan.fallback.timestampMs) scan.fallback = record;
+      const region = zcodeRegionFromProviderId(record.providerKey);
+      const regionRecord = region ? scan.byRegion.get(region) : null;
+      if (region && (!regionRecord || record.timestampMs > regionRecord.timestampMs)) {
+        scan.byRegion.set(region, record);
+      }
+      const regionMatch = Boolean(region)
+        && record.providerKey.startsWith("account:")
+        && preferredPairs.has(`${region}:${zcodePlanKindFromProviderId(record.providerKey)}`);
+      if (
+        (preferredProviders.has(record.providerKey) || regionMatch)
+        && (!scan.preferred || record.timestampMs > scan.preferred.timestampMs)
+      ) {
+        scan.preferred = record;
       }
     }
   }
-  if (preferred) return preferred;
-  return requireProviderMatch && preferredProviders.size > 0 ? null : fallback;
+  return scan;
+}
+
+function loadLatestZcodeBalanceFromLogs({
+  home,
+  env = process.env,
+  providerKeys = [],
+  nowMs = Date.now(),
+  requireProviderMatch = false,
+} = {}) {
+  const scan = scanZcodeBalanceLogs({ home, env, providerKeys, nowMs });
+  if (scan.preferred) return scan.preferred;
+  return requireProviderMatch && providerKeys.filter(Boolean).length > 0 ? null : scan.fallback;
 }
 
 function zcodeLogFallbackResult(logRecord, errors = []) {
@@ -874,28 +1070,346 @@ function zcodeLogFallbackResult(logRecord, errors = []) {
     error: null,
     source: "zcode-log",
     provider_key: logRecord.providerKey,
+    region: zcodeRegionFromProviderId(logRecord.providerKey),
     log_timestamp: logRecord.log_timestamp,
+    // The log line's age IS the data age: ZCode wrote it when it last fetched.
+    cached_at: logRecord.log_timestamp,
+    stale: true,
     provider_errors: errors,
     ...normalizeZcodeBalanceResponse(logRecord.body),
   };
 }
 
+// Last-good disk cache for ZCode quota windows, following the house pattern
+// (codex / ark / qoder): write on every live success, serve stale bars when the
+// live chain fails. One file, partitioned per built-in provider key
+// (region × plan kind) so one region's billing read never falls back to
+// another region's data (#938's ownership principle).
+
+// Cache partitions are also scoped to the login that produced the windows:
+// two logins on the same region × plan kind share one providerKey, so an
+// account switch followed by a live failure would otherwise serve the
+// previous login's bars. The login id comes from the app's own user_info —
+// the same ownership source as login-scoped tokens — plus the applicable
+// team scope for team-scoped coding-plan quota. No secret material is
+// persisted, and an unreadable login ("unknown") matches only itself.
+function zcodeCacheIdentity(loginAccountId, teamContext) {
+  const login = typeof loginAccountId === "string" && loginAccountId.trim() ? loginAccountId.trim() : "unknown";
+  return `${login}|${typeof teamContext === "string" ? teamContext : ""}`;
+}
+
+function zcodeLimitsCachePath({ home } = {}) {
+  return path.join(home || os.homedir(), ".tokentracker", "tracker", ZCODE_LIMITS_CACHE_FILE);
+}
+
+// A window whose reset_at has already passed is stale data, not a usable
+// fallback — the quota has rolled over, so drop it. Undated windows cannot be
+// checked against a reset and are bounded by the snapshot-age TTL instead.
+function zcodeCachedWindow(window, { cachedAtMs, nowMs } = {}) {
+  if (!window || typeof window !== "object") return null;
+  const resetAtMs = Date.parse(window.reset_at || "");
+  if (Number.isFinite(resetAtMs)) return resetAtMs > nowMs ? window : null;
+  return nowMs - cachedAtMs <= ZCODE_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS ? window : null;
+}
+
+function zcodeCachedBucket(bucket, { cachedAtMs, nowMs } = {}) {
+  if (!bucket || typeof bucket !== "object") return null;
+  if (!bucket.window || typeof bucket.window !== "object") {
+    return nowMs - cachedAtMs <= ZCODE_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS ? bucket : null;
+  }
+  const window = zcodeCachedWindow(bucket.window, { cachedAtMs, nowMs });
+  return window ? { ...bucket, window } : null;
+}
+
 /**
- * Return normalized quota windows, trying eligible providers and recent billing logs.
+ * Read the last-good windows for the first provider key with a usable cache
+ * entry. `providerKeys` arrives in live candidate priority order; keys whose
+ * live attempts all ended in auth errors are withheld by the caller, and
+ * `identityByKey` scopes each key to the credentials that could have
+ * produced its windows.
+ */
+function readZcodeLimitsCache({ home, nowMs = Date.now(), providerKeys = [], identityByKey } = {}) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(zcodeLimitsCachePath({ home }), "utf8"));
+  } catch (_error) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  for (const providerKey of providerKeys) {
+    const raw = parsed[providerKey];
+    if (!raw || typeof raw !== "object") continue;
+    const acceptableIdentities = identityByKey?.get(providerKey);
+    if (!acceptableIdentities || !acceptableIdentities.size) continue;
+    if (typeof raw.identity !== "string" || !acceptableIdentities.has(raw.identity)) continue;
+    const cachedAtMs = Date.parse(raw.cached_at || "");
+    if (!Number.isFinite(cachedAtMs) || cachedAtMs > nowMs + 60_000) continue;
+    const context = { cachedAtMs, nowMs };
+    const buckets = (Array.isArray(raw.buckets) ? raw.buckets : [])
+      .map((bucket) => zcodeCachedBucket(bucket, context))
+      .filter(Boolean);
+    const primaryWindow = zcodeCachedWindow(raw.primary_window, context);
+    const secondaryWindow = zcodeCachedWindow(raw.secondary_window, context);
+    const tertiaryWindow = zcodeCachedWindow(raw.tertiary_window, context);
+    if (!primaryWindow && !secondaryWindow && !tertiaryWindow && !buckets.some((bucket) => bucket.window)) continue;
+    return {
+      configured: true,
+      error: null,
+      provider_key: providerKey,
+      // Live results carry their provider's region for the other_region
+      // attach; the cached shape mirrors them so a cache-served card keeps
+      // that section too (issue #959).
+      region: zcodeRegionFromProviderId(providerKey),
+      plan_kind: typeof raw.plan_kind === "string" ? raw.plan_kind : null,
+      plan_id: typeof raw.plan_id === "string" ? raw.plan_id : null,
+      plan_label: typeof raw.plan_label === "string" ? raw.plan_label : null,
+      buckets,
+      primary_window: primaryWindow,
+      secondary_window: secondaryWindow,
+      tertiary_window: tertiaryWindow,
+      cached: true,
+      stale: true,
+      cached_at: raw.cached_at,
+      source: "disk-cache",
+    };
+  }
+  return null;
+}
+
+/**
+ * Merge partitions into the disk cache atomically; best-effort, never throws.
+ * Cross-process semantics are last-writer-wins on purpose, matching the house
+ * pattern (ark / qoder / codex caches): a concurrent writer can discard a
+ * partition added between its read and rename, which costs one refresh cycle
+ * — the next fetch rewrites it. Snapshots in particular keep getting
+ * re-persisted on every fetch while their region's rows are inside the scan
+ * window, so a lost write self-heals long before the window expires.
+ */
+function mergeZcodeLimitsCacheEntries(entries, { home } = {}) {
+  const cachePath = zcodeLimitsCachePath({ home });
+  let payload = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    if (parsed && typeof parsed === "object") payload = parsed;
+  } catch (_error) {}
+  Object.assign(payload, entries);
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    const tmpPath = `${cachePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmpPath, cachePath);
+  } catch (_error) {}
+}
+
+/** Merge one provider partition into the disk cache; best-effort, never throws. */
+function writeZcodeLimitsCache(limits, { home, nowMs = Date.now(), providerKey, identity } = {}) {
+  if (!providerKey || !identity || !limits?.configured || limits.error) return;
+  if (!limits.primary_window && !limits.secondary_window && !limits.tertiary_window) return;
+  mergeZcodeLimitsCacheEntries({
+    [providerKey]: {
+      identity,
+      plan_kind: typeof limits.plan_kind === "string" ? limits.plan_kind : null,
+      plan_id: typeof limits.plan_id === "string" ? limits.plan_id : null,
+      plan_label: typeof limits.plan_label === "string" ? limits.plan_label : null,
+      buckets: Array.isArray(limits.buckets) ? limits.buckets : [],
+      primary_window: limits.primary_window || null,
+      secondary_window: limits.secondary_window || null,
+      tertiary_window: limits.tertiary_window || null,
+      cached_at: new Date(nowMs).toISOString(),
+    },
+  }, { home });
+}
+
+// Issue #959: ZCode only queries the balance of the region currently in use,
+// so the other region's log rows stop appearing the moment it goes idle and
+// then age out of the 6h scan window — the other_region section would vanish.
+// While a region's rows are still fresh, snapshot its latest record into a
+// per-region cache partition; withZcodeOtherRegion falls back to it after the
+// window expires. The snapshot shape comes straight from
+// normalizeZcodeBalanceResponse, so the no-reset_credits / no-start_plan red
+// line holds structurally. Log records carry no login id, so unlike the
+// windows partitions there is no identity guard here: staleness is
+// self-attested by the snapshot's log_timestamp (rendered as the section's
+// time row), and the section stays collapsed and informational.
+function zcodeLogSnapshotCacheKey(region) {
+  return `log-snapshot:${region}`;
+}
+
+function writeZcodeLogSnapshotCache(byRegion, { home, nowMs = Date.now() } = {}) {
+  if (!(byRegion instanceof Map) || byRegion.size === 0) return;
+  const entries = {};
+  for (const [region, record] of byRegion) {
+    if (region !== "bigmodel" && region !== "zai") continue;
+    let normalized;
+    try {
+      normalized = normalizeZcodeBalanceResponse(record.body);
+    } catch (_error) {
+      continue;
+    }
+    entries[zcodeLogSnapshotCacheKey(region)] = {
+      source: "zcode-log",
+      region,
+      provider_key: record.providerKey,
+      log_timestamp: record.log_timestamp,
+      ...normalized,
+      cached_at: new Date(nowMs).toISOString(),
+    };
+  }
+  if (Object.keys(entries).length > 0) mergeZcodeLimitsCacheEntries(entries, { home });
+}
+
+/**
+ * Read one region's persisted log snapshot, shaped exactly like the fresh
+ * withZcodeOtherRegion attach (issue #938). Deliberately no per-window
+ * expiry: clipping aged windows would make the cached section render
+ * differently from the same record served fresh inside the scan window.
+ */
+function readZcodeLogSnapshotCache(region, { home, nowMs = Date.now() } = {}) {
+  if (region !== "bigmodel" && region !== "zai") return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(zcodeLimitsCachePath({ home }), "utf8"));
+  } catch (_error) {
+    return null;
+  }
+  const raw = parsed?.[zcodeLogSnapshotCacheKey(region)];
+  if (!raw || typeof raw !== "object" || raw.source !== "zcode-log" || raw.region !== region) return null;
+  if (!Number.isFinite(Date.parse(typeof raw.log_timestamp === "string" ? raw.log_timestamp : ""))) return null;
+  const cachedAtMs = Date.parse(typeof raw.cached_at === "string" ? raw.cached_at : "");
+  if (!Number.isFinite(cachedAtMs) || cachedAtMs > nowMs + 60_000) return null;
+  return {
+    source: "zcode-log",
+    region,
+    provider_key: typeof raw.provider_key === "string" ? raw.provider_key : null,
+    log_timestamp: raw.log_timestamp,
+    plan_kind: typeof raw.plan_kind === "string" ? raw.plan_kind : null,
+    plan_id: typeof raw.plan_id === "string" ? raw.plan_id : null,
+    plan_label: typeof raw.plan_label === "string" ? raw.plan_label : null,
+    buckets: Array.isArray(raw.buckets) ? raw.buckets : [],
+    primary_window: raw.primary_window || null,
+    secondary_window: raw.secondary_window || null,
+    tertiary_window: raw.tertiary_window || null,
+  };
+}
+
+/**
+ * Attach the freshest logged balance snapshot from the user's other region
+ * (issue #938): ZCode's own usage logs carry both regions' billing data even
+ * when only the active region's credentials are on disk. Once those rows age
+ * out of the 6h scan window (ZCode only queries the active region's balance,
+ * issue #959), fall back to the snapshot persisted by
+ * writeZcodeLogSnapshotCache while they were fresh. Either way the section is
+ * read-only and deliberately carries no reset_credits / start_plan extras —
+ * those are login-scoped and must never ride along across regions.
+ */
+function withZcodeOtherRegion(result, byRegion, { home, env = process.env, nowMs = Date.now() } = {}) {
+  if (!result || result.error || !result.region) return result;
+  const otherRegion = result.region === "bigmodel" ? "zai" : "bigmodel";
+  const record = byRegion instanceof Map ? byRegion.get(otherRegion) : null;
+  if (record) {
+    return {
+      ...result,
+      other_region: {
+        source: "zcode-log",
+        region: otherRegion,
+        provider_key: record.providerKey,
+        log_timestamp: record.log_timestamp,
+        ...normalizeZcodeBalanceResponse(record.body),
+      },
+    };
+  }
+  // Saved snapshots are log-derived data, so the log-fallback kill switch
+  // silences them along with the scan that feeds them.
+  if (env?.TOKENTRACKER_ZCODE_DISABLE_LOG_FALLBACK === "1") return result;
+  const snapshot = readZcodeLogSnapshotCache(otherRegion, { home, nowMs });
+  if (!snapshot) return result;
+  return { ...result, other_region: snapshot };
+}
+
+/**
+ * Login tokens for reset cards / Start Plan grants, or null when the quota key
+ * cannot be proven to belong to the signed-in login. Both extras are personal
+ * to the current login. Any key carrying an account id (per-account
+ * credentials, or config.json keys that byte-equal one) must match the login's
+ * id. In a per-account layout (credentials.json lists a coding-plan key for
+ * this family) an unproven config.json key may be a leftover from a switched
+ * account, so the extras stay fail-closed there. In a legacy layout without
+ * any per-account credential for the family, no other account is known to
+ * this ZCode home, so the config.json key cannot be attributed to a different
+ * login and rides with the login's extras (#937). When the login
+ * identity itself is unreadable (user_info missing or unparseable) nothing can
+ * prove the key belongs to the signed-in account either, so the extras are
+ * skipped and only the main plan quota stays.
+ */
+function loadZcodeLoginScopedTokens(family, auth, { home, env } = {}) {
+  if (loadZcodeActiveProvider({ home, env }) !== family) return null;
+  const loginAccountId = loadZcodeLoginAccountId(family, { home, env });
+  if (!loginAccountId) return null;
+  if (auth.accountId) {
+    if (auth.accountId !== loginAccountId) return null;
+  } else if (auth.auth_source === "credential:account-provider") {
+    return null;
+  } else if (auth.auth_source === "provider:config"
+    && Object.keys(loadZcodeAccountProviderAuths({ home, env }))
+      .some((providerKey) => zcodeProviderFamily(providerKey) === family)) {
+    return null;
+  }
+  const zcodeToken = loadZcodeCredential("zcodejwttoken", { home, env });
+  if (!zcodeToken) return null;
+  const codingPlanToken = loadZcodeCredential(`oauth:${family}:access_token`, { home, env });
+  return { zcodeToken, codingPlanToken };
+}
+
+/**
+ * Return normalized quota windows, trying eligible providers, recent billing
+ * logs, and finally the last-good disk cache. The result carries the winning
+ * provider's `region` ("bigmodel" | "zai") and, when ZCode's own logs hold one,
+ * an `other_region` snapshot of the second region's plan (issue #938) — read-only
+ * log data, never extended with login-scoped extras, served from the logs while
+ * fresh and from the disk cache once the scan window expires (issue #959).
  * Credentials and internal team routing identifiers are omitted from the result.
  */
-async function fetchZcodeLimits({ home, env, fetchImpl = fetch, nowMs = Date.now() } = {}) {
+async function fetchZcodeLimits({ home, env, fetchImpl = fetch, nowMs = Date.now(), providerTimeoutMs } = {}) {
+  const startedAt = Date.now();
   if (!isZcodeInstalled({ home, env })) {
     return { configured: false };
   }
   const authCandidates = loadZcodeAuthCandidates({ home, env });
+  // One log pass serves both the failed-candidate fallback and the other
+  // region's snapshot. selectLogFallback keeps the former gate semantics:
+  // builtin: candidates only adopt per-account records carrying the same
+  // (region, plan kind) pair as one of them.
+  const logScan = scanZcodeBalanceLogs({
+    home,
+    env,
+    providerKeys: authCandidates.map((auth) => auth.providerKey),
+    nowMs,
+  });
+  // Issue #959: capture each region's freshest log record while it is still
+  // inside the scan window, so the other_region section survives the window
+  // expiring (ZCode stops writing rows for a region the moment it goes idle).
+  writeZcodeLogSnapshotCache(logScan.byRegion, { home, nowMs });
+  const requireProviderMatch = authCandidates.some((auth) => auth.planKind === "coding-plan");
+  const selectLogFallback = (errors) => {
+    const record = logScan.preferred
+      || (requireProviderMatch && authCandidates.length > 0 ? null : logScan.fallback);
+    return withZcodeOtherRegion(zcodeLogFallbackResult(record, errors), logScan.byRegion, { home, env, nowMs });
+  };
   if (!authCandidates.length) {
-    const logFallback = loadLatestZcodeBalanceFromLogs({ home, env, nowMs });
-    if (logFallback) return zcodeLogFallbackResult(logFallback, []);
-    return { configured: false };
+    return selectLogFallback([]) || { configured: false };
   }
   const errors = [];
+  const partitionFailures = [];
   let emptySuccess = null;
+  // The current login per region, resolved once: cache partitions are keyed
+  // to it so an account switch cannot inherit the previous login's windows.
+  const loginIdByFamily = new Map();
+  const loginIdFor = (family) => {
+    if (!loginIdByFamily.has(family)) {
+      loginIdByFamily.set(family, loadZcodeLoginAccountId(family, { home, env }));
+    }
+    return loginIdByFamily.get(family);
+  };
   for (const auth of authCandidates) {
     try {
       const body = auth.planKind === "coding-plan"
@@ -923,26 +1437,116 @@ async function fetchZcodeLimits({ home, env, fetchImpl = fetch, nowMs = Date.now
         configured: true,
         error: null,
         provider_key: auth.providerKey,
+        region: zcodeProviderFamily(auth.providerKey),
         ...normalized,
       };
+      // Last-good disk cache (house pattern: codex / ark / qoder): persist the
+      // windows so a later network failure serves stale bars instead of a
+      // vanished card. Login-scoped extras stay live-only.
+      writeZcodeLimitsCache(result, {
+        home,
+        nowMs,
+        providerKey: auth.providerKey,
+        identity: zcodeCacheIdentity(loginIdFor(zcodeProviderFamily(auth.providerKey)), auth.teamContext),
+      });
       if (Array.isArray(normalized.buckets) && normalized.buckets.length === 0 && authCandidates.length > 1) {
         emptySuccess = emptySuccess || result;
         continue;
       }
-      return result;
+      if (auth.planKind === "coding-plan") {
+        const family = zcodeProviderFamily(auth.providerKey);
+        const tokens = loadZcodeLoginScopedTokens(family, auth, { home, env });
+        if (tokens) {
+          const remainingMs = providerTimeoutMs > 0 ? providerTimeoutMs - (Date.now() - startedAt) - 100 : 4000;
+          if (remainingMs <= 0) {
+            result.reset_credits = { error: "ZCode reset credits: provider time budget exhausted" };
+            result.start_plan = { configured: true, error: "ZCode start plan grants: provider time budget exhausted" };
+          } else {
+            const timeoutMs = Math.min(2000, remainingMs);
+            // Reset cards additionally need the region's login token; without
+            // it the status endpoint cannot identify a coding plan, so the
+            // inventory stays absent instead of surfacing a blocking error.
+            await Promise.all([
+              (tokens.codingPlanToken
+                ? fetchZcodeResetCredits({
+                    zcodeToken: tokens.zcodeToken,
+                    codingPlanToken: tokens.codingPlanToken,
+                    teamContext: auth.teamContext,
+                    fetchImpl,
+                    nowMs,
+                    timeoutMs,
+                  })
+                : Promise.resolve(null)
+              ).then(
+                (value) => {
+                  if (value) result.reset_credits = value;
+                },
+                (reason) => {
+                  result.reset_credits = { error: reason?.message || "Could not read ZCode reset credits" };
+                },
+              ),
+              fetchZcodeStartPlanGrants({
+                zcodeToken: tokens.zcodeToken,
+                fetchImpl,
+                env,
+                home,
+                timeoutMs,
+              }).then(
+                (value) => {
+                  // No grants on the login → no section, instead of an empty card.
+                  if (Array.isArray(value.buckets) && value.buckets.length) {
+                    result.start_plan = { configured: true, error: null, ...value };
+                  }
+                },
+                (reason) => {
+                  result.start_plan = {
+                    configured: true,
+                    error: reason?.message || "Could not read ZCode start plan grants",
+                  };
+                },
+              ),
+            ]);
+          }
+        }
+      }
+      return withZcodeOtherRegion(result, logScan.byRegion, { home, env, nowMs });
     } catch (error) {
       errors.push(`${auth.providerKey}: ${error?.message || "Unknown error"}`);
+      partitionFailures.push({ providerKey: auth.providerKey, authError: error?.authError === true });
     }
   }
-  if (emptySuccess) return emptySuccess;
-  const logFallback = loadLatestZcodeBalanceFromLogs({
-    home,
-    env,
-    providerKeys: authCandidates.map((auth) => auth.providerKey),
-    nowMs,
-    requireProviderMatch: authCandidates.some((auth) => auth.planKind === "coding-plan"),
-  });
-  if (logFallback) return zcodeLogFallbackResult(logFallback, errors);
+  if (emptySuccess) return withZcodeOtherRegion(emptySuccess, logScan.byRegion, { home, env, nowMs });
+  // Rank fallback partitions in live candidate priority order, and withhold
+  // any partition whose attempts all ended in auth errors: re-login is
+  // actionable, so neither a stale log record nor stale cache bars may mask
+  // it (opencode-go auth_error / codex reauth precedent).
+  const cacheOrder = [];
+  for (const auth of authCandidates) {
+    if (!cacheOrder.includes(auth.providerKey)) cacheOrder.push(auth.providerKey);
+  }
+  const cacheEligible = cacheOrder.filter((providerKey) =>
+    partitionFailures.some((failure) => failure.providerKey === providerKey && !failure.authError));
+  const authErrorOnlyProviders = new Set(cacheOrder.filter((providerKey) => !cacheEligible.includes(providerKey)));
+  // Prefer the #942 scan (region+plan preferred match) over a second log pass,
+  // then apply the #947 auth-error gate so re-login stays actionable.
+  const logRecord = logScan.preferred
+    || (requireProviderMatch && authCandidates.length > 0 ? null : logScan.fallback);
+  // A log record for a provider with no live candidate is untouched by this
+  // gate: nothing was attempted for it, so no error is being masked.
+  if (logRecord && !authErrorOnlyProviders.has(logRecord.providerKey)) {
+    return withZcodeOtherRegion(zcodeLogFallbackResult(logRecord, errors), logScan.byRegion, { home, env, nowMs });
+  }
+  // Last stop before the error result: serve the disk cache in live candidate
+  // priority order, scoped to the login that produced the windows so an
+  // account switch cannot inherit the previous login's bars.
+  const identityByKey = new Map();
+  for (const auth of authCandidates) {
+    if (!cacheEligible.includes(auth.providerKey)) continue;
+    if (!identityByKey.has(auth.providerKey)) identityByKey.set(auth.providerKey, new Set());
+    identityByKey.get(auth.providerKey).add(zcodeCacheIdentity(loginIdFor(zcodeProviderFamily(auth.providerKey)), auth.teamContext));
+  }
+  const cached = readZcodeLimitsCache({ home, nowMs, providerKeys: cacheEligible, identityByKey });
+  if (cached) return withZcodeOtherRegion(cached, logScan.byRegion, { home, env, nowMs });
   return {
     configured: true,
     error: errors[0] || "Unknown error",
@@ -958,7 +1562,12 @@ module.exports = {
   loadZcodeProviderAvailability,
   loadZcodeSelectedPlanProviderKeys,
   loadZcodeCredential,
+  loadZcodeLoginAccountId,
+  zcodeProviderFamily,
+  zcodeRegionFromProviderId,
+  zcodePlanKindFromProviderId,
   loadLatestZcodeBalanceFromLogs,
+  scanZcodeBalanceLogs,
   resolveZcodeProviderBillingBaseUrl,
   resolveZcodeProviderQuotaUrl,
   loadZcodeAuthCandidates,
@@ -968,5 +1577,11 @@ module.exports = {
   normalizeZcodeCodingPlanQuotaResponse,
   fetchZcodeBilling,
   fetchZcodeCodingPlanQuota,
+  fetchZcodeStartPlanGrants,
+  readZcodeLimitsCache,
+  writeZcodeLimitsCache,
+  writeZcodeLogSnapshotCache,
+  readZcodeLogSnapshotCache,
+  zcodeCacheIdentity,
   fetchZcodeLimits,
 };

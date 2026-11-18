@@ -30,10 +30,11 @@ const {
   currentCodexModel,
   snapshotCodexModelAttributionState,
 } = require("./codex-model-attribution");
-const { readCodexServiceTier, isPriorityServiceTier } = require("./codex-service-tier");
+const { readCodexServiceTier, isPriorityServiceTier, isUltrafastServiceTier } = require("./codex-service-tier");
 const {
   createUsageRecordState,
   extractTokenUsageRecord,
+  isCodexTotalOnlyResetSentinel,
   noteLineAfterUsageRecord,
   noteTokenCount,
   noteUsageRecord,
@@ -42,6 +43,28 @@ const {
 } = require("./codex-usage-record");
 
 const DISCOVERY_FULL_AUDIT_INTERVAL_MS = 60 * 1000;
+const CODEX_ROLLOUT_TEXT_MAX_BYTES = 256 * 1024 * 1024;
+
+async function readCodexRolloutText(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
+  if (typeof filePath !== "string" || !/\.jsonl\.zstd?$/i.test(filePath)) {
+    return fs.readFile(filePath, "utf8");
+  }
+  // The snapshot decoder lives in rollout.js (reused by the sync parser);
+  // require lazily so this module stays loadable without pulling the whole
+  // rollout graph at import time.
+  const rollout = require("./rollout");
+  const snapshot = await rollout.readCodexRolloutSnapshot(filePath, { maxOutputBytes });
+  if (!snapshot) {
+    // Treat undecodable / vanished archives as recoverable I/O so grouped
+    // session reads (live + archive) can still use a readable sibling copy.
+    const error = new Error(`unreadable Codex archive ${filePath}`);
+    error.code = "EIO";
+    throw error;
+  }
+  // Snapshot lines keep their "\n" terminators; the tail element may be an
+  // unterminated final line — join preserves exactly that.
+  return snapshot.lines.join("\n");
+}
 const MAX_DISCOVERY_INVENTORIES = 32;
 const DISCOVERY_INVENTORIES = new Map();
 const ZONED_DAY_FORMATTERS = new Map();
@@ -49,6 +72,11 @@ const CODEX_RESUME_INVALIDATED = "TOKENTRACKER_CODEX_RESUME_INVALIDATED";
 // Match src/lib/pricing/index.js. Classify individual requests using raw
 // input (including cache), not the accumulated session or day totals.
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
+
+// Session token summaries use the same fork-prefix rules as rollout.js; the
+// reset-sentinel predicate is shared verbatim from codex-usage-record.js.
+// Context/performance callers retain their existing event view.
+const LEDGER_FORK_REPLAY_GAP_MS = 500;
 
 // ---------------------------------------------------------------------------
 // Timezone helpers
@@ -143,6 +171,11 @@ function safeJsonParse(str, diagnostics = null) {
   }
 }
 
+function isRolloutCandidateFileName(name) {
+  if (typeof name !== "string") return false;
+  return name.endsWith(".jsonl") || /^rollout-.*\.jsonl\.zstd?$/.test(name);
+}
+
 function listJsonlFiles(rootDir) {
   const out = [];
   const stack = [rootDir];
@@ -160,7 +193,7 @@ function listJsonlFiles(rootDir) {
       const filePath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(filePath);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      } else if (entry.isFile() && isRolloutCandidateFileName(entry.name)) {
         out.push(filePath);
       }
     }
@@ -331,7 +364,7 @@ function discoverCodexSessionFiles(rootDirs, options = {}) {
         stack.push(filePath);
         continue;
       }
-      if (!child.isFile() || !child.name.endsWith(".jsonl") || visited.has(filePath)) continue;
+      if (!child.isFile() || !isRolloutCandidateFileName(child.name) || visited.has(filePath)) continue;
       visited.add(filePath);
       if (diagnostics) diagnostics.discovered_files += 1;
       const cached = inventory.files.get(filePath) || null;
@@ -434,7 +467,7 @@ function formatToolDisplayName(name) {
 // Usage normalization
 // ---------------------------------------------------------------------------
 
-function normalizeUsage(u) {
+function normalizeUsage(u, { preserveReportedTotal = false } = {}) {
   const out = {};
   for (const k of [
     "input_tokens",
@@ -450,7 +483,7 @@ function normalizeUsage(u) {
   // Codex reports input inclusive of cached_input_tokens; keep our schema
   // convention: non-cached input and cached input tracked separately.
   out.input_tokens = Math.max(0, out.input_tokens - out.cached_input_tokens);
-  out.total_tokens =
+  if (!preserveReportedTotal) out.total_tokens =
     out.input_tokens +
     out.cached_input_tokens +
     out.cache_creation_input_tokens +
@@ -569,7 +602,9 @@ async function parseCodexRolloutFile(filePath, {
   sourceHandle = null,
   collectBreakdowns = true,
   collectModelUsage = false,
+  ledgerUsage = false,
   onObject = null,
+  onUsage = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const primaryFilePath = filePaths[0] || String(filePath || "");
@@ -610,6 +645,12 @@ async function parseCodexRolloutFile(filePath, {
   let provider = isResuming ? resumeState.provider || null : null;
   let cliVersion = isResuming ? resumeState.cliVersion || null : null;
   let forkedFromId = isResuming ? resumeState.forkedFromId || null : null;
+  const ledgerRolloutDate = path.basename(primaryFilePath).match(/^rollout-(\d{4}-\d{2}-\d{2})T/)?.[1] || null;
+  let ledgerCurrentDate = null;
+  // Same gating as rollout.js: the replay prefix only ever sits at the head of
+  // a freshly-forked file, so only a scan from offset 0 can see it.
+  let ledgerReplayActive = initialOffset === 0;
+  let ledgerPreviousTokenMs = null;
   let parentThreadId = isResuming ? resumeState.parentThreadId || null : null;
   let threadSource = isResuming ? resumeState.threadSource || null : null;
   let agentNickname = isResuming ? resumeState.agentNickname || null : null;
@@ -703,15 +744,28 @@ async function parseCodexRolloutFile(filePath, {
         priority_long_context_cache_creation_input_tokens: 0,
         priority_long_context_output_tokens: 0,
         priority_long_context_reasoning_output_tokens: 0,
+        ultrafast_input_tokens: 0,
+        ultrafast_cached_input_tokens: 0,
+        ultrafast_cache_creation_input_tokens: 0,
+        ultrafast_output_tokens: 0,
+        ultrafast_reasoning_output_tokens: 0,
+        ultrafast_long_context_input_tokens: 0,
+        ultrafast_long_context_cached_input_tokens: 0,
+        ultrafast_long_context_cache_creation_input_tokens: 0,
+        ultrafast_long_context_output_tokens: 0,
+        ultrafast_long_context_reasoning_output_tokens: 0,
         usage_events: 0,
         rerouted_usage_events: 0,
         long_context_usage_events: 0,
         priority_usage_events: 0,
+        ultrafast_usage_events: 0,
         selected_models: new Set(),
         reroute_reasons: new Set(),
       };
       byModel.set(effectiveModel, row);
     }
+    const subsetKeys = Object.keys(row).filter((key) => /^(?:long_context_|priority_|ultrafast_)|^(?:usage_events|rerouted_usage_events)$/.test(key));
+    const before = Object.fromEntries(subsetKeys.map((key) => [key, row[key]]));
     addInto(row, delta);
     row.usage_events += 1;
     if (attribution.selectedModel) {
@@ -757,6 +811,26 @@ async function parseCodexRolloutFile(filePath, {
         row.priority_long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
       }
     }
+    if (isUltrafastServiceTier(attribution.serviceTier)) {
+      row.ultrafast_usage_events += 1;
+      row.ultrafast_input_tokens += delta.input_tokens;
+      row.ultrafast_cached_input_tokens += delta.cached_input_tokens;
+      row.ultrafast_cache_creation_input_tokens += delta.cache_creation_input_tokens;
+      row.ultrafast_output_tokens += delta.output_tokens;
+      row.ultrafast_reasoning_output_tokens += delta.reasoning_output_tokens;
+      if (isLongContext) {
+        row.ultrafast_long_context_input_tokens += delta.input_tokens;
+        row.ultrafast_long_context_cached_input_tokens += delta.cached_input_tokens;
+        row.ultrafast_long_context_cache_creation_input_tokens +=
+          delta.cache_creation_input_tokens;
+        row.ultrafast_long_context_output_tokens += delta.output_tokens;
+        row.ultrafast_long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
+      }
+    }
+    return { ...delta, ...Object.fromEntries(subsetKeys.map((key) => [key, row[key] - before[key]])),
+      selected_models: attribution.selectedModel ? [attribution.selectedModel] : [],
+      reroute_reasons: attribution.rerouteReason ? [attribution.rerouteReason] : [],
+      model_attribution: attribution.rerouted ? "effective" : "selected" };
   }
 
   function ensureTool(name) {
@@ -926,7 +1000,9 @@ async function parseCodexRolloutFile(filePath, {
     if (compactionResponseIds.has(record.responseId)) return;
     compactionResponseIds.add(record.responseId);
     if (!record.inRequestedRange) return;
-    recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    const pricedDelta = recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    if (typeof onUsage === "function") onUsage({ timestamp: record.timestamp,
+      delta: pricedDelta || record.delta, rawUsage: record.rawUsage, model: record.attribution.model, origin: "compaction" });
     attributeTurn(record.delta);
   }
 
@@ -987,6 +1063,9 @@ async function parseCodexRolloutFile(filePath, {
     contentHasher,
     sourceHandle,
   })) {
+    if (ledgerUsage && obj?.type === "turn_context" && typeof obj?.payload?.current_date === "string") {
+      ledgerCurrentDate = obj.payload.current_date.trim().match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null;
+    }
     const modelEvent = applyCodexModelEvent(modelAttributionState, obj);
     const attributedModel = currentCodexModel(modelAttributionState);
     model = attributedModel || model;
@@ -1051,7 +1130,7 @@ async function parseCodexRolloutFile(filePath, {
     }
 
     if (usageRecord) {
-      const delta = normalizeUsage(usageRecord.usage);
+      const delta = normalizeUsage(usageRecord.usage, { preserveReportedTotal: ledgerUsage });
       noteUsageRecord(
         usageRecordState,
         // Without a response_id a compaction cannot be deduplicated.
@@ -1084,17 +1163,42 @@ async function parseCodexRolloutFile(filePath, {
         );
       }
       const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
-      const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+      const delta = rawDelta && !(ledgerUsage && isCodexTotalOnlyResetSentinel(lastUsage, totalUsage))
+        ? normalizeUsage(rawDelta, { preserveReportedTotal: ledgerUsage }) : null;
+      // Timing consumers receive canonical, deduplicated usage below. A null
+      // delta is a snapshot, not another model response.
       if (compaction) countCompactionRecord(compaction);
       const isNewResumeEvent = noteTokenEvent(ts, lastUsage, totalUsage);
       if (inRequestedRange) {
         const eventSessionId = sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath;
-        const eventKey = `${eventSessionId}:${ts}:${usageEventSignature(lastUsage, totalUsage)}`;
-        if (!isNewResumeEvent || (seenTokenEvents && seenTokenEvents.has(eventKey))) {
+        const eventKey = ledgerUsage ? `${eventSessionId}:${ts}`
+          : `${eventSessionId}:${ts}:${usageEventSignature(lastUsage, totalUsage)}`;
+        const alreadySeen = seenTokenEvents && seenTokenEvents.has(eventKey);
+        let replayed = false;
+        if (ledgerUsage && forkedFromId && delta?.total_tokens > 0) {
+          if (ledgerReplayActive) {
+            const tokenMs = Date.parse(ts);
+            if (!Number.isFinite(tokenMs) || (ledgerPreviousTokenMs !== null && tokenMs < ledgerPreviousTokenMs)) {
+              ledgerReplayActive = false;
+            } else {
+              if (ledgerPreviousTokenMs !== null && tokenMs - ledgerPreviousTokenMs >= LEDGER_FORK_REPLAY_GAP_MS) ledgerReplayActive = false;
+              replayed = ledgerReplayActive && ledgerPreviousTokenMs !== null
+                && tokenMs - ledgerPreviousTokenMs < LEDGER_FORK_REPLAY_GAP_MS;
+              ledgerPreviousTokenMs = tokenMs;
+            }
+          }
+          replayed ||= Boolean(ledgerRolloutDate && ledgerCurrentDate && ledgerCurrentDate < ledgerRolloutDate);
+        }
+        // Remember skipped inherited rows too: another readable copy of the
+        // same session must not reintroduce its prefix after the first live turn.
+        if (ledgerUsage && seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
+        if (!isNewResumeEvent || alreadySeen || replayed) {
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: null, rawUsage: lastUsage, model: attributedModel });
           attributeTurn(null);
         } else {
           if (seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
-          recordModelUsage(delta, lastUsage || rawDelta);
+          const pricedDelta = recordModelUsage(delta, lastUsage || rawDelta);
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: pricedDelta || delta, rawUsage: lastUsage || rawDelta, model: attributedModel });
           attributeTurn(delta);
         }
       } else {
@@ -1162,7 +1266,13 @@ async function parseCodexRolloutFile(filePath, {
       compactionResponseIds: Array.from(compactionResponseIds),
     };
     result.endOffset = readProgress.endOffset;
-    result.appendable = Boolean(contentHasher) && (
+    // Compressed snapshots are not append-only logs: endOffset stays at the
+    // pre-decode cursor (often 0) and must never be marked appendable, or the
+    // next growth would "resume" by parsing compressed bytes as JSONL.
+    const hasCompressedArchive = filePaths.some(
+      (candidate) => typeof candidate === "string" && /\.jsonl\.zstd?$/i.test(candidate),
+    );
+    result.appendable = Boolean(contentHasher) && !hasCompressedArchive && (
       readProgress.endOffset === 0 || readProgress.lastByte === 0x0a
     );
     result.contentHashState = contentHasher;
@@ -1296,6 +1406,27 @@ async function* readCodexObjectsFull(filePath, diagnostics, fileIndex, {
   readProgress = null,
   contentHasher = null,
 } = {}) {
+  // Compressed archives are immutable snapshots, not append-only logs: byte
+  // offsets are meaningless inside them, so decode the whole text and split
+  // into lines. `readProgress` stays null so callers never persist a fake
+  // byte cursor for them.
+  if (typeof filePath === "string" && /\.jsonl\.zstd?$/i.test(filePath)) {
+    const text = await readCodexRolloutText(filePath);
+    let lineIndex = 0;
+    const lines = text.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const isLast = index + 1 >= lines.length;
+      if (isLast && lines[index] === "") continue;
+      const lineBuffer = Buffer.from(lines[index], "utf8");
+      const obj = parseCodexLine(lineBuffer, diagnostics);
+      if (obj) {
+        yield { obj, fileIndex, lineIndex };
+        lineIndex += 1;
+      }
+    }
+    if (diagnostics) diagnostics.parsed_files += 1;
+    return;
+  }
   yield* readCodexObjectsIncremental(filePath, diagnostics, fileIndex, {
     startOffset,
     endOffset,
@@ -1318,6 +1449,7 @@ function isRecoverableGroupedReadError(error) {
 
 async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
   if (filePaths.length <= 1) {
+    if (!filePaths[0]) return;
     for await (const record of readCodexObjects(filePaths[0], diagnostics, 0, options)) {
       yield record.obj;
     }
@@ -1342,7 +1474,11 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
       if (!isRecoverableGroupedReadError(error)) throw error;
     }
   }
-  if (!scannedFiles) throw new Error("all grouped Codex rollout files failed during read");
+  if (!scannedFiles) {
+    const error = new Error("all grouped Codex rollout files failed during read");
+    error.code = "EIO";
+    throw error;
+  }
   records.sort((a, b) => {
     const aTimestamp = typeof a.obj?.timestamp === "string" ? a.obj.timestamp : "";
     const bTimestamp = typeof b.obj?.timestamp === "string" ? b.obj.timestamp : "";
@@ -1360,7 +1496,7 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
 
 function rolloutSessionIdFromPath(filePath) {
   const match = path.basename(String(filePath || "")).match(
-    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zstd?)?$/i,
   );
   return match ? match[1] : null;
 }
@@ -1391,6 +1527,7 @@ module.exports = {
   isTimestampInRequestedDayRange,
   rolloutSessionIdFromPath,
   isCodexResumeInvalidated,
+  isRecoverableGroupedReadError,
   finalizeToolRows,
   finalizeSkillRows,
   finalizeExecRows,

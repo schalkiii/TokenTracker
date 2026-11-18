@@ -7,6 +7,8 @@ export declare const LIMIT_PROVIDER_ICON_KEYS: readonly string[];
 
 export declare function isLimitsPrefsStorageKey(key: string | null): boolean;
 export declare function isDevinProviderSelected(): boolean;
+export declare function visibleProviderIds(): string[];
+export declare function hiddenProviderIds(): string[];
 export declare function limitProviderIconKey(id: string): string | null;
 export declare function limitProviderName(id: string): string;
 
@@ -19,6 +21,7 @@ export interface LimitsDisplayPrefs {
   setDisplayMode(mode: string): void;
   setShowSubscriptions(value: boolean): void;
   toggle(id: string): void;
+  setAllVisible(visible: boolean): void;
   moveUp(id: string): void;
   moveDown(id: string): void;
   moveToward(sourceId: string, targetId: string): void;

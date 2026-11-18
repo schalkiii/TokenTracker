@@ -48,9 +48,13 @@ internal sealed class DashboardWindow : Window
     private WebView2CompositionControl _webView = CreateWebViewControl();
     private readonly ServerManager _server;
     private bool _coreReady;
+    private WebViewActivity? _activity;
+    private bool _backdropEnabled;
     private bool _exiting;
     private bool _oauthInFlight;
+    private long _oauthAttempt;
     private CancellationTokenSource? _oauthTimeout;
+    private readonly OAuthLoginWindow _oauthLoginWindow = new();
     private Task? _initializationTask;
     private bool _recoveryInFlight;
     private bool _tiltForwardLogged;
@@ -140,10 +144,9 @@ internal sealed class DashboardWindow : Window
             // change (minimise still minimises-to-taskbar) and without Hide(), which broke
             // Win+D restore (the HWND left DWM's minimised-windows list) and tray restore
             // (WindowState stayed Minimized, so ShowDashboard re-fired this handler).
-            _webView.Visibility = (WindowState == WindowState.Minimized)
-                ? Visibility.Collapsed
-                : Visibility.Visible;
+            UpdateWebViewActivity();
         };
+        IsVisibleChanged += (_, _) => UpdateWebViewActivity();
         KeyDown += (_, e) => { if (e.Key == System.Windows.Input.Key.Escape) CloseOrHideForOAuth(); };
         _server.StatusChanged += OnServerStatusChanged;
     }
@@ -237,7 +240,7 @@ internal sealed class DashboardWindow : Window
     private void ApplyBackdrop(int type)
     {
         if (_hwnd == 0) return;
-        DwmSetWindowAttribute(_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref type, sizeof(int));
+        _backdropEnabled = DwmSetWindowAttribute(_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref type, sizeof(int)) == 0;
     }
 
     // ── Tilt wheel (horizontal scroll) ─────────────────────────────────
@@ -377,21 +380,9 @@ internal sealed class DashboardWindow : Window
         // alpha 0 or 255 are supported.
         Environment.SetEnvironmentVariable("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "0");
 
-        // Disable Chromium background/occlusion throttling. When the OAuth callback
-        // deep-links back, our app is still in the background (the system browser has
-        // focus), so the dashboard WebView is occluded. WebView2 would otherwise
-        // suspend/throttle its JS — stalling the InsForge SDK's code-exchange and the
-        // SPA's redirect to /dashboard, so the sign-in never completes until (and
-        // unless) the window is brought forward. These flags keep the callback page's
-        // timers + network running while occluded, so login finishes regardless of focus.
-        var options = new CoreWebView2EnvironmentOptions
-        {
-            AdditionalBrowserArguments =
-                "--disable-background-timer-throttling " +
-                "--disable-renderer-backgrounding " +
-                "--disable-backgrounding-occluded-windows",
-        };
-        var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);
+        // Use Chromium's normal background throttling. Hidden windows explicitly
+        // sleep; an in-flight native OAuth exchange is exempt from suspension.
+        var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder, null);
         await _webView.EnsureCoreWebView2Async(env);
         _coreReady = true;
 
@@ -402,6 +393,10 @@ internal sealed class DashboardWindow : Window
         _webView.DefaultBackgroundColor = System.Drawing.Color.FromArgb(0, 0, 0, 0);
 
         var core = _webView.CoreWebView2;
+        var view = _webView;
+        _activity = new WebViewActivity(
+            visible => view.Visibility = visible ? Visibility.Visible : Visibility.Collapsed,
+            core.Resume, core.TrySuspendAsync, Log);
         core.Settings.AreDefaultContextMenusEnabled = false;
         core.Settings.IsStatusBarEnabled = false;
 
@@ -435,7 +430,7 @@ internal sealed class DashboardWindow : Window
         // Top-level navigations away from the local server go to the system browser.
         core.NavigationStarting += (_, e) =>
         {
-            Log($"nav starting uri={e.Uri}");
+            Log($"nav starting uriPresent={!string.IsNullOrEmpty(e.Uri)} uriLen={e.Uri?.Length ?? 0}");
             if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri)
                 && uri.Scheme is "http" or "https"
                 && uri.Host is not ("127.0.0.1" or "localhost"))
@@ -449,7 +444,7 @@ internal sealed class DashboardWindow : Window
         {
             try
             {
-                Log($"nav completed uri={_webView.CoreWebView2.Source}");
+                Log($"nav completed uriPresent={!string.IsNullOrEmpty(_webView.CoreWebView2.Source)} uriLen={_webView.CoreWebView2.Source?.Length ?? 0}");
                 if (_oauthInFlight
                     && Uri.TryCreate(_webView.CoreWebView2.Source, UriKind.Absolute, out var completedUri)
                     && completedUri.AbsolutePath is "/" or "/dashboard")
@@ -457,6 +452,7 @@ internal sealed class DashboardWindow : Window
                     CompleteNativeOAuth();
                 }
                 await ApplyNativeChromeAsync();
+                UpdateWebViewActivity();
             }
             catch (Exception ex)
             {
@@ -470,12 +466,12 @@ internal sealed class DashboardWindow : Window
         // does, so we can observe the callback page's client-side redirect to /dashboard.
         core.HistoryChanged += (_, _) =>
         {
-            try { Log($"history changed uri={_webView.CoreWebView2.Source}"); } catch { }
+            try { Log($"history changed uriPresent={!string.IsNullOrEmpty(_webView.CoreWebView2.Source)} uriLen={_webView.CoreWebView2.Source?.Length ?? 0}"); } catch { }
         };
 
         // The injected script posts setting changes, and the injected title bar
         // (ApplyNativeChromeAsync) posts "win:*" for the window controls + drag.
-        core.WebMessageReceived += (_, e) =>
+        core.WebMessageReceived += async (sender, e) =>
         {
             string msg;
             try { msg = e.TryGetWebMessageAsString(); }
@@ -493,12 +489,33 @@ internal sealed class DashboardWindow : Window
                 {
                     using var doc = JsonDocument.Parse(msg);
                     if (!doc.RootElement.TryGetProperty("type", out var t)) return;
-                    if (t.GetString() == "oauth"
+                    if (t.GetString() is "saveCloudUsageExport" or "saveLocalUsageExport")
+                    {
+                        // Core.WebMessageReceived is emitted by the top-level document;
+                        // iframe messages use the separate CoreWebView2Frame event.
+                        var requestId = doc.RootElement.TryGetProperty("requestId", out var id)
+                            && id.ValueKind == JsonValueKind.String ? id.GetString() ?? "" : "";
+                        if (!Guid.TryParseExact(requestId, "D", out _)) return;
+                        CloudUsageExportResult result;
+                        if (!ReferenceEquals(sender, core) || !ReferenceEquals(core, _webView.CoreWebView2)
+                            || !CloudUsageExport.PermitsSource(e.Source, core.Source, _server.BaseUrl))
+                            result = new(requestId, false, ErrorCode: "forbidden_source");
+                        else
+                        {
+                            try { result = CloudUsageExport.Save(doc.RootElement, CloudUsageExport.GetDownloadsDirectory()); }
+                            catch { result = new(requestId, false, ErrorCode: "save_failed"); }
+                        }
+                        var json = JsonSerializer.Serialize(result);
+                        await core.ExecuteScriptAsync("window.dispatchEvent(new CustomEvent('tokentracker:cloud-export-result',{detail:" + json + "}));");
+                    }
+                    else if (t.GetString() == "oauth"
                         && doc.RootElement.TryGetProperty("url", out var u) && u.GetString() is { } url)
                     {
-                        Log($"oauth open url={url}");
+                        Log($"oauth open urlPresent={!string.IsNullOrEmpty(url)} urlLen={url.Length}");
                         BeginNativeOAuth();
-                        OpenInBrowser(url);
+                        // Dedicated browser window so it can be closed by ownership
+                        // (WM_CLOSE) after the deep link, instead of sweeping tabs.
+                        _oauthLoginWindow.Launch(url);
                     }
                     else if (t.GetString() == "authCompleted")
                     {
@@ -519,7 +536,17 @@ internal sealed class DashboardWindow : Window
                              && doc.RootElement.TryGetProperty("name", out var actionName)
                              && actionName.GetString() is { } name)
                     {
-                        NativeActionRequested?.Invoke(name);
+                        if (name == "openURL")
+                        {
+                            if (doc.RootElement.TryGetProperty("value", out var externalValue)
+                                && externalValue.GetString() is { } externalUrl
+                                && Uri.TryCreate(externalUrl, UriKind.Absolute, out var externalUri)
+                                && string.IsNullOrEmpty(externalUri.UserInfo)
+                                && (externalUri.Scheme == Uri.UriSchemeHttps
+                                    || (externalUri.Scheme == Uri.UriSchemeHttp && externalUri.IsLoopback)))
+                                OpenInBrowser(externalUri.AbsoluteUri);
+                        }
+                        else NativeActionRequested?.Invoke(name);
                     }
                     else if (t.GetString() == "nativeSetting"
                              && doc.RootElement.TryGetProperty("key", out var k)
@@ -596,6 +623,8 @@ internal sealed class DashboardWindow : Window
         //     rules apply — letting the acrylic backdrop show through.
         //  3. Wrap localStorage.setItem to notify native when tray-facing settings change.
         await core.AddScriptToExecuteOnDocumentCreatedAsync(
+            "window.__TOKENTRACKER_CLOUD_EXPORT__=true;" +
+            "window.__TOKENTRACKER_LOCAL_EXPORT__=true;" +
             "try{if(!localStorage.getItem('tokentracker-theme')){" +
             "localStorage.setItem('tokentracker-theme','dark');" +
             "document.documentElement.classList.add('dark');}" +
@@ -630,7 +659,11 @@ internal sealed class DashboardWindow : Window
         // ?app=1 → dashboard renders in native-app layout (Clawd companion, native
         // component treatment, transparent root + 28px drag strip), matching macOS.
         NavigateWhenServerReady("/?app=1");
+        UpdateWebViewActivity();
     }
+
+    private void UpdateWebViewActivity() =>
+        _activity?.Update(IsVisible && WindowState != WindowState.Minimized, _oauthInFlight);
 
     public void PushPetSettings(bool visible, string size, string character, string botColor)
     {
@@ -657,6 +690,8 @@ internal sealed class DashboardWindow : Window
     private void ReplaceWebViewControl()
     {
         if (_exiting) return;
+        _activity?.Dispose();
+        _activity = null;
         _coreReady = false;
         var old = _webView;
         Content = null;
@@ -736,7 +771,7 @@ internal sealed class DashboardWindow : Window
         // specific (html.native-windows-app …) and force the shells fully transparent.
         // The frosted tint lives only on the body's ::before overlay at low alpha, so
         // the window's DWM acrylic shows through. Solid cards keep their own bg.
-        const string css = """
+        var css = """
             ::-webkit-scrollbar{display:none!important}
             *{-webkit-user-select:none;user-select:none}
             input,textarea{-webkit-user-select:text;user-select:text}
@@ -765,9 +800,9 @@ internal sealed class DashboardWindow : Window
               z-index:0!important;
               pointer-events:none!important;
               border-radius:10px!important;
-              /* Frosted blur restored — this is the glass/translucent texture. */
-              backdrop-filter:blur(40px) saturate(135%)!important;
-              -webkit-backdrop-filter:blur(40px) saturate(135%)!important;
+              /* Older Windows keeps one CSS fallback when DWM cannot supply acrylic. */
+              backdrop-filter:blur(28px) saturate(135%)!important;
+              -webkit-backdrop-filter:blur(28px) saturate(135%)!important;
             }
             html.native-windows-app.dark body.tt-native-glass-shell::before{
               background:
@@ -820,6 +855,8 @@ internal sealed class DashboardWindow : Window
             }
             #tt-titlebar{background:transparent!important}
             """;
+        if (_backdropEnabled)
+            css += "html.native-windows-app.dark body.tt-native-glass-shell::before,html.native-windows-app:not(.dark) body.tt-native-glass-shell::before{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;}";
         var js =
             "document.documentElement.classList.add('native-app','native-windows-app');" +
             "document.body&&document.body.classList.add('tt-native-glass-shell');" +
@@ -909,18 +946,23 @@ internal sealed class DashboardWindow : Window
     private void BeginNativeOAuth()
     {
         _oauthInFlight = true;
+        var attempt = ++_oauthAttempt;
+        UpdateWebViewActivity();
         _oauthTimeout?.Cancel();
         _oauthTimeout?.Dispose();
         _oauthTimeout = new CancellationTokenSource();
-        _ = WaitForNativeOAuthTimeoutAsync(_oauthTimeout.Token);
+        _ = WaitForNativeOAuthTimeoutAsync(_oauthTimeout.Token, attempt);
     }
 
-    private async Task WaitForNativeOAuthTimeoutAsync(CancellationToken cancellationToken)
+    private async Task WaitForNativeOAuthTimeoutAsync(CancellationToken cancellationToken, long attempt)
     {
         try
         {
             await Task.Delay(TimeSpan.FromMinutes(10), cancellationToken);
-            await Dispatcher.InvokeAsync(ExpireNativeOAuth);
+            // Re-check attempt on the dispatcher: Cancel does not dequeue an
+            // already-queued InvokeAsync, so a stale timeout must not close a
+            // newer login's dedicated browser window.
+            await Dispatcher.InvokeAsync(() => ExpireNativeOAuth(attempt));
         }
         catch (OperationCanceledException)
         {
@@ -962,11 +1004,13 @@ internal sealed class DashboardWindow : Window
         _oauthTimeout?.Cancel();
         _oauthTimeout?.Dispose();
         _oauthTimeout = null;
-        if (!IsVisible) CloseOrHideForOAuth();
+        UpdateWebViewActivity();
     }
 
-    private void ExpireNativeOAuth()
+    private void ExpireNativeOAuth(long attempt)
     {
+        if (attempt != _oauthAttempt || !_oauthInFlight) return;
+        _oauthLoginWindow.CloseTracked("oauth flow timed out");
         CompleteNativeOAuth();
     }
 
@@ -1015,7 +1059,7 @@ internal sealed class DashboardWindow : Window
     {
         Log($"HandleAuthCallback code.len={code.Length}");
         ShowDashboard();
-        BrowserTabCloser.CloseAuthCallbackTab(_server.BaseUrl, _hwnd);
+        _oauthLoginWindow.CloseTracked("auth callback received");
         var encoded = Uri.EscapeDataString(code);
         NavigateWhenServerReady($"/auth/callback?insforge_code={encoded}&app=1");
 
@@ -1032,11 +1076,18 @@ internal sealed class DashboardWindow : Window
             try
             {
                 var path = await _webView.CoreWebView2.ExecuteScriptAsync("location.pathname");
-                Log($"post-callback path={path} → reloading /?app=1");
+                Log($"post-callback pathPresent={!string.IsNullOrEmpty(path)} pathLen={path?.Length ?? 0}; reloading dashboard");
             }
             catch { /* window closed / page navigating */ }
             NavigateWhenServerReady("/?app=1");
         });
+    }
+
+    public void HandleBillingReturn(Guid order)
+    {
+        Log("HandleBillingReturn type=billing");
+        ShowDashboard();
+        NavigateWhenServerReady(NativeReturnUri.CheckoutPath(order));
     }
 
     /// <summary>Diagnostics → %LOCALAPPDATA%\TokenTracker\windows-host.log (shared with ServerManager).</summary>
@@ -1044,11 +1095,11 @@ internal sealed class DashboardWindow : Window
 
     /// <summary>
     /// Read the user's currency choice + USD→currency rate from the dashboard's
-    /// localStorage. Returns ("$", 1) until the WebView is ready or on any failure.
+    /// localStorage. Returns null when the WebView cannot supply a current value.
     /// </summary>
-    public async Task<(string Symbol, decimal Rate)> ReadCurrencyAsync()
+    public async Task<(string Symbol, decimal Rate)?> ReadCurrencyAsync()
     {
-        if (!_coreReady) return ("$", 1m);
+        if (!_coreReady) return null;
         try
         {
             var raw = await _webView.CoreWebView2.ExecuteScriptAsync(
@@ -1074,7 +1125,7 @@ internal sealed class DashboardWindow : Window
             }
             return (symbol, rate);
         }
-        catch { return ("$", 1m); }
+        catch { return null; }
     }
 
     /// <summary>
@@ -1151,6 +1202,8 @@ internal sealed class DashboardWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _activity?.Dispose();
+        _activity = null;
         try { HwndSource.FromHwnd(_hwnd)?.RemoveHook(DashboardWndProc); }
         catch { /* the source may already be gone during teardown */ }
         _oauthTimeout?.Cancel();

@@ -74,6 +74,7 @@ const PROVIDER_NAMES = {
     grok: 'Grok', zcode: 'ZCode', opencodeGo: 'OpenCode Go',
     commandCode: 'Command Code', devin: 'Devin', qoder: 'Qoder',
     qoderCn: 'Qoder CN', codingPlan: 'Coding Plan', agentPlan: 'Agent Plan',
+    workbuddy: 'WorkBuddy', workbuddyAi: 'WorkBuddy AI',
 };
 
 const WINDOW_NAMES = {
@@ -176,6 +177,15 @@ function limitRows(limits) {
             const windows = Array.isArray(value) ? value : [value];
             for (const win of windows) {
                 if (!win || typeof win !== 'object') continue;
+                // Grok product rows nest the percent under `window`. The label is the
+                // product name. Do not invent a window length: a share is not a quota.
+                if (key === 'products' && win.window && typeof win.window === 'object') {
+                    const nested = percentOf(win.window);
+                    const label = typeof win.label === 'string' ? win.label.trim() : '';
+                    if (nested === null || !label) continue;
+                    rows.push({name, label, percent: nested, reset: resetSeconds(win.window)});
+                    continue;
+                }
                 const percent = percentOf(win);
                 if (percent === null) continue;
                 const label = win.label

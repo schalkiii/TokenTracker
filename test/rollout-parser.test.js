@@ -79,6 +79,7 @@ const {
   resolveZedDbPath,
   resolveGooseDbPath,
   listRolloutFilesDeep,
+  readCodexRolloutSnapshot,
   filterColdCodexRolloutFiles,
   bucketKey,
 } = require("../src/lib/rollout");
@@ -510,6 +511,320 @@ test("listRolloutFilesDeep finds flat archived_sessions files the strict scanner
 
     const found = await listRolloutFilesDeep(tmp);
     assert.deepEqual(found.sort(), [flat, nested].sort());
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+async function compressZstdForTest(buf) {
+  // Node >=22.15 has zlib.zstdCompressSync; Node 20 (engines.node) falls back
+  // to @mongodb-js/zstd, matching production decodeDshZstd.
+  const zlib = require("node:zlib");
+  if (typeof zlib.zstdCompressSync === "function") return zlib.zstdCompressSync(buf);
+  const { compress } = require("@mongodb-js/zstd");
+  return Buffer.from(await compress(buf));
+}
+
+test("compressed Codex archives are discovered and counted once (issue #817)", async () => {
+  // Newer Codex compresses older sessions to rollout-*.jsonl.zst, both under
+  // sessions/** and flat in archived_sessions/. The scanner must discover
+  // them, decode via the shared DSH zstd machinery, and dedup by
+  // sessionUUID:timestamp so a re-sync is a no-op.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-"));
+  try {
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const usage = { input_tokens: 100, cached_input_tokens: 0, output_tokens: 50, reasoning_output_tokens: 0, total_tokens: 150 };
+    const lines = [
+      JSON.stringify({ timestamp: "2026-06-09T10:00:00.000Z", type: "session_meta", payload: { id: uuid, cwd: "/tmp/proj" } }),
+      buildTokenCountLine({ ts: "2026-06-09T10:01:00.000Z", last: usage, total: usage }),
+    ];
+    const text = lines.join("\n") + "\n";
+    const compressed = await compressZstdForTest(Buffer.from(text, "utf8"));
+
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const zstPath = path.join(archiveDir, `rollout-2026-06-09T10-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(zstPath, compressed);
+
+    const found = await listRolloutFilesDeep(archiveDir);
+    assert.ok(found.includes(zstPath), `compressed archive must be discovered, got ${JSON.stringify(found)}`);
+
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const first = await parseRolloutIncremental({ rolloutFiles: [zstPath], cursors, queuePath, source: "codex" });
+    assert.equal(first.eventsAggregated, 1, "compressed archive must contribute its token_count event");
+    assert.equal(cursors.files[zstPath].offset, (await fs.stat(zstPath)).size, "cursor pins the compressed size");
+
+    const second = await parseRolloutIncremental({ rolloutFiles: [zstPath], cursors, queuePath, source: "codex" });
+    assert.equal(second.eventsAggregated, 0, "unchanged archive must not re-count");
+    assert.equal(second.filesProcessed, 0, "unchanged archive must be skipped");
+
+    // Multi-frame archives (concatenated zstd frames) must decode fully.
+    const multiPath = path.join(archiveDir, `rollout-2026-06-10T10-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(multiPath, Buffer.concat([
+      await compressZstdForTest(Buffer.from(text.slice(0, 40), "utf8")),
+      await compressZstdForTest(Buffer.from(text.slice(40), "utf8")),
+    ]));
+    const foundMulti = await listRolloutFilesDeep(archiveDir);
+    assert.ok(foundMulti.includes(multiPath), "multi-frame archive must be discovered");
+    const cursors2 = { version: 1, files: {}, updatedAt: null };
+    const multi = await parseRolloutIncremental({
+      rolloutFiles: [multiPath], cursors: cursors2, queuePath: path.join(tmp, "queue2.jsonl"), source: "codex",
+    });
+    assert.equal(multi.eventsAggregated, 1, "multi-frame archive must decode all events");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("malformed compressed Codex archive does not abort the sync (issue #817)", async () => {
+  // A truncated .zst must return null from the snapshot reader so the sync
+  // loop keeps the prior cursor and continues with later rollout files.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-bad-"));
+  try {
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const badPath = path.join(archiveDir, `rollout-2026-06-09T10-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(badPath, Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00])); // truncated zstd magic+frame
+
+    const usage = { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0, total_tokens: 15 };
+    const goodPath = path.join(archiveDir, `rollout-2026-06-09T11-00-00-${uuid}.jsonl`);
+    await fs.writeFile(
+      goodPath,
+      [
+        JSON.stringify({ timestamp: "2026-06-09T11:00:00.000Z", type: "session_meta", payload: { id: uuid, cwd: "/tmp/proj" } }),
+        buildTokenCountLine({ ts: "2026-06-09T11:01:00.000Z", last: usage, total: usage }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    assert.equal(await readCodexRolloutSnapshot(badPath), null, "malformed archive must yield null");
+
+    const priorCursor = {
+      inode: 424242,
+      offset: 128,
+      lastTotal: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+      tokenUsageBaselines: null,
+      lastModel: "gpt-5",
+      lastServiceTier: null,
+      modelAttributionState: null,
+      updatedAt: "2026-06-09T09:00:00.000Z",
+    };
+    const cursors = { version: 1, files: { [badPath]: priorCursor }, updatedAt: null };
+    const result = await parseRolloutIncremental({
+      rolloutFiles: [badPath, goodPath],
+      cursors,
+      queuePath: path.join(tmp, "queue.jsonl"),
+      source: "codex",
+    });
+    assert.equal(result.eventsAggregated, 1, "sibling jsonl must still be parsed after a bad archive");
+    assert.deepEqual(
+      cursors.files[badPath],
+      priorCursor,
+      "soft-fail must leave the prior archive cursor untouched even when inode changed",
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("malformed compressed Codex archive throws under strict rebuild policy (issue #817)", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-strict-"));
+  try {
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const badPath = path.join(archiveDir, `rollout-2026-06-09T10-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(badPath, Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00]));
+    await assert.rejects(
+      () => parseRolloutIncremental({
+        rolloutFiles: [badPath],
+        cursors: { version: 1, files: {}, updatedAt: null },
+        queuePath: path.join(tmp, "queue.jsonl"),
+        source: "codex",
+        invalidRecordPolicy: "throw",
+      }),
+      /unreadable Codex compressed archive/,
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("compressed Codex project-only rescan keeps compressed-size cursor (issue #817)", async () => {
+  // After a full sync, an expired project context must re-read cwd via the
+  // snapshot decoder — never as raw compressed bytes — and leave the cursor
+  // pinned to the compressed size so the next unchanged check still hits.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-proj-"));
+  try {
+    const repoRoot = path.join(tmp, "repo");
+    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await fs.writeFile(
+      path.join(repoRoot, ".git", "config"),
+      `[remote "origin"]\n\turl = https://github.com/acme/alpha.git\n`,
+      "utf8",
+    );
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const usage = {
+      input_tokens: 2,
+      cached_input_tokens: 0,
+      output_tokens: 3,
+      reasoning_output_tokens: 0,
+      total_tokens: 5,
+    };
+    const text = [
+      JSON.stringify({
+        timestamp: "2026-01-26T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: uuid, cwd: repoRoot },
+      }),
+      buildTokenCountLine({ ts: "2026-01-26T00:10:00.000Z", last: usage, total: usage }),
+    ].join("\n") + "\n";
+    const compressed = await compressZstdForTest(Buffer.from(text, "utf8"));
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const rolloutPath = path.join(archiveDir, `rollout-2026-01-26T00-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(rolloutPath, compressed);
+
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const projectQueuePath = path.join(tmp, "project.queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const first = await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath],
+      cursors,
+      queuePath,
+      projectQueuePath,
+      source: "codex",
+    });
+    assert.equal(first.eventsAggregated, 1);
+    const compressedSize = compressed.length;
+    assert.equal(cursors.files[rolloutPath].offset, compressedSize);
+    assert.equal(cursors.files[rolloutPath].projectOffset, compressedSize);
+
+    await fs.writeFile(path.join(repoRoot, ".git", "config"), "", "utf8");
+    const second = await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath],
+      cursors,
+      queuePath,
+      projectQueuePath,
+      source: "codex",
+    });
+    assert.equal(second.eventsAggregated, 0);
+    assert.equal(cursors.files[rolloutPath].offset, compressedSize,
+      "project-only rescan must not rewrite cursor to a decompressed newline offset");
+    assert.equal(cursors.files[rolloutPath].projectOffset, compressedSize);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("compressed Codex archive growth does not inflate totals (issue #817)", async () => {
+  // Same inode, larger compressed bytes: must full-rescan without retaining
+  // lastTotal, or previously counted events are applied again.
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-grow-"));
+  try {
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const rolloutPath = path.join(archiveDir, `rollout-2026-06-09T10-00-00-${uuid}.jsonl.zst`);
+
+    function linesFor(totals) {
+      return totals.map((total, index) => {
+        const ts = `2026-06-09T10:0${index}:00.000Z`;
+        const last = index === 0
+          ? total
+          : {
+              input_tokens: total.input_tokens - totals[index - 1].input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: total.output_tokens - totals[index - 1].output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: total.total_tokens - totals[index - 1].total_tokens,
+            };
+        return [
+          index === 0
+            ? JSON.stringify({ timestamp: ts, type: "session_meta", payload: { id: uuid, cwd: "/tmp/proj" } })
+            : null,
+          buildTokenCountLine({ ts, last, total }),
+        ].filter(Boolean).join("\n");
+      }).join("\n") + "\n";
+    }
+
+    const firstTotals = [
+      { input_tokens: 100, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 100 },
+      { input_tokens: 200, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 200 },
+    ];
+    await fs.writeFile(rolloutPath, await compressZstdForTest(Buffer.from(linesFor(firstTotals), "utf8")));
+
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const first = await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath], cursors, queuePath, source: "codex",
+    });
+    assert.equal(first.eventsAggregated, 2);
+
+    const grownTotals = [
+      ...firstTotals,
+      { input_tokens: 350, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 350 },
+    ];
+    // Rewrite in place (same path); inode may or may not change on this FS —
+    // force same-inode semantics by restoring the cursor inode after write.
+    const prevInode = cursors.files[rolloutPath].inode;
+    await fs.writeFile(rolloutPath, await compressZstdForTest(Buffer.from(linesFor(grownTotals), "utf8")));
+    cursors.files[rolloutPath].inode = prevInode;
+
+    const second = await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath], cursors, queuePath, source: "codex",
+    });
+    assert.equal(second.eventsAggregated, 1, "only the new event should aggregate");
+
+    const queued = (await fs.readFile(queuePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+    const latest = queued[queued.length - 1];
+    assert.equal(latest.total_tokens, 350, "lifetime total must be 350 not 450");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("unchanged compressed archive with publicRepoResolver does not inflate (issue #817)", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-817-resolver-"));
+  try {
+    const uuid = "019c26ca-e6bb-7e00-b33a-2ac67a11ddb9";
+    const archiveDir = path.join(tmp, "archived_sessions");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const usage = { input_tokens: 100, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 100 };
+    const usage2 = { input_tokens: 200, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 200 };
+    const textBody = [
+      JSON.stringify({ timestamp: "2026-06-09T10:00:00.000Z", type: "session_meta", payload: { id: uuid, cwd: "/tmp/proj" } }),
+      buildTokenCountLine({ ts: "2026-06-09T10:01:00.000Z", last: usage, total: usage }),
+      buildTokenCountLine({
+        ts: "2026-06-09T10:02:00.000Z",
+        last: {
+          input_tokens: 100, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0, total_tokens: 100,
+        },
+        total: usage2,
+      }),
+    ].join("\n") + "\n";
+    const rolloutPath = path.join(archiveDir, `rollout-2026-06-09T10-00-00-${uuid}.jsonl.zst`);
+    await fs.writeFile(rolloutPath, await compressZstdForTest(Buffer.from(textBody, "utf8")));
+
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const projectQueuePath = path.join(tmp, "project.queue.jsonl");
+    const resolver = async () => ({ owner: "acme", name: "proj", host: "github.com" });
+
+    await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath], cursors, queuePath, projectQueuePath, source: "codex",
+      publicRepoResolver: resolver,
+    });
+    const before = cursors.files[rolloutPath].lastTotal.total_tokens;
+    await parseRolloutIncremental({
+      rolloutFiles: [rolloutPath], cursors, queuePath, projectQueuePath, source: "codex",
+      publicRepoResolver: resolver,
+    });
+    assert.equal(cursors.files[rolloutPath].lastTotal.total_tokens, before);
+    assert.equal(before, 200);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -3186,6 +3501,77 @@ test("parseCursorApiIncremental treats Cursor CSV as authoritative and replaces 
   }
 });
 
+test("parseCursorApiIncremental keeps request-only rows as 1-request records (issue #998)", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-cursor-request-only-"));
+  try {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+
+    const result = await parseCursorApiIncremental({
+      records: [
+        {
+          date: "2026-10-01T08:00:00.000Z",
+          model: "grok-bot-automation",
+          kind: "Included",
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+        },
+      ],
+      cursors,
+      queuePath,
+      source: "cursor",
+    });
+    assert.equal(result.eventsAggregated, 1);
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].conversation_count, 1);
+    assert.equal(queued[0].total_tokens, 0);
+    assert.equal(
+      cursors.hourly.buckets["cursor|grok-bot-automation|2026-10-01T08:00:00.000Z"].totals
+        .conversation_count,
+      1,
+    );
+    assert.equal(cursors.cursorApi.lastRecordTimestamp, "2026-10-01T08:00:00.000Z");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseCursorApiIncremental still skips all-zero rows without a model identity", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-cursor-degenerate-"));
+  try {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+
+    const result = await parseCursorApiIncremental({
+      records: [
+        {
+          date: "2026-10-01T08:00:00.000Z",
+          model: "",
+          kind: "Included",
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+        },
+      ],
+      cursors,
+      queuePath,
+      source: "cursor",
+    });
+    assert.equal(result.eventsAggregated, 0);
+    assert.equal(result.bucketsQueued, 0);
+    assert.equal((await readJsonLines(queuePath)).length, 0);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("parseCursorApiIncremental preserves history older than a windowed/truncated export", async () => {
   // Guard (2026-06 audit): the wipe-then-refill design assumes the Cursor
   // export is full-history. If the endpoint ever returns a windowed export
@@ -3589,8 +3975,29 @@ test("readZcodeDbMessages preserves legacy history before native model_usage beg
       id: "legacy-covered-by-native",
       time: { created: 1787105605912, completed: 1787105665912 },
     };
+    // ZCode renamed the assistant-message field providerID -> providerId
+    // (lowercase d, ~2026-09, issue #1008). Post-rename rows only carry the new
+    // spelling and must still count as native history; the bundled sub-agent
+    // blocklist (#216) keeps applying to the new spelling.
+    const legacyRenamedField = {
+      id: "legacy-renamed-field",
+      sessionID: "session-real",
+      role: "assistant",
+      providerId: "account:bigmodel-coding-plan",
+      modelId: "GLM-5.3",
+      time: { created: 1784000000000, completed: 1784000060000 },
+      tokens: { input: 50, output: 8, reasoning: 0, cache: { read: 12, write: 0 } },
+    };
+    const legacyRenamedSubagent = {
+      ...legacyRenamedField,
+      id: "legacy-renamed-subagent",
+      providerId: "openai",
+      modelId: "gpt-5",
+    };
     const beforeJson = JSON.stringify(legacyBeforeNative).replace(/'/g, "''");
     const coveredJson = JSON.stringify(legacyCoveredByNative).replace(/'/g, "''");
+    const renamedJson = JSON.stringify(legacyRenamedField).replace(/'/g, "''");
+    const renamedSubagentJson = JSON.stringify(legacyRenamedSubagent).replace(/'/g, "''");
     runSqliteWrite(dbPath, `
       CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
       CREATE TABLE message (
@@ -3618,6 +4025,8 @@ test("readZcodeDbMessages preserves legacy history before native model_usage beg
       INSERT INTO session VALUES ('session-real', '/real/project');
       INSERT INTO message VALUES
         ('legacy-before-native', 'session-real', 1781514000000, 1781514060000, '${beforeJson}'),
+        ('legacy-renamed-field', 'session-real', 1784000000000, 1784000060000, '${renamedJson}'),
+        ('legacy-renamed-subagent', 'session-real', 1784000060000, 1784000120000, '${renamedSubagentJson}'),
         ('legacy-covered-by-native', 'session-real', 1787105605912, 1787105665912, '${coveredJson}');
       INSERT INTO model_usage VALUES
         ('native', 'logical-native', 0, 'session-real', 'builtin:zai-start-plan', 'GLM-5.3',
@@ -3625,9 +4034,15 @@ test("readZcodeDbMessages preserves legacy history before native model_usage beg
     `);
 
     const rows = readZcodeDbMessages(dbPath);
-    assert.deepEqual(rows.map((row) => row.id), ["legacy-before-native", "native"]);
+    assert.deepEqual(rows.map((row) => row.id), [
+      "legacy-before-native",
+      "legacy-renamed-field",
+      "native",
+    ]);
     assert.equal(rows[0].data.modelID, "GLM-5.2");
-    assert.equal(rows[1].data.modelID, "GLM-5.3");
+    assert.equal(rows[1].data.modelId, "GLM-5.3");
+    assert.equal(rows[1].data.providerId, "account:bigmodel-coding-plan");
+    assert.equal(rows[2].data.modelID, "GLM-5.3");
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -4444,7 +4859,7 @@ test("parseRolloutIncremental persists selected-model state and bills an observe
   }
 });
 
-test("parseRolloutIncremental backfills unknown into dominant known model", async () => {
+test("parseRolloutIncremental every-code backfills unknown into dominant known model", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-rollout-"));
   try {
     const rolloutPath = path.join(tmp, "rollout-test.jsonl");
@@ -4507,7 +4922,7 @@ test("parseRolloutIncremental backfills unknown into dominant known model", asyn
 
     await fs.writeFile(rolloutPath, lines.join("\n") + "\n", "utf8");
 
-    const res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+    const res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath, source: "every-code" });
     assert.equal(res.bucketsQueued, 2);
 
     const queued = await readJsonLines(queuePath);
@@ -4526,7 +4941,7 @@ test("parseRolloutIncremental backfills unknown into dominant known model", asyn
   }
 });
 
-test("parseRolloutIncremental chooses dominant model deterministically on tie", async () => {
+test("parseRolloutIncremental every-code chooses dominant model deterministically on tie", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-rollout-"));
   try {
     const rolloutPath = path.join(tmp, "rollout-test.jsonl");
@@ -4583,7 +4998,7 @@ test("parseRolloutIncremental chooses dominant model deterministically on tie", 
 
     await fs.writeFile(rolloutPath, lines.join("\n") + "\n", "utf8");
 
-    const res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+    const res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath, source: "every-code" });
     assert.equal(res.bucketsQueued, 2);
 
     const queued = await readJsonLines(queuePath);
@@ -4842,7 +5257,7 @@ test("parseRolloutIncremental retracts prior every-code alignment when target ch
   }
 });
 
-test("parseRolloutIncremental retracts unknown when known model appears later", async () => {
+test("parseRolloutIncremental every-code retracts unknown when known model appears later", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-rollout-"));
   try {
     const rolloutPath = path.join(tmp, "rollout-test.jsonl");
@@ -4880,7 +5295,7 @@ test("parseRolloutIncremental retracts unknown when known model appears later", 
     ];
     await fs.writeFile(rolloutPath, lines.join("\n") + "\n", "utf8");
 
-    let res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+    let res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath, source: "every-code" });
     assert.equal(res.bucketsQueued, 1);
 
     let queued = await readJsonLines(queuePath);
@@ -4894,7 +5309,7 @@ test("parseRolloutIncremental retracts unknown when known model appears later", 
     ];
     await fs.appendFile(rolloutPath, append.join("\n") + "\n", "utf8");
 
-    res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath });
+    res = await parseRolloutIncremental({ rolloutFiles: [rolloutPath], cursors, queuePath, source: "every-code" });
     assert.equal(res.bucketsQueued, 2);
 
     queued = await readJsonLines(queuePath);
@@ -5006,6 +5421,47 @@ test("parseRolloutIncremental recomputes every-code alignment on codex-only upda
     const byModel = new Map(everyDelta.map((row) => [row.model, row]));
     assert.equal(byModel.get("gpt-4o")?.total_tokens, 0);
     assert.equal(byModel.get("gpt-4o-mini")?.total_tokens, everyUsage.total_tokens);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseClaudeIncremental skips OmO-mirrored sdk-ts external Claude SDK usage", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-claude-omo-"));
+  try {
+    const claudePath = path.join(tmp, "agent-claude.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const model = "claude-opus-5-5";
+    const lines = [
+      buildClaudeUsageLine({
+        ts: "2026-09-27T06:30:00.000Z",
+        input: 1000,
+        output: 500,
+        model,
+        entrypoint: "sdk-ts",
+        userType: "external",
+        msgId: "msg-omo-mirror",
+      }),
+      buildClaudeUsageLine({
+        ts: "2026-09-27T06:35:00.000Z",
+        input: 200,
+        output: 50,
+        model,
+        entrypoint: "cli",
+        msgId: "msg-real-claude",
+      }),
+    ];
+    await fs.writeFile(claudePath, lines.join("\n") + "\n", "utf8");
+    const res = await parseClaudeIncremental({
+      projectFiles: [{ path: claudePath, source: "claude" }],
+      cursors,
+      queuePath,
+    });
+    assert.equal(res.eventsAggregated, 1);
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].input_tokens, 200);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -5622,6 +6078,8 @@ function buildClaudeUsageLine({
   cacheRead,
   msgId,
   requestId,
+  entrypoint,
+  userType,
 }) {
   const obj = {
     timestamp: ts,
@@ -5638,6 +6096,8 @@ function buildClaudeUsageLine({
   };
   if (typeof msgId === "string") obj.message.id = msgId;
   if (typeof requestId === "string") obj.requestId = requestId;
+  if (typeof entrypoint === "string") obj.entrypoint = entrypoint;
+  if (typeof userType === "string") obj.userType = userType;
   return JSON.stringify(obj);
 }
 
@@ -9084,7 +9544,7 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
       JSON.stringify({
         id: "sess_54d63bb9-e719-461e-a3b0-52ba957d6fb9",
         modelId: "auto",
-        createdAt: "2026-07-22T03:24:00.000Z",
+        createdAt: "2026-10-15T03:24:00.000Z",
       }),
     );
     const messagesPath = path.join(sessionDir, "messages.jsonl");
@@ -9092,17 +9552,17 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
       const events = [
         {
           id: "user-1",
-          timestamp: "2026-07-22T03:24:03.717Z",
+          timestamp: "2026-10-15T03:24:03.717Z",
           payload: { type: "user", content: "u".repeat(400) },
         },
         {
           id: "exec-1-turn-start",
-          timestamp: "2026-07-22T03:24:04.000Z",
+          timestamp: "2026-10-15T03:24:04.000Z",
           payload: { type: "turn_start", executionId: "exec-1" },
         },
         {
           id: "exec-1-reasoning",
-          timestamp: "2026-07-22T03:24:05.000Z",
+          timestamp: "2026-10-15T03:24:05.000Z",
           payload: {
             type: "assistant",
             operationType: "Reasoning",
@@ -9113,7 +9573,7 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         },
         {
           id: "exec-1-tool-call",
-          timestamp: "2026-07-22T03:24:05.200Z",
+          timestamp: "2026-10-15T03:24:05.200Z",
           payload: {
             type: "tool_call",
             executionId: "exec-1",
@@ -9124,7 +9584,7 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         // model request — must be counted as input chars, not skipped.
         {
           id: "exec-1-tool-result",
-          timestamp: "2026-07-22T03:24:05.500Z",
+          timestamp: "2026-10-15T03:24:05.500Z",
           payload: {
             type: "tool_result",
             executionId: "exec-1",
@@ -9133,7 +9593,7 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         },
         {
           id: "exec-1-say",
-          timestamp: "2026-07-22T03:24:06.000Z",
+          timestamp: "2026-10-15T03:24:06.000Z",
           payload: {
             type: "assistant",
             operationType: "Say",
@@ -9143,14 +9603,14 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         },
         {
           id: "exec-1-turn-end",
-          timestamp: "2026-07-22T03:24:07.000Z",
+          timestamp: "2026-10-15T03:24:07.000Z",
           payload: { type: "turn_end", executionId: "exec-1" },
         },
         // Credits are billing metadata and may arrive after turn_end. Keep
         // their attribution independent from the token turn state machine.
         {
           id: "exec-1-usage",
-          timestamp: "2026-07-22T03:24:07.500Z",
+          timestamp: "2026-10-15T03:24:07.500Z",
           payload: {
             type: "usage_summary",
             executionId: "exec-1",
@@ -9162,17 +9622,17 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         },
         {
           id: "user-2",
-          timestamp: "2026-07-22T03:25:00.000Z",
+          timestamp: "2026-10-15T03:25:00.000Z",
           payload: { type: "user", content: "v".repeat(200) },
         },
         {
           id: "exec-2-turn-start",
-          timestamp: "2026-07-22T03:25:01.000Z",
+          timestamp: "2026-10-15T03:25:01.000Z",
           payload: { type: "turn_start", executionId: "exec-2" },
         },
         {
           id: "exec-2-say",
-          timestamp: "2026-07-22T03:25:02.000Z",
+          timestamp: "2026-10-15T03:25:02.000Z",
           payload: {
             type: "assistant",
             operationType: "Say",
@@ -9185,7 +9645,7 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
         // perturb the char approximation (#366 Problem 2 is tracked apart).
         {
           id: "exec-2-usage",
-          timestamp: "2026-07-22T03:25:03.000Z",
+          timestamp: "2026-10-15T03:25:03.000Z",
           payload: {
             type: "usage_summary",
             executionId: "exec-2",
@@ -9253,8 +9713,11 @@ test("parseKiroCliIncremental parses Kiro CLI 2.13 event sessions with per-turn 
     assert.equal(firstCredits.record_count, 2);
     assert.equal(firstCredits.session_count, 1);
     assert.equal(firstCredits.file_count, 1);
-    assert.equal(firstCredits.latest_at, "2026-07-22T03:25:03.000Z");
-    assert.equal((await fs.stat(creditsPath)).mode & 0o777, 0o600);
+    assert.equal(firstCredits.latest_at, "2026-10-15T03:25:03.000Z");
+    // POSIX mode bits do not describe Windows NTFS access permissions.
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(creditsPath)).mode & 0o777, 0o600);
+    }
 
     const second = await rolloutModule.parseKiroCliIncremental({
       cursors,
@@ -9943,6 +10406,131 @@ test("parseOmpIncremental parses a single session and queues correct 30-min buck
     assert.equal(queued[0].output_tokens, 20);
     assert.equal(queued[0].total_tokens, 120);
     assert.equal(queued[0].hour_start, "2026-04-05T14:00:00.000Z");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseOmpIncremental skips an oversized record and still counts usage after it", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-omp-"));
+  try {
+    const sessionsDir = path.join(tmp, "sessions", "--test--");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const maxRecordBytes = 1024;
+    const ts = Date.UTC(2026, 9, 1, 8, 10);
+    const toolResult = JSON.stringify({
+      type: "message",
+      id: "big00001",
+      message: {
+        role: "toolResult",
+        toolName: "eval",
+        content: [{ type: "text", text: "x".repeat(4096) }],
+      },
+    });
+    const assistant = buildOmpAssistantLine({
+      id: "use00001",
+      model: "claude-sonnet-4-5",
+      input: 100,
+      output: 20,
+      timestamp: ts,
+      totalTokens: 120,
+    });
+    assert.ok(Buffer.byteLength(toolResult, "utf8") > maxRecordBytes);
+    assert.ok(Buffer.byteLength(assistant, "utf8") <= maxRecordBytes);
+    await fs.writeFile(
+      filePath,
+      [buildOmpSessionHeader(), toolResult, assistant].join("\n") + "\n",
+      "utf8",
+    );
+
+    const first = await parseOmpIncremental({
+      sessionFiles: [filePath],
+      cursors,
+      queuePath,
+      maxRecordBytes,
+    });
+    assert.equal(first.eventsAggregated, 1);
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].source, "omp");
+    assert.equal(queued[0].model, "claude-sonnet-4-5");
+    assert.equal(queued[0].input_tokens, 100);
+    assert.equal(queued[0].output_tokens, 20);
+    assert.equal(queued[0].total_tokens, 120);
+    assert.equal(queued[0].hour_start, "2026-10-01T08:00:00.000Z");
+    const fileSize = (await fs.stat(filePath)).size;
+    assert.equal(cursors.omp.fileOffsets[filePath].size, fileSize);
+
+    const second = await parseOmpIncremental({
+      sessionFiles: [filePath],
+      cursors,
+      queuePath,
+      maxRecordBytes,
+    });
+    assert.equal(second.eventsAggregated, 0);
+    assert.equal((await readJsonLines(queuePath)).length, 1);
+    assert.equal(cursors.omp.fileOffsets[filePath].size, fileSize);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseOmpIncremental retries a half-written final record", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-omp-"));
+  try {
+    const sessionsDir = path.join(tmp, "sessions", "--test--");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const ts = Date.UTC(2026, 9, 1, 8, 10);
+    const assistantA = buildOmpAssistantLine({
+      id: "use0000a",
+      model: "claude-sonnet-4-5",
+      input: 100,
+      output: 20,
+      timestamp: ts,
+      totalTokens: 120,
+    });
+    const assistantB = buildOmpAssistantLine({
+      id: "use0000b",
+      model: "claude-sonnet-4-5",
+      input: 50,
+      output: 10,
+      timestamp: ts + 60_000,
+      totalTokens: 60,
+    });
+    const completePrefix = [buildOmpSessionHeader(), assistantA].join("\n") + "\n";
+    const splitAt = Math.floor(assistantB.length / 2);
+    const partialB = assistantB.slice(0, splitAt);
+    assert.throws(() => JSON.parse(partialB), SyntaxError);
+    await fs.writeFile(filePath, completePrefix + partialB, "utf8");
+
+    const first = await parseOmpIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(first.eventsAggregated, 1);
+    assert.equal(cursors.omp.fileOffsets[filePath].size, Buffer.byteLength(completePrefix, "utf8"));
+    const queuedFirst = await readJsonLines(queuePath);
+    assert.equal(queuedFirst.length, 1);
+    assert.equal(queuedFirst[0].input_tokens, 100);
+    assert.equal(queuedFirst[0].output_tokens, 20);
+    assert.equal(queuedFirst[0].total_tokens, 120);
+    assert.equal(queuedFirst[0].hour_start, "2026-10-01T08:00:00.000Z");
+
+    await fs.appendFile(filePath, assistantB.slice(splitAt) + "\n", "utf8");
+    const second = await parseOmpIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(second.eventsAggregated, 1);
+    assert.equal(cursors.omp.fileOffsets[filePath].size, (await fs.stat(filePath)).size);
+    const queuedSecond = await readJsonLines(queuePath);
+    const latest = queuedSecond.at(-1);
+    assert.equal(latest.source, "omp");
+    assert.equal(latest.model, "claude-sonnet-4-5");
+    assert.equal(latest.hour_start, "2026-10-01T08:00:00.000Z");
+    assert.equal(latest.input_tokens, 150);
+    assert.equal(latest.output_tokens, 30);
+    assert.equal(latest.total_tokens, 180);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -12242,6 +12830,15 @@ test("listAntigravitySessionFiles discovers transcripts across sibling 2.0 brain
       "logs",
       "transcript.jsonl",
     );
+    const insidersTranscript = path.join(
+      tmp,
+      "antigravity-insiders",
+      "brain",
+      "session-insiders",
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
     const cliTranscript = path.join(
       tmp,
       "antigravity-cli",
@@ -12251,7 +12848,7 @@ test("listAntigravitySessionFiles discovers transcripts across sibling 2.0 brain
       "logs",
       "transcript.jsonl",
     );
-    for (const p of [legacyTranscript, ideTranscript, cliTranscript]) {
+    for (const p of [legacyTranscript, ideTranscript, insidersTranscript, cliTranscript]) {
       await fs.mkdir(path.dirname(p), { recursive: true });
       await fs.writeFile(p, "");
     }
@@ -12259,14 +12856,18 @@ test("listAntigravitySessionFiles discovers transcripts across sibling 2.0 brain
     const dirs = [
       path.join(tmp, "antigravity", "brain"),
       path.join(tmp, "antigravity-ide", "brain"),
+      path.join(tmp, "antigravity-insiders", "brain"),
       path.join(tmp, "antigravity-cli", "brain"),
       path.join(tmp, "antigravity-missing", "brain"),
     ];
     const results = await Promise.all(dirs.map((d) => listAntigravitySessionFiles(d)));
     const all = results.flat();
 
-    assert.deepEqual(all.sort(), [cliTranscript, ideTranscript, legacyTranscript].sort());
-    assert.deepEqual(results[3], []);
+    assert.deepEqual(
+      all.sort(),
+      [cliTranscript, ideTranscript, insidersTranscript, legacyTranscript].sort(),
+    );
+    assert.deepEqual(results[4], []);
 
     const inventory = await listAntigravityTranscriptsWithStatus(tmp);
     assert.deepEqual(inventory.files.sort(), all.sort());
@@ -12277,7 +12878,10 @@ test("listAntigravitySessionFiles discovers transcripts across sibling 2.0 brain
       tmp,
       new Set([cliTranscript]),
     );
-    assert.deepEqual(partialInventory.files.sort(), [legacyTranscript, ideTranscript].sort());
+    assert.deepEqual(
+      partialInventory.files.sort(),
+      [legacyTranscript, ideTranscript, insidersTranscript].sort(),
+    );
     assert.equal(partialInventory.complete, false);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });

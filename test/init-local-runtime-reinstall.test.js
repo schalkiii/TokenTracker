@@ -5,6 +5,8 @@ const fs = require("node:fs/promises");
 const { spawn, spawnSync } = require("node:child_process");
 const http = require("node:http");
 const { test } = require("node:test");
+const publicAnon = [Buffer.from('{"alg":"HS256"}').toString("base64url"),
+  Buffer.from('{"role":"anon"}').toString("base64url"), "test-signature"].join(".");
 const { installLocalTrackerApp } = require("../src/commands/init");
 
 const repoRoot = path.join(__dirname, "..");
@@ -25,7 +27,7 @@ function runLocalTracker(trackerBinPath, args, env) {
   });
 }
 
-test("init first sync keeps local data and credentials without uploading when not opted in", async (t) => {
+test("init first sync keeps local data and credentials without uploading when not opted in", { timeout: 300_000 }, async (t) => {
   let uploads = 0;
   const server = http.createServer((_req, res) => {
     uploads += 1;
@@ -41,7 +43,9 @@ test("init first sync keeps local data and credentials without uploading when no
       await fs.mkdir(trackerDir, { recursive: true });
       const prefPath = path.join(trackerDir, "cloud-sync-pref.json");
       if (enabled !== null) await fs.writeFile(prefPath, JSON.stringify({ enabled }));
-      await fs.writeFile(path.join(trackerDir, "config.json"), JSON.stringify({ deviceToken: "fixture-token" }));
+      const baseUrl = `http://127.0.0.1:${server.address().port}`;
+      await fs.writeFile(path.join(trackerDir, "config.json"), JSON.stringify({ baseUrl, anonKey: publicAnon,
+        deviceToken: "fixture-token", deviceTokenBaseUrl: baseUrl }));
       const row = { source: "fixture", model: "fixture-model", hour_start: "2026-10-01T00:00:00Z", input_tokens: 20, output_tokens: 0, total_tokens: 20 };
       await fs.writeFile(path.join(trackerDir, "queue.jsonl"), JSON.stringify(row) + "\n");
       const env = {
@@ -69,7 +73,7 @@ test("init first sync keeps local data and credentials without uploading when no
   }
 });
 
-test("init can rerun from installed local runtime without self-deleting app source", async () => {
+test("init can rerun from installed local runtime without self-deleting app source", { timeout: 300_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-init-local-runtime-"));
   const env = {
     ...process.env,
@@ -77,6 +81,10 @@ test("init can rerun from installed local runtime without self-deleting app sour
     USERPROFILE: tmp,
     CODEX_HOME: path.join(tmp, ".codex"),
     OPENCODE_CONFIG_DIR: path.join(tmp, ".config", "opencode"),
+    // This case checks runtime re-entry, not scanning. A detached first sync
+    // can otherwise outlive init and recreate files during Windows cleanup.
+    TOKENTRACKER_SKIP_FIRST_SYNC: "1",
+    TOKENTRACKER_NO_TELEMETRY: "1",
   };
   delete env.TOKENTRACKER_DEVICE_TOKEN;
 
@@ -85,7 +93,7 @@ test("init can rerun from installed local runtime without self-deleting app sour
     await fs.writeFile(path.join(env.CODEX_HOME, "config.toml"), "# empty\n", "utf8");
 
     const firstInit = runTracker(
-      ["init", "--yes", "--no-auth", "--no-open", "--base-url", "https://example.invalid"],
+      ["init", "--yes", "--no-auth", "--no-open", "--base-url", "https://example.invalid", "--anon-key", publicAnon],
       env,
     );
     assert.equal(
@@ -99,7 +107,7 @@ test("init can rerun from installed local runtime without self-deleting app sour
 
     const secondInit = runLocalTracker(
       trackerBinPath,
-      ["init", "--yes", "--no-auth", "--no-open", "--base-url", "https://example.invalid"],
+      ["init", "--yes", "--no-auth", "--no-open", "--base-url", "https://example.invalid", "--anon-key", publicAnon],
       env,
     );
     assert.equal(
@@ -114,7 +122,7 @@ test("init can rerun from installed local runtime without self-deleting app sour
   }
 });
 
-test("installLocalTrackerApp replaces stale installed runtime and writes a package marker", async () => {
+test("installLocalTrackerApp replaces stale installed runtime and writes a package marker", { timeout: 300_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-runtime-refresh-"));
   try {
     const appDir = path.join(tmp, "app");
@@ -132,6 +140,16 @@ test("installLocalTrackerApp replaces stale installed runtime and writes a packa
     assert.equal(typeof marker.version, "string");
     await fs.stat(path.join(appDir, "src", "lib", "codex-context-breakdown.js"));
     await fs.stat(path.join(appDir, "dashboard", "dist", "index.html"));
+
+    const installedParser = path.join(appDir, "src", "lib", "cursor-config.js");
+    await fs.utimes(installedParser, new Date(1000), new Date(1000));
+    await Promise.all([
+      installLocalTrackerApp({ appDir }),
+      installLocalTrackerApp({ appDir }),
+    ]);
+    assert.equal((await fs.stat(installedParser)).mtimeMs, 1000,
+      "overlapping refreshes must preserve unchanged files");
+    assert.equal(await fs.readFile(installedParser, "utf8"), copiedParser);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

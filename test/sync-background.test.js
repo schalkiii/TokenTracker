@@ -6,7 +6,8 @@ const { test } = require("node:test");
 
 const { cmdSync } = require("../src/commands/sync");
 const { openLock } = require("../src/lib/fs");
-const { DEFAULT_ANON_KEY } = require("../src/lib/runtime-config");
+const { publicAnonFor } = require("./helpers/public-instance-fixture");
+const publicAnon = publicAnonFor("background");
 
 function tokenCountLine({ ts, totalTokens }) {
   const usage = {
@@ -130,11 +131,45 @@ async function writeReasonixTelemetry(home, sessionId) {
   }));
 }
 
+async function writeMuseSession(home, sessionId) {
+  const dir = path.join(home, ".local", "share", "muse", "sessions", "2026", "06", "30", sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  const at = Date.parse("2026-06-30T10:15:00Z") * 1000;
+  const records = [
+    {
+      id: `${sessionId}-model`,
+      recorded_at: at,
+      payload_type: "run.model.configured",
+      payload: { kind: "run_model", record: { run_stream: { kind: "run", id: "run-1" }, model_id: "muse-wonder-full-1.0" } },
+    },
+    {
+      id: `${sessionId}-usage`,
+      recorded_at: at,
+      payload_type: "runtime.session",
+      payload: {
+        kind: "run",
+        run_id: "run-1",
+        event: {
+          kind: "goal_usage_attribution",
+          record: {
+            usage_id: `${sessionId}-usage`,
+            usage_family: "provider",
+            quantity: { unit: "tokens", reported: true, input_tokens: 100, cached_tokens: 60, output_tokens: 9, reasoning_tokens: 4 },
+          },
+        },
+      },
+    },
+  ];
+  await fs.writeFile(path.join(dir, "session.jsonl"), records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+}
+
 async function withTempSyncEnv(fn) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-background-"));
   const saved = {
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
     CODEX_HOME: process.env.CODEX_HOME,
     CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
     CODE_HOME: process.env.CODE_HOME,
@@ -143,6 +178,7 @@ async function withTempSyncEnv(fn) {
     OPENCODE_HOME: process.env.OPENCODE_HOME,
     XDG_DATA_HOME: process.env.XDG_DATA_HOME,
     TOKENTRACKER_REASONIX_HOME: process.env.TOKENTRACKER_REASONIX_HOME,
+    TOKENTRACKER_MUSE_HOME: process.env.TOKENTRACKER_MUSE_HOME,
     TOKENTRACKER_TRAE_HOME: process.env.TOKENTRACKER_TRAE_HOME,
     TOKENTRACKER_TRAE_DB: process.env.TOKENTRACKER_TRAE_DB,
     REASONIX_STATE_HOME: process.env.REASONIX_STATE_HOME,
@@ -157,6 +193,8 @@ async function withTempSyncEnv(fn) {
   try {
     process.env.HOME = home;
     process.env.USERPROFILE = home;
+    process.env.APPDATA = path.join(home, "AppData", "Roaming");
+    process.env.LOCALAPPDATA = path.join(home, "AppData", "Local");
     process.env.CODEX_HOME = path.join(home, ".codex");
     delete process.env.CLAUDE_CONFIG_DIR;
     process.env.CODE_HOME = path.join(home, ".code");
@@ -168,10 +206,11 @@ async function withTempSyncEnv(fn) {
     process.env.TOKENTRACKER_TRAE_HOME = path.join(home, "trae-data");
     delete process.env.TOKENTRACKER_TRAE_DB;
     delete process.env.TOKENTRACKER_REASONIX_HOME;
+    delete process.env.TOKENTRACKER_MUSE_HOME;
     delete process.env.REASONIX_STATE_HOME;
     delete process.env.TOKENTRACKER_DEVICE_TOKEN;
     delete process.env.TOKENTRACKER_INSFORGE_BASE_URL;
-    delete process.env.TOKENTRACKER_INSFORGE_ANON_KEY;
+    process.env.TOKENTRACKER_INSFORGE_ANON_KEY = publicAnon;
     delete process.env.TOKENTRACKER_OPENCLAW_AGENT_ID;
     delete process.env.TOKENTRACKER_OPENCLAW_PREV_SESSION_ID;
     delete process.env.TOKENTRACKER_OPENCLAW_SESSION_KEY;
@@ -282,6 +321,53 @@ async function readCursors(home) {
   return JSON.parse(await fs.readFile(path.join(home, ".tokentracker", "tracker", "cursors.json"), "utf8"));
 }
 
+async function syncAfterObservedContention(t, home, args, lockWaitOptions) {
+  const trackerDir = path.join(home, ".tokentracker", "tracker");
+  await fs.mkdir(trackerDir, { recursive: true });
+  const lockPath = path.join(trackerDir, "sync.lock");
+  const active = await openLock(lockPath, { quietIfLocked: true });
+  assert.ok(active);
+
+  // These success cases verify retries and publication, not filesystem speed.
+  // Keep their clock still; the separate busy-lock cases test real deadlines.
+  const now = Date.now();
+  const clock = t.mock.method(Date, "now", () => now);
+  const originalOpen = fs.open;
+  let blockedAttempts = 0;
+  let observedContention;
+  const contention = new Promise((resolve) => { observedContention = resolve; });
+  const open = t.mock.method(fs, "open", async (...params) => {
+    try {
+      return await originalOpen(...params);
+    } catch (error) {
+      if (params[0] === lockPath && params[1] === "wx" && error.code === "EEXIST") {
+        blockedAttempts += 1;
+        if (blockedAttempts === 2) observedContention();
+      }
+      throw error;
+    }
+  });
+  let released = false;
+  try {
+    const sync = cmdSync(args, { lockWaitOptions });
+    // Attach rejection handling immediately and require an actual lock retry
+    // before release, rather than assuming a 30ms sleep establishes overlap.
+    await Promise.race([
+      contention,
+      sync.then(() => { throw new Error("sync completed before the held lock was released"); }),
+    ]);
+    await assert.rejects(readQueue(home), { code: "ENOENT" });
+    await active.release();
+    released = true;
+    await sync;
+    assert.ok(blockedAttempts >= 2);
+  } finally {
+    open.mock.restore();
+    clock.mock.restore();
+    if (!released) await active.release();
+  }
+}
+
 test("background auto sync skips deep Codex archives", async () => {
   await withTempSyncEnv(async (home) => {
     const codexHome = process.env.CODEX_HOME;
@@ -321,7 +407,7 @@ test("background drain skips deep Codex archives while retaining drain semantics
   });
 });
 
-test("Codex notify sync catches up after an overlapping background sync releases the lock", async () => {
+test("Codex notify sync catches up after an overlapping background sync releases the lock", async (t) => {
   await withTempSyncEnv(async (home) => {
     const codexHome = process.env.CODEX_HOME;
     await writeCodexRollout(
@@ -331,20 +417,11 @@ test("Codex notify sync catches up after an overlapping background sync releases
       73,
     );
 
-    const trackerDir = path.join(home, ".tokentracker", "tracker");
-    await fs.mkdir(trackerDir, { recursive: true });
-    const active = await openLock(path.join(trackerDir, "sync.lock"), {
-      quietIfLocked: true,
-    });
-    assert.ok(active);
-
-    const notificationSync = cmdSync(
+    await syncAfterObservedContention(
+      t, home,
       ["--auto", "--from-notify", "--source=codex"],
-      { lockWaitOptions: { notifyWaitMs: 500, notifyPollMs: 10 } },
+      { notifyWaitMs: 500, notifyPollMs: 10 },
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    await active.release();
-    await notificationSync;
 
     const queue = await readQueue(home);
     assert.match(queue, /"source":"codex"/);
@@ -352,7 +429,7 @@ test("Codex notify sync catches up after an overlapping background sync releases
   });
 });
 
-test("native account publication waits for an overlapping sync instead of reporting success", async () => {
+test("native account publication waits for an overlapping sync instead of reporting success", async (t) => {
   await withTempSyncEnv(async (home) => {
     const codexHome = process.env.CODEX_HOME;
     await writeCodexRollout(
@@ -362,20 +439,11 @@ test("native account publication waits for an overlapping sync instead of report
       79,
     );
 
-    const trackerDir = path.join(home, ".tokentracker", "tracker");
-    await fs.mkdir(trackerDir, { recursive: true });
-    const active = await openLock(path.join(trackerDir, "sync.lock"), {
-      quietIfLocked: true,
-    });
-    assert.ok(active);
-
-    const publicationSync = cmdSync(
+    await syncAfterObservedContention(
+      t, home,
       ["--auto", "--background", "--publish-account"],
-      { lockWaitOptions: { priorityWaitMs: 500, priorityPollMs: 10 } },
+      { priorityWaitMs: 500, priorityPollMs: 10 },
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    await active.release();
-    await publicationSync;
 
     const queue = await readQueue(home);
     assert.match(queue, /"source":"codex"/);
@@ -660,6 +728,39 @@ test("default background auto sync includes Reasonix telemetry", async () => {
   });
 });
 
+test("all-local background sync includes Muse Code sessions", async () => {
+  await withTempSyncEnv(async (home) => {
+    await writeMuseSession(home, "muse-all-local");
+
+    await cmdSync(["--auto", "--background", "--all-local-sources"]);
+
+    const firstQueue = await readQueue(home);
+    const [row] = firstQueue.trim().split("\n").map(JSON.parse);
+    assert.equal(row.source, "muse");
+    assert.equal(row.model, "muse-wonder-full-1.0");
+    assert.equal(row.input_tokens, 40);
+    assert.equal(row.cached_input_tokens, 60);
+    assert.equal(row.output_tokens, 9);
+    assert.equal(row.reasoning_output_tokens, 4);
+    assert.equal(row.total_tokens, 109);
+
+    await cmdSync(["--auto", "--background", "--all-local-sources"]);
+    assert.equal(await readQueue(home), firstQueue);
+  });
+});
+
+test("default background auto sync includes Muse Code sessions", async () => {
+  await withTempSyncEnv(async (home) => {
+    await writeMuseSession(home, "muse-default-background");
+
+    await cmdSync(["--auto", "--background"]);
+
+    const queue = await readQueue(home);
+    assert.match(queue, /"source":"muse"/);
+    assert.match(queue, /"model":"muse-wonder-full-1.0"/);
+  });
+});
+
 test("background auto sync skips full-source migration and backfill work", async () => {
   await withTempSyncEnv(async (home) => {
     const trackerDir = path.join(home, ".tokentracker", "tracker");
@@ -673,8 +774,11 @@ test("background auto sync skips full-source migration and backfill work", async
         files: {},
         hourly: {
           buckets: {
-            "codex|gpt-5.5|2026-06-30T00:00:00.000Z": {
-              totals: { total_tokens: 99 },
+            "codex|gpt-6-astra|2026-06-30T00:00:00.000Z": {
+              totals: { total_tokens: 100 },
+            },
+            "codex|gpt-6.1-sol|2026-06-30T00:00:00.000Z": {
+              totals: { total_tokens: 200 },
             },
           },
           groupQueued: {
@@ -693,7 +797,19 @@ test("background auto sync skips full-source migration and backfill work", async
     assert.equal(cursors.migrations.rolloutCumulativeDeltaReparse_2026_05, undefined);
     assert.equal(cursors.migrations.cloudConversationsBackfill_2026_06, undefined);
     assert.deepEqual(JSON.parse(await fs.readFile(queueStatePath, "utf8")), { offset: 123 });
-    await assert.rejects(readQueue(home), { code: "ENOENT" });
+    // Attribution repair only re-emits existing buckets; it does not scan
+    // historical logs or reset upload state as the full-source repairs do.
+    const repairedQueue = await readQueue(home);
+    const rows = repairedQueue.trim().split("\n").map(JSON.parse);
+    assert.equal(rows.length, 3);
+    assert.deepEqual(Object.fromEntries(rows.map(row => [row.model, row.total_tokens])), {
+      "gpt-6-astra": 100,
+      "gpt-6.1-sol": 200,
+      unknown: 0,
+    });
+    assert.equal(cursors.hourly.version, 3);
+    await cmdSync(["--auto", "--background"]);
+    assert.deepEqual(await readQueue(home), repairedQueue);
   });
 });
 
@@ -753,11 +869,38 @@ test("explicit account publication uploads after bounded background parsing", as
     }
 
     assert.equal(ingestCalls, 1);
-    assert.equal(ingestHeaders.apikey, DEFAULT_ANON_KEY);
+    assert.equal(ingestHeaders.apikey, publicAnon);
     const queueState = JSON.parse(
       await fs.readFile(path.join(home, ".tokentracker", "tracker", "queue.state.json"), "utf8"),
     );
     assert.ok(queueState.offset > 0);
+  });
+});
+
+test("invalid custom Cloud configuration leaves free local parsing and history intact", async () => {
+  for (const anonKey of [undefined, "ik_unsafe-fixture"]) await withTempSyncEnv(async home => {
+    await writeCodexRollout(process.env.CODEX_HOME, "2026-06-30", "019f16bd-1007-7000-8000-bbbbbbbbbbbb", 74);
+    const tracker = path.join(home, ".tokentracker", "tracker"); await fs.mkdir(tracker, { recursive: true });
+    const config = { baseUrl: "https://missing-public-key.example.test", ...(anonKey ? { anonKey } : {}),
+      deviceToken: "old-device-token", deviceTokenBaseUrl: "https://missing-public-key.example.test" };
+    await fs.writeFile(path.join(tracker, "config.json"), JSON.stringify(config));
+    const originalFetch = global.fetch; const localToken = process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN;
+    let calls = 0;
+    global.fetch = async () => { calls += 1; throw new Error("invalid configuration cannot upload"); };
+    delete process.env.TOKENTRACKER_INSFORGE_ANON_KEY;
+    process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN = "unusable-local-capability";
+    try { await cmdSync(["--auto", "--background", "--publish-account"]); }
+    finally {
+      global.fetch = originalFetch;
+      if (localToken === undefined) delete process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN;
+      else process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN = localToken;
+    }
+    assert.equal(calls, 0);
+    assert.match(await readQueue(home), /"total_tokens":74/);
+    assert.ok(JSON.stringify(await readCursors(home)).includes("019f16bd-1007-7000-8000-bbbbbbbbbbbb"));
+    assert.equal(await fs.stat(path.join(tracker, "queue.state.json")).catch(() => null), null);
+    const retained = JSON.parse(await fs.readFile(path.join(tracker, "config.json"), "utf8"));
+    assert.equal(retained.baseUrl, config.baseUrl); assert.equal(retained.deviceToken, config.deviceToken);
   });
 });
 

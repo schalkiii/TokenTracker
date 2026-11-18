@@ -19,12 +19,16 @@ struct UsageLimitsResponse: Codable, Equatable {
     let codingPlan: CodingPlanLimits?
     let agentPlan: AgentPlanLimits?
     let devin: DevinLimits?
+    let workbuddy: WorkbuddyLimits?
+    let workbuddyAi: WorkbuddyLimits?
+    let deepseek: DeepseekLimits?
 
     enum CodingKeys: String, CodingKey {
         case fetchedAt = "fetched_at"
-        case claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, qoder, qoderCn, codingPlan, agentPlan, devin
+        case claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, qoder, qoderCn, codingPlan, agentPlan, devin, workbuddy, workbuddyAi
         case opencodeGo = "opencodeGo"
         case commandCode = "commandCode"
+        case deepseek
     }
 }
 
@@ -359,11 +363,32 @@ struct GenericLimitWindow: Codable, Equatable {
     let usedPercent: Double
     let resetAt: String?
     let limitWindowSeconds: Double?
+    let limitCredits: Double?
+    let usedCredits: Double?
+    let remainingCredits: Double?
+
+    init(usedPercent: Double, resetAt: String? = nil, limitWindowSeconds: Double? = nil, limitCredits: Double? = nil, usedCredits: Double? = nil, remainingCredits: Double? = nil) {
+        self.usedPercent = usedPercent
+        self.resetAt = resetAt
+        self.limitWindowSeconds = limitWindowSeconds
+        self.limitCredits = limitCredits
+        self.usedCredits = usedCredits
+        self.remainingCredits = remainingCredits
+    }
+
+    var creditsDetail: String? {
+        guard let total = limitCredits, let used = usedCredits, let remaining = remainingCredits,
+              total.isFinite, used.isFinite, remaining.isFinite, total > 0, used >= 0, remaining >= 0 else { return nil }
+        return Strings.limitCreditsDetail(used: used, total: total, remaining: remaining)
+    }
 
     enum CodingKeys: String, CodingKey {
         case usedPercent = "used_percent"
         case resetAt = "reset_at"
         case limitWindowSeconds = "limit_window_seconds"
+        case limitCredits = "limit_credits"
+        case usedCredits = "used_credits"
+        case remainingCredits = "remaining_credits"
     }
 }
 
@@ -449,6 +474,14 @@ struct GeminiLimits: Codable, Equatable {
     }
 }
 
+/// One product's share of the Grok pool (Grok Build, Grok Bot, Imagine, …).
+/// `window.usedPercent` is points of the shared cap, not a separate quota.
+struct GrokProductUsage: Codable, Equatable {
+    let product: String?
+    let label: String?
+    let window: GenericLimitWindow?
+}
+
 struct GrokLimits: Codable, Equatable {
     let configured: Bool
     let error: String?
@@ -457,9 +490,11 @@ struct GrokLimits: Codable, Equatable {
     let periodType: String?
     let primaryWindow: GenericLimitWindow?
     let secondaryWindow: GenericLimitWindow?
+    /// Absent on payloads from older servers.
+    let products: [GrokProductUsage]?
 
     enum CodingKeys: String, CodingKey {
-        case configured, error
+        case configured, error, products
         case planLabel = "plan_label"
         case periodType = "period_type"
         case primaryWindow = "primary_window"
@@ -493,6 +528,10 @@ struct ZcodeLimits: Codable, Equatable {
     let secondaryWindow: GenericLimitWindow?
     let tertiaryWindow: GenericLimitWindow?
     let buckets: [ZcodeBucket]?
+    /// Inventory of unused 5h / weekly reset cards (dashboard `reset_credits`).
+    let resetCredits: ZcodeResetCredits?
+    /// Separate Start-plan grant payload (dashboard `start_plan`).
+    let startPlan: ZcodeStartPlan?
 
     enum CodingKeys: String, CodingKey {
         case configured, error, buckets
@@ -501,10 +540,68 @@ struct ZcodeLimits: Codable, Equatable {
         case primaryWindow = "primary_window"
         case secondaryWindow = "secondary_window"
         case tertiaryWindow = "tertiary_window"
+        case resetCredits = "reset_credits"
+        case startPlan = "start_plan"
     }
 }
 
-/// One ZCode start-plan balance (daily allowance or one-time promotional grant).
+/// Unused ZCode reset-card inventory. Cards with a past `expires_at` are filtered
+/// at render time so a stale payload still decodes.
+struct ZcodeResetCredits: Codable, Equatable {
+    let error: String?
+    let fiveHour: [ZcodeResetCard]?
+    let weekly: [ZcodeResetCard]?
+
+    enum CodingKeys: String, CodingKey {
+        case error
+        case fiveHour = "five_hour"
+        case weekly
+    }
+}
+
+struct ZcodeResetCard: Codable, Equatable {
+    let expiresAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case expiresAt = "expires_at"
+    }
+}
+
+/// Start-plan grants shipped beside a coding-plan ZCode card.
+struct ZcodeStartPlan: Codable, Equatable {
+    let configured: Bool
+    let error: String?
+    let planLabel: String?
+    let planKind: String?
+    let buckets: [ZcodeStartPlanBucket]?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, error, buckets
+        case planLabel = "plan_label"
+        case planKind = "plan_kind"
+    }
+}
+
+struct ZcodeStartPlanBucket: Codable, Equatable {
+    let label: String?
+    let entitlementId: String?
+    let planName: String?
+    let period: String?
+    let remainingUnits: Double?
+    let totalUnits: Double?
+    let window: GenericLimitWindow?
+
+    enum CodingKeys: String, CodingKey {
+        case label, window, period
+        case entitlementId = "entitlement_id"
+        case planName = "plan_name"
+        case remainingUnits = "remaining_units"
+        case totalUnits = "total_units"
+    }
+}
+
+/// One ZCode start-plan balance (daily allowance or one-time promotional grant)
+/// when the server still nests balances under top-level `buckets` (legacy).
 struct ZcodeBucket: Codable, Equatable {
     let label: String?
     let entitlementId: String?
@@ -582,6 +679,7 @@ struct QoderLimits: Codable, Equatable {
     let planLabel: String?
     let primaryWindow: GenericLimitWindow?
     let secondaryWindow: GenericLimitWindow?
+    let tertiaryWindow: GenericLimitWindow?
     let cachedAt: String?
     let stale: Bool?
 
@@ -590,6 +688,7 @@ struct QoderLimits: Codable, Equatable {
         case planLabel = "plan_label"
         case primaryWindow = "primary_window"
         case secondaryWindow = "secondary_window"
+        case tertiaryWindow = "tertiary_window"
         case cachedAt = "cached_at"
     }
 }
@@ -615,6 +714,28 @@ struct CodingPlanLimits: Codable, Equatable {
 }
 
 typealias AgentPlanLimits = CodingPlanLimits
+
+/// One WorkBuddy edition's credits (China and AI each publish their own row).
+/// The plan window is the subscription's base credits with its cycle reset;
+/// the secondary window pools every non-plan credit group (gift, top-up and
+/// platform rewards) and carries no reset, mirroring the desktop app's split.
+struct WorkbuddyLimits: Codable, Equatable {
+    let configured: Bool
+    let error: String?
+    let planLabel: String?
+    let primaryWindow: GenericLimitWindow?
+    let secondaryWindow: GenericLimitWindow?
+    let cachedAt: String?
+    let stale: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, error, stale
+        case planLabel = "plan_label"
+        case primaryWindow = "primary_window"
+        case secondaryWindow = "secondary_window"
+        case cachedAt = "cached_at"
+    }
+}
 
 /// Devin (devin.ai): daily + weekly subscription quota read from the official
 /// GetPlanStatus RPC by the local server, keyed by the Devin CLI's saved
@@ -650,6 +771,38 @@ struct DevinLimits: Codable, Equatable {
         stale: nil,
         authActionRequired: nil
     )
+}
+
+/// DeepSeek (platform.deepseek.com) is pay-as-you-go with no quota windows:
+/// the official balance endpoint is the only documented programmatic source,
+/// so this carries a balance card — one entry per currency, no bars (#960).
+struct DeepseekLimits: Codable, Equatable {
+    let configured: Bool
+    let error: String?
+    let isAvailable: Bool?
+    let balances: [DeepseekBalance]?
+    let credentialSource: String?
+    let cachedAt: String?
+    let stale: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, error, stale, balances
+        case isAvailable = "is_available"
+        case credentialSource = "credential_source"
+        case cachedAt = "cached_at"
+    }
+}
+
+struct DeepseekBalance: Codable, Equatable {
+    let currency: String
+    let total: Double
+    let granted: Double?
+    let toppedUp: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case currency, total, granted
+        case toppedUp = "topped_up"
+    }
 }
 
 struct AntigravityLimits: Codable, Equatable {
@@ -699,6 +852,9 @@ extension UsageLimitsResponse {
             (codingPlan?.configured ?? false, codingPlan?.error),
             (agentPlan?.configured ?? false, agentPlan?.error),
             (devin?.configured ?? false, devin?.error),
+            (workbuddy?.configured ?? false, workbuddy?.error),
+            (workbuddyAi?.configured ?? false, workbuddyAi?.error),
+            (deepseek?.configured ?? false, deepseek?.error),
         ]
         return providers.contains { $0.0 && $0.1 == nil }
     }
@@ -737,7 +893,10 @@ extension UsageLimitsResponse {
             qoderCn: qoderCn,
             codingPlan: codingPlan,
             agentPlan: agentPlan,
-            devin: .unconfigured
+            devin: .unconfigured,
+            workbuddy: workbuddy,
+            workbuddyAi: workbuddyAi,
+            deepseek: deepseek
         )
     }
 }

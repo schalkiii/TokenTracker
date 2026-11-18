@@ -5,10 +5,20 @@ const fssync = require("node:fs");
 const cp = require("node:child_process");
 const readline = require("node:readline");
 const { functionUrlFor, fetchFunctionResponse } = require("../lib/function-url");
+const { cloudUsageResetBlocksUpload, finishCloudDeviceUsageReset } = require("../lib/cloud-usage-reset");
+const { KIMI_MODEL_REPAIR_KEY, repairKimiModelAttribution } = require("../lib/kimi-model-repair");
+const { readSqliteJsonRows } = require("../lib/sqlite-reader");
 
 const { resolveInstallPaths, resolveZcodeNativeDbPath, resolveMimoNativeDbPath, ensureFlatCursor } = require("../lib/install-resolver");
 const { multiInstallParse, mergeBothFileSources } = require("../lib/multi-install-parser");
+const { resolveDumateDbPaths, parseDumateIncremental } = require("../lib/dumate");
 const wsl = require("../lib/wsl-probe");
+const {
+  T3_ANTIGRAVITY_REL,
+  discoverT3AntigravityBrainDirs,
+  hostDiscoveryIncomplete,
+  mergeAntigravityInventories,
+} = require("../lib/antigravity-discovery");
 const {
   ensureDir,
   readJson,
@@ -23,6 +33,7 @@ const { countRecordOnlyFiles, formatRecordOnlyWarning } = require("../lib/codex-
 const {
   listRolloutFiles,
   listRolloutFilesDeep,
+  readCodexRolloutSnapshot,
   codexSessionIdFromPath,
   filterColdCodexRolloutFiles,
   listClaudeProjectFiles,
@@ -99,6 +110,8 @@ const {
   parseCraftIncremental,
   resolveReasonixTelemetryFiles,
   parseReasonixIncremental,
+  resolveMuseSessionFiles,
+  parseMuseIncremental,
   resolveGrokBuildSessions,
   parseGrokBuildIncremental,
   resolveAntigravityDbPath,
@@ -122,6 +135,8 @@ const {
   parseZedIncremental,
   resolveLmstudioLogFiles,
   parseLmstudioIncremental,
+  resolveOpenSquillaDbPaths,
+  parseOpenSquillaIncremental,
   resolveUnslothDbPath,
   parseUnslothIncremental,
   resolveAnythingllmDbPath,
@@ -144,6 +159,9 @@ const {
   toUtcHalfHourStart,
   totalsKey,
   claudeMessageDedupKey,
+  coerceEpochMs,
+  hasZcodeCursorState,
+  resolveZcodeInstallPaths,
 } = require("../lib/rollout");
 const { computeClaudeGroundTruthBuckets } = require("../lib/claude-categorizer");
 const { createProgress, renderBar, formatNumber, formatBytes } = require("../lib/progress");
@@ -155,12 +173,14 @@ const {
   recordUploadSuccess,
   parseRetryAfterMs,
 } = require("../lib/upload-throttle");
+const { compactPendingQueue, iterateQueueLines, sessionSnapshotMs } = require("../lib/upload-queue");
 const AUTO_UPLOAD_CONFIG = {
-  intervalMs: 5 * 60_000,
+  intervalMs: 15 * 60_000,
   batchSize: 200,
   maxBatchesSmall: 5,
-  maxBatchesLarge: 5,
+  maxBatchesLarge: 100,
 };
+const UPLOAD_BUDGET_MS = 90_000;
 const { maybeSendHeartbeat } = require("../lib/telemetry");
 const {
   isCursorInstalled,
@@ -171,7 +191,7 @@ const {
 const { purgeProjectUsage } = require("../lib/project-usage-purge");
 const {
   fetchTraeCnUsageWithAuth,
-  resolveTraeCnStoragePath,
+  readTraeCnAuthFromStorage,
   isTraeCnUsageEnabled,
 } = require("../lib/trae-cn-config");
 const {
@@ -190,6 +210,18 @@ const {
   scanRootDirState,
 } = require("../lib/scan-roots");
 const { resolveRuntimeConfig, isLegacyInsforgeBaseUrl } = require("../lib/runtime-config");
+const { resolveDeviceTokenPresence } = require("../lib/cloud-device-token");
+
+function formatSyncUploadSummaryLine({ runtimeDeviceToken, uploadResult, tokenPresentOnDisk }) {
+  if (runtimeDeviceToken) {
+    return `- Uploaded: ${uploadResult.inserted} inserted, ${uploadResult.skipped} skipped`;
+  }
+  if (tokenPresentOnDisk) {
+    return "- Uploaded: skipped (handled by local server; device token is set)";
+  }
+  return "- Uploaded: skipped (no device token)";
+}
+
 const { extractTokenCount } = require("../lib/codex-rollout-parser");
 const {
   consumeUsageDelta,
@@ -289,7 +321,7 @@ const DROID_DUP_SESSION_REPAIR_KEY = "droidDupSessionInflationRepair_2026_06";
 const CODEX_COLD_SCAN_AUDIT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const NOTIFY_LOCK_WAIT_MS = 130_000;
 const NOTIFY_LOCK_POLL_MS = 5_000;
-// Local API sync requests have a 120-second child-process budget. Reserve at
+// Local API sync requests answer within a 120-second wait window. Reserve at
 // least 30 seconds for parsing, persistence, and the response after contention.
 const PRIORITY_LOCK_WAIT_MS = 90_000;
 const PRIORITY_LOCK_POLL_MS = 250;
@@ -302,6 +334,13 @@ const MIMO_PROVIDER_REPAIR_KEY = "mimoClaudeMislabelRepair_2026_06";
 const DSH_LEGACY_SOURCE_MIGRATION_KEY = "deepseekHarnessSourceMigration_2026_08";
 const ZCODE_NATIVE_USAGE_REPAIR_KEY = "zcodeNativeUsageRepair_2026_08";
 const ZCODE_INCLUSIVE_TOKEN_REPAIR_KEY = "zcodeInclusiveTokenRepair_2026_09";
+// #828: ZCode CLI prunes model_usage/turn_usage to ~30 days. The wipe+rescan
+// repairs above destroyed pre-window history for late upgraders (and anyone
+// whose prune line advanced before the one-shot key fired). This follow-up
+// restores pre-window peaks from queue.jsonl.bak.* when the live ledger is
+// lower, and the wipe helpers below now preserve hours older than the live
+// rebuild floor so a future re-key cannot repeat the loss.
+const ZCODE_PRUNE_WINDOW_RESTORE_KEY = "zcodePruneWindowRestore_2026_10";
 const AUTO_SYNC_SOURCE_ALIASES = new Map([
   ["code", "every-code"],
   ["commandcode", "command-code"],
@@ -327,6 +366,7 @@ const AUTO_SYNC_SOURCES = new Set([
   "cursor",
   "devin",
   "droid",
+  "dumate",
   "dsh",
   "every-code",
   "gemini",
@@ -341,10 +381,12 @@ const AUTO_SYNC_SOURCES = new Set([
   "lmstudio",
   "mimo",
   "minimax-code",
+  "muse",
   "omo",
   "omp",
   "opencode",
   "openclaw",
+  "opensquilla",
   "pi",
   "qoder",
   "qoder-cn",
@@ -354,6 +396,7 @@ const AUTO_SYNC_SOURCES = new Set([
   "trae",
   "unsloth",
   "workbuddy",
+  "workbuddy-ai",
   "zcode",
   "zed",
 ]);
@@ -362,6 +405,7 @@ const BACKGROUND_AUTO_SYNC_SOURCES = new Set([
   "acode",
   "codex",
   "every-code",
+  "muse",
   "reasonix",
 ]);
 
@@ -507,6 +551,7 @@ async function clearSyncSkip(trackerDir) {
 }
 
 async function cmdSync(argv, context = {}) {
+  context = context && typeof context === "object" ? context : {};
   const opts = parseArgs(argv);
   const diagnostics = context && typeof context === "object" ? context.diagnostics : null;
   const cursorStoreOptions = context && typeof context === "object"
@@ -528,13 +573,19 @@ async function cmdSync(argv, context = {}) {
     ? context.cursorSyncDeps
     : {};
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
-  const home = os.homedir();
-  const { trackerDir } = await resolveTrackerPaths({ home });
+  const home = context.home || os.homedir();
+  const trackerDir = context.trackerDataDir || (await resolveTrackerPaths({ home })).trackerDir;
   // Manual CLI sync is a one-time upload request, without changing the toggle.
   // Hooks, native publication and detached retries must honor the saved opt-in.
   const requiresCloudSyncPref = opts.auto || opts.background || opts.fromRetry || opts.fromNotify || opts.fromOpenclaw ||
     Boolean(process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID);
-  const canUpload = () => !requiresCloudSyncPref || readCloudSyncEnabled(trackerDir);
+  let cloudResetRuntime = null;
+  const canUpload = () => !cloudUsageResetBlocksUpload(trackerDir, {
+    ownerId: process.env.TOKENTRACKER_CLOUD_OWNER_ID,
+    baseUrl: cloudResetRuntime?.baseUrl || process.env.TOKENTRACKER_INSFORGE_BASE_URL,
+    deviceId: process.env.TOKENTRACKER_CLOUD_DEVICE_ID,
+  }) &&
+    (!requiresCloudSyncPref || readCloudSyncEnabled(trackerDir));
 
   await ensureDir(trackerDir);
   if (opts.fromOpenclaw) {
@@ -589,7 +640,8 @@ async function cmdSync(argv, context = {}) {
     // token unless the local API has already minted a replacement from the
     // user's current login session and passed it through the environment.
     // Ingest is a whole-row upsert per bucket key, making replay idempotent.
-    if (config && isLegacyInsforgeBaseUrl(config.baseUrl)) {
+    if (config && isLegacyInsforgeBaseUrl(config.baseUrl) &&
+        !Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN")) {
       const priorQueueState = (await readJson(queueStatePath)) || {};
       // Prepare the replay exactly once. The note survives successful batches,
       // so retryable failures retain both their committed offset and backoff
@@ -708,6 +760,7 @@ async function cmdSync(argv, context = {}) {
     const isBackgroundAllLocalSync = isBackgroundLightweightSync && opts.allLocalSources;
     const isFullSourceScan = !autoSourceScope && !isBackgroundLightweightSync;
     const sourceAllowed = (...sources) => {
+      if (Array.isArray(context.scanSources) && !sources.some(source => context.scanSources.includes(source))) return false;
       if (isBackgroundLightweightSync) {
         if (autoSourceScope) {
           return (
@@ -981,8 +1034,9 @@ async function cmdSync(argv, context = {}) {
     // Plugin-triggered sync points at one specific session file; a normal full
     // sync also passively scans every on-disk OpenClaw transcript so usage is
     // captured even when the session plugin never fires (issue #264). The scan
-    // is gated to full syncs so a scoped `--from-openclaw` hook still only
-    // touches its own file and the 5-minute background tick stays cheap. The
+    // is gated to full syncs except for gateway lifecycle signals. A scoped
+    // agent_end reads only its transcript or its session in the agent database,
+    // and the ordinary background tick stays cheap. The
     // event-identity dedup makes the plugin and passive paths idempotent, so
     // overlap on the same file is safe.
     //
@@ -996,12 +1050,22 @@ async function cmdSync(argv, context = {}) {
         path: openclawSignal.sessionFile,
         source: "openclaw",
       });
+      for (const dbPath of [
+        path.join(openclawSignal.openclawHome, "agents", openclawSignal.agentId, "agent", "openclaw-agent.sqlite"),
+        path.join(openclawSignal.openclawHome, "agents", openclawSignal.agentId, "openclaw-agent.sqlite"),
+      ]) {
+        if (!(await fs.stat(dbPath).catch(() => null))?.isFile()) continue;
+        openclawSessionFiles.set(openclawCursorKey(dbPath), {
+          path: dbPath, source: "openclaw", sessionId: openclawSignal.sessionId,
+        });
+        break;
+      }
     }
-    if (isFullSourceScan && sourceAllowed("openclaw")) {
+    if ((isFullSourceScan || (opts.fromOpenclaw && !openclawSignal)) && sourceAllowed("openclaw")) {
       try {
         for (const f of await resolveOpenclawSessionFiles(process.env)) {
           const key = openclawCursorKey(f);
-          if (!openclawSessionFiles.has(key)) {
+          if (!openclawSessionFiles.has(key) || f.endsWith(".sqlite")) {
             openclawSessionFiles.set(key, { path: f, source: "openclaw" });
           }
         }
@@ -1257,31 +1321,43 @@ async function cmdSync(argv, context = {}) {
 
     let antigravityFiles = [];
     let antigravityInventoryComplete = true;
-    if (sourceAllowed("antigravity") && geminiPaths) {
+    if (sourceAllowed("antigravity")) {
       const knownAntigravityFiles = new Set(
         Object.keys(cursors.files || {}).filter((filePath) => resolveAntigravityDbPath(filePath)),
       );
+      const extraT3Parents = [];
+      if (process.platform === "win32" && wsl.shouldProbeWsl(process.env)) {
+        const wslT3Home = wsl.discoverWslHome(".t3");
+        if (wslT3Home) {
+          // discoverWslHome(".t3") already returns the T3 state root.
+          extraT3Parents.push(path.join(wslT3Home, T3_ANTIGRAVITY_REL));
+        }
+      }
+      const hostDiscovery = await discoverT3AntigravityBrainDirs({
+        home,
+        env: process.env,
+        parents: extraT3Parents,
+      });
       const fileSets = [];
-      if (geminiPaths.native) {
+      if (geminiPaths?.native) {
         fileSets.push(
           await listAntigravityTranscriptsWithStatus(geminiPaths.native, knownAntigravityFiles),
         );
       }
-      if (geminiPaths.wsl) {
+      if (geminiPaths?.wsl) {
         fileSets.push(
           await listAntigravityTranscriptsWithStatus(geminiPaths.wsl, knownAntigravityFiles),
         );
       }
-      antigravityInventoryComplete = fileSets.every((set) => set.complete);
-      const seen = new Set();
-      for (const set of fileSets) {
-        for (const f of set.files) {
-          if (!seen.has(f)) {
-            seen.add(f);
-            antigravityFiles.push(f);
-          }
-        }
+      if (hostDiscovery.brainDirs.length > 0 || hostDiscoveryIncomplete(hostDiscovery.reports, knownAntigravityFiles)) {
+        fileSets.push(
+          await listAntigravityTranscriptsWithStatus(null, knownAntigravityFiles, hostDiscovery.brainDirs),
+        );
       }
+      antigravityInventoryComplete =
+        fileSets.every((set) => set.complete) &&
+        !hostDiscoveryIncomplete(hostDiscovery.reports, knownAntigravityFiles);
+      antigravityFiles = mergeAntigravityInventories(fileSets, knownAntigravityFiles);
     }
     let antigravityResult = { filesProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     if (antigravityFiles.length > 0) {
@@ -1671,6 +1747,20 @@ async function cmdSync(argv, context = {}) {
       }
     }
 
+    let dumateResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("dumate")) {
+      const dumateDbPaths = resolveDumateDbPaths({ home });
+      if (dumateDbPaths.length > 0) {
+        if (progress?.enabled) progress.start(`Parsing DuMate ${renderBar(0)} | buckets 0`);
+        try {
+          dumateResult = await parseDumateIncremental({
+            dbPaths: dumateDbPaths, cursors, queuePath, projectQueuePath,
+            onProgress: makeProviderProgress("DuMate"),
+          });
+        } catch (err) { warnProviderParseFailure("DuMate", err, opts); }
+      }
+    }
+
     // ── Mimo (mimocode — OpenCode-fork SQLite) ──
     // readMimoDbMessages filters out mirrored Claude Code rows to avoid
     // double-counting usage already counted as source=claude.
@@ -1700,13 +1790,30 @@ async function cmdSync(argv, context = {}) {
       const wslZcodeDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
         ? wsl.discoverWslHome(".zcode")
         : null;
-      const zcodePaths = resolveInstallPaths({ nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null });
+      const zcodeWslValue = wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null;
+      const zcodePaths = resolveZcodeInstallPaths(
+        { nativeValue: zcodeNativeValue, wslValue: zcodeWslValue }, process.env,
+        { cursors },
+      );
       if (zcodePaths.native || zcodePaths.wsl) {
+        const mode = wsl.getWslMode(process.env);
+        if (process.platform === "win32" && ["native-first", "wsl-first"].includes(mode) &&
+            !cursors.zcodeInstallSelection && hasZcodeCursorState(cursors)) {
+          // Preserve legacy ownership before a repair can clear old buckets,
+          // even when the selected database currently has no rows to parse.
+          cursors.zcodeInstallSelection = {
+            mode, zcodeHome: process.env.ZCODE_HOME?.trim() || null,
+            dbPath: zcodePaths.native || zcodePaths.wsl,
+          };
+          cursorStore.requiresCommit = true;
+        }
         if (progress?.enabled) progress.start(`Parsing ZCode ${renderBar(0)} | buckets 0`);
         try {
           const nativeUsageAvailable = [zcodePaths.native, zcodePaths.wsl]
             .filter(Boolean)
             .some((dbPath) => hasZcodeNativeUsageSchema(dbPath));
+          const zcodeDbPaths = [zcodePaths.native, zcodePaths.wsl].filter(Boolean);
+          const zcodeRebuildFloorMs = resolveZcodeRebuildFloorMs(zcodeDbPaths);
           if (nativeUsageAvailable) {
             await repairZcodeNativeUsageMigration({
               cursors,
@@ -1714,6 +1821,7 @@ async function cmdSync(argv, context = {}) {
               queueStatePath,
               projectQueuePath,
               projectQueueStatePath,
+              rebuildFloorMs: zcodeRebuildFloorMs,
             });
           }
           await repairZcodeInclusiveTokenMigration({
@@ -1722,12 +1830,29 @@ async function cmdSync(argv, context = {}) {
             queueStatePath,
             projectQueuePath,
             projectQueueStatePath,
+            rebuildFloorMs: zcodeRebuildFloorMs,
+          });
+          await repairZcodePruneWindowRestore({
+            cursors,
+            queuePath,
+            queueStatePath,
+            dbPaths: zcodeDbPaths,
           });
           zcodeResult = await multiInstallParse({
             paths: zcodePaths, parserFn: parseOpencodeDbForInstall, providerName: "zcode",
             cursors, getParams: (p) => ({ dbPath: p, readFn: readZcodeDbMessages, source: "zcode", cursorKey: "zcode" }),
             queuePath, projectQueuePath, onProgress: makeProviderProgress("ZCode"),
           });
+          if (zcodeResult.recordsProcessed > 0) {
+            if (process.platform === "win32" && ["native-first", "wsl-first"].includes(mode)) {
+              cursors.zcodeInstallSelection = {
+                mode, zcodeHome: process.env.ZCODE_HOME?.trim() || null,
+                dbPath: zcodePaths.native || zcodePaths.wsl,
+              };
+            } else {
+              delete cursors.zcodeInstallSelection;
+            }
+          }
         } catch (err) { warnProviderParseFailure("ZCode", err, opts); }
       }
     }
@@ -1747,7 +1872,7 @@ async function cmdSync(argv, context = {}) {
     if (sourceAllowed("dsh")) {
       await migrateLegacyDeepseekHarnessSource({ cursors, queuePath, queueStatePath });
       const dshSessionFiles = await resolveDshSessionFiles(process.env);
-      if (dshSessionFiles.length > 0) {
+      if (dshSessionFiles.length > 0 || cursors.dsh) {
         if (progress?.enabled) {
           progress.start(
             `Parsing DeepSeek Harness ${renderBar(0)} 0/${formatNumber(
@@ -1766,7 +1891,7 @@ async function cmdSync(argv, context = {}) {
             warnProviderParseFailure(
               "DeepSeek Harness",
               new Error(
-                `${dshResult.deferredMigrations} artifact migration(s) deferred; inspect cursors.dsh.deferredMigrations and retry after the replacement is complete`,
+                `${dshResult.deferredMigrations} accounting repair/artifact migration(s) deferred; inspect cursors.dsh.deferredMigrations, restore unavailable history or complete the replacement, then retry`,
               ),
               opts,
             );
@@ -1842,6 +1967,25 @@ async function cmdSync(argv, context = {}) {
           });
         } catch (err) {
           warnProviderParseFailure("Unsloth", err, opts);
+        }
+      }
+    }
+
+    let opensquillaResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    if (sourceAllowed("opensquilla")) {
+      const opensquillaDbPaths = resolveOpenSquillaDbPaths(process.env)
+        .filter((dbPath) => fssync.existsSync(dbPath));
+      if (opensquillaDbPaths.length > 0) {
+        if (progress?.enabled) progress.start("Parsing OpenSquilla " + renderBar(0) + " | buckets 0");
+        try {
+          opensquillaResult = await parseOpenSquillaIncremental({
+            dbPaths: opensquillaDbPaths,
+            cursors,
+            queuePath,
+            onProgress: makeProviderProgress("OpenSquilla"),
+          });
+        } catch (err) {
+          warnProviderParseFailure("OpenSquilla", err, opts);
         }
       }
     }
@@ -2095,8 +2239,8 @@ async function cmdSync(argv, context = {}) {
     const cursorInstalled = cursorSyncDeps.isInstalled || isCursorInstalled;
     const cursorAuthExtractor = cursorSyncDeps.extractAuth || extractCursorSessionToken;
     const cursorUsageFetcher = cursorSyncDeps.fetchUsageCsv || fetchCursorUsageCsv;
-    if (sourceAllowed("cursor") && cursorInstalled({ home })) {
-      const cursorAuth = cursorAuthExtractor({ home });
+    if (sourceAllowed("cursor") && cursorInstalled({ home, trackerDir })) {
+      const cursorAuth = cursorAuthExtractor({ home, trackerDir });
       if (cursorAuth) {
         try {
           if (progress?.enabled) {
@@ -2189,9 +2333,10 @@ async function cmdSync(argv, context = {}) {
         Math.floor((endTime - 30 * 24 * 60 * 60) / HALF_HOUR_SEC) * HALF_HOUR_SEC,
       );
       try {
-        // Absent storage means "not signed in" — a silent skip, not an error.
-        const traeCnStoragePath = resolveTraeCnStoragePath({ env: process.env, home });
-        if (traeCnStoragePath && fssync.existsSync(traeCnStoragePath)) {
+        // Read through junctions and let the credential-safe reader distinguish
+        // missing auth from access/IO errors. existsSync masks both as absent.
+        const traeCnAuth = readTraeCnAuthFromStorage({ env: process.env, home });
+        if (traeCnAuth) {
           if (progress?.enabled) {
             progress.start(`Fetching TRAE Work CN usage...`);
           }
@@ -2448,6 +2593,17 @@ async function cmdSync(argv, context = {}) {
     const kimiWireFiles = sourceAllowed("kimi")
       ? mergeBothFileSources({ resolveFiles: resolveKimiWireFiles, env: process.env })
       : [];
+    const kimiCodeWireFiles = sourceAllowed("kimi-code")
+      ? mergeBothFileSources({ resolveFiles: resolveKimiCodeWireFiles, env: process.env })
+      : [];
+    if (isFullSourceScan && sourceAllowed("kimi") && sourceAllowed("kimi-code")) {
+      await repairKimiModelAttribution({
+        cursors, queuePath, queueStatePath,
+        legacyFiles: kimiWireFiles, officialFiles: kimiCodeWireFiles,
+        parseLegacy: parseKimiIncremental, parseOfficial: parseKimiCodeIncremental,
+        env: process.env,
+      });
+    }
     if (kimiWireFiles.length > 0) {
       if (progress?.enabled) {
         progress.start(`Parsing Kimi Code ${renderBar(0)} | buckets 0`);
@@ -2473,9 +2629,6 @@ async function cmdSync(argv, context = {}) {
 
     // ── Kimi Code official (@moonshot-ai/kimi-code, ~/.kimi-code) ──
     let kimiCodeResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
-    const kimiCodeWireFiles = sourceAllowed("kimi-code")
-      ? mergeBothFileSources({ resolveFiles: resolveKimiCodeWireFiles, env: process.env })
-      : [];
     if (kimiCodeWireFiles.length > 0) {
       if (progress?.enabled) {
         progress.start(`Parsing Kimi Code (official) ${renderBar(0)} | buckets 0`);
@@ -2554,7 +2707,7 @@ async function cmdSync(argv, context = {}) {
     // usage rides on function_call records too (not only assistant messages) and
     // sub-agent logs nest one level deeper, so the resolver recurses. See the
     // parser comment in rollout.js for the cache-aware token math.
-    let workbuddyResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    let workbuddyResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0, projectBucketsQueued: 0, projectCursorUpdated: false };
     const workbuddyFiles = sourceAllowed("workbuddy")
       ? mergeBothFileSources({ resolveFiles: resolveWorkbuddyProjectFiles, env: process.env })
       : [];
@@ -2580,6 +2733,7 @@ async function cmdSync(argv, context = {}) {
           projectFiles: workbuddyFiles,
           cursors,
           queuePath,
+          projectQueuePath,
           env: process.env,
           onProgress: (p) => {
             if (!progress?.enabled) return;
@@ -2591,6 +2745,43 @@ async function cmdSync(argv, context = {}) {
         });
       } catch (err) {
         warnProviderParseFailure("WorkBuddy", err, opts);
+      }
+    }
+
+    // ── WorkBuddy AI — international build (~/.workbuddy-ai/projects/**/*.jsonl) ──
+    // Same Claude-fork family and byte-identical JSONL as the CN build above;
+    // only the home directory differs, so it reuses the WorkBuddy parser and
+    // gets its own source key (and cursor namespace) so the two builds stay
+    // separable instead of merging into one provider row.
+    let workbuddyAiResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0, projectBucketsQueued: 0, projectCursorUpdated: false };
+    const workbuddyAiFiles = sourceAllowed("workbuddy-ai")
+      ? mergeBothFileSources({
+          resolveFiles: (resolveEnv) => resolveWorkbuddyProjectFiles(resolveEnv, "workbuddy-ai"),
+          env: process.env,
+        })
+      : [];
+    if (sourceAllowed("workbuddy-ai")) {
+      if (progress?.enabled) {
+        progress.start(`Parsing WorkBuddy AI ${renderBar(0)} | buckets 0`);
+      }
+      try {
+        workbuddyAiResult = await parseWorkbuddyIncremental({
+          projectFiles: workbuddyAiFiles,
+          cursors,
+          queuePath,
+          projectQueuePath,
+          env: process.env,
+          source: "workbuddy-ai",
+          onProgress: (p) => {
+            if (!progress?.enabled) return;
+            const pct = p.total > 0 ? p.index / p.total : 1;
+            progress.update(
+              `Parsing WorkBuddy AI ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(p.total)} files | buckets ${formatNumber(p.bucketsQueued)}`,
+            );
+          },
+        });
+      } catch (err) {
+        warnProviderParseFailure("WorkBuddy AI", err, opts);
       }
     }
 
@@ -2800,6 +2991,25 @@ async function cmdSync(argv, context = {}) {
         });
       } catch (err) {
         warnProviderParseFailure("Reasonix", err, opts);
+      }
+    }
+
+    // Muse Code (Meta) — usage counts from per-session session.jsonl logs.
+    let museResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    const museFiles = sourceAllowed("muse")
+      ? mergeBothFileSources({ resolveFiles: resolveMuseSessionFiles, env: process.env })
+      : [];
+    if (museFiles.length > 0) {
+      try {
+        museResult = await parseMuseIncremental({
+          sessionFiles: museFiles,
+          cursors,
+          queuePath,
+          env: process.env,
+          onProgress: makeProviderProgress("Muse"),
+        });
+      } catch (err) {
+        warnProviderParseFailure("Muse", err, opts);
       }
     }
 
@@ -3253,6 +3463,7 @@ async function cmdSync(argv, context = {}) {
       kimiCodeResult.recordsProcessed +
       codebuddyResult.recordsProcessed +
       workbuddyResult.recordsProcessed +
+      workbuddyAiResult.recordsProcessed +
       ompResult.recordsProcessed +
       omoResult.recordsProcessed +
       piResult.recordsProcessed +
@@ -3260,13 +3471,16 @@ async function cmdSync(argv, context = {}) {
       minimaxCodeResult.recordsProcessed +
       craftResult.recordsProcessed +
       reasonixResult.recordsProcessed +
+      museResult.recordsProcessed +
       grokResult.recordsProcessed +
       copilotResult.recordsProcessed +
       lmstudioResult.recordsProcessed +
       unslothResult.recordsProcessed +
+      opensquillaResult.recordsProcessed +
       anythingllmResult.recordsProcessed +
       devinResult.recordsProcessed +
       kiloResult.recordsProcessed +
+      dumateResult.recordsProcessed +
       mimoResult.recordsProcessed +
       zcodeResult.recordsProcessed +
       kilocodeResult.recordsProcessed +
@@ -3297,6 +3511,7 @@ async function cmdSync(argv, context = {}) {
       kimiCodeResult.bucketsQueued +
       codebuddyResult.bucketsQueued +
       workbuddyResult.bucketsQueued +
+      workbuddyAiResult.bucketsQueued +
       ompResult.bucketsQueued +
       omoResult.bucketsQueued +
       piResult.bucketsQueued +
@@ -3304,13 +3519,16 @@ async function cmdSync(argv, context = {}) {
       minimaxCodeResult.bucketsQueued +
       craftResult.bucketsQueued +
       reasonixResult.bucketsQueued +
+      museResult.bucketsQueued +
       grokResult.bucketsQueued +
       copilotResult.bucketsQueued +
       lmstudioResult.bucketsQueued +
       unslothResult.bucketsQueued +
+      opensquillaResult.bucketsQueued +
       anythingllmResult.bucketsQueued +
       devinResult.bucketsQueued +
       kiloResult.bucketsQueued +
+      dumateResult.bucketsQueued +
       mimoResult.bucketsQueued +
       zcodeResult.bucketsQueued +
       kilocodeResult.bucketsQueued +
@@ -3328,12 +3546,17 @@ async function cmdSync(argv, context = {}) {
       cursorStore.requiresCommit !== true &&
       totalParsed === (commandCodeResult.cursorUnchanged ? commandCodeResult.recordsProcessed : 0) &&
       totalBuckets === 0 &&
+      !(workbuddyResult.projectBucketsQueued > 0) &&
+      !(workbuddyAiResult.projectBucketsQueued > 0) &&
+      !workbuddyResult.projectCursorUpdated &&
+      !workbuddyAiResult.projectCursorUpdated &&
       !(grokResult.projectBucketsQueued > 0) &&
       !(commandCodeResult.projectBucketsQueued > 0) &&
       !commandCodeResult.schemaMigrated &&
       !codexColdAuditDue &&
       !codexFallbackRetryRan &&
       !grokHookSignalConsumed &&
+      !cursors.migrations?.[KIMI_MODEL_REPAIR_KEY]?.pendingCompaction &&
       !opts.repairGrok;
 
     if (syncDiagnostics) {
@@ -3358,6 +3581,12 @@ async function cmdSync(argv, context = {}) {
         deferredCodexAuditSyncs + 1,
       );
     }
+    if (cursors.migrations?.[KIMI_MODEL_REPAIR_KEY]?.pendingCompaction) {
+      const state = (await readJson(queueStatePath)) || { offset: 0 };
+      await compactPendingQueue({ queuePath, offset: Number(state.offset || 0), minPendingBytes: 0 });
+      cursors.migrations[KIMI_MODEL_REPAIR_KEY].pendingCompaction = false;
+      await cursorStore.commit(cursors);
+    }
     if (grokHookSignalConsumed && grokHookSignalPath) {
       await fs.unlink(grokHookSignalPath).catch(() => {});
     }
@@ -3373,7 +3602,7 @@ async function cmdSync(argv, context = {}) {
     }
     // An authenticated local API supplies this capability for this upload.
     // Keep a separately configured CLI account from overriding its owner.
-    const runtime = resolveRuntimeConfig({
+    const resolvedRuntime = resolveRuntimeConfig({
       cli: {
         deviceToken: process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN,
         ...(process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN ? {
@@ -3384,6 +3613,13 @@ async function cmdSync(argv, context = {}) {
       config: runtimeConfig,
       env: process.env,
     });
+
+    // Empty is an explicit local-server denial, so it cannot fall back to a
+    // separately configured CLI account when the browser is signed out.
+    const runtime = Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN")
+      ? { ...resolvedRuntime, deviceToken: resolvedRuntime.configurationError ? null : process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN }
+      : resolvedRuntime;
+    cloudResetRuntime = runtime;
 
     let uploadResult = { inserted: 0, skipped: 0 };
     let uploadAttempted = false;
@@ -3397,22 +3633,25 @@ async function cmdSync(argv, context = {}) {
         0,
         queueSizeBefore - Number(uploadStateBefore.offset || 0),
       );
-      // Native publication owns a five-minute timer. Drains and a pending
-      // backend migration also bypass the success interval, but all automatic
-      // producers must respect a failed upload's retry deadline.
-      const bypassSuccessInterval = opts.publishAccount || opts.drain || legacyBaseUrlMigration;
+      // Automatic producers honor success and failure deadlines. A verified
+      // manual recheck may probe changed membership; the server decides access.
+      const bypassSuccessInterval = (!opts.auto && opts.drain) || legacyBaseUrlMigration;
       const lastSuccessMs = Number(uploadThrottleState.lastSuccessMs || 0);
       const successDeadline = lastSuccessMs > 0
-        ? Math.min(Number(uploadThrottleState.nextAllowedAtMs || 0),
-          lastSuccessMs + AUTO_UPLOAD_CONFIG.intervalMs + AUTO_UPLOAD_DEFAULTS.jitterMsMax)
+        ? Math.max(Number(uploadThrottleState.serverNextAllowedAtMs || 0), Math.min(Number(uploadThrottleState.nextAllowedAtMs || 0),
+          lastSuccessMs + AUTO_UPLOAD_CONFIG.intervalMs + AUTO_UPLOAD_DEFAULTS.jitterMsMax))
         : Number(uploadThrottleState.nextAllowedAtMs || 0);
+      const recheckCloudAccess = opts.drain && process.env.TOKENTRACKER_CLOUD_RECHECK === "1" &&
+        Boolean(process.env.TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN?.trim());
+      const storedBackoff = recheckCloudAccess ? 0 : Number(uploadThrottleState.backoffUntilMs || 0);
       autoUploadDecision = decideAutoUpload({
         nowMs: Date.now(),
         pendingBytes: pendingBytesBefore,
         state: {
           ...uploadThrottleState,
-          nextAllowedAtMs: bypassSuccessInterval
-            ? Number(uploadThrottleState.backoffUntilMs || 0)
+          backoffUntilMs: storedBackoff,
+          nextAllowedAtMs: recheckCloudAccess ? 0 : bypassSuccessInterval
+            ? Math.max(storedBackoff, Number(uploadThrottleState.serverNextAllowedAtMs || 0))
             : successDeadline,
         },
         config: AUTO_UPLOAD_CONFIG,
@@ -3428,6 +3667,10 @@ async function cmdSync(argv, context = {}) {
     if (canUpload() && runtime.deviceToken && runtime.baseUrl &&
         (!isBackgroundLightweightSync || opts.publishAccount) &&
         (!autoUploadDecision || autoUploadDecision.allowed)) {
+      // Decide the window budget from the original backlog. Compact only once
+      // upload is allowed so a cooldown run cannot shrink away that budget.
+      const state = (await readJson(queueStatePath)) || { offset: 0 };
+      await compactPendingQueue({ queuePath, offset: Number(state.offset || 0) });
       uploadAttempted = true;
       // Mirror the machine identity into the purge-surviving seed file so a
       // future `uninstall --purge` + reinstall recovers the same cloud device
@@ -3449,6 +3692,7 @@ async function cmdSync(argv, context = {}) {
             queueStatePath,
             maxBatches: opts.drain ? 100 : (autoUploadDecision?.maxBatches || 5),
             batchSize: autoUploadDecision?.batchSize || 200,
+            maxDurationMs: UPLOAD_BUDGET_MS,
             canUpload,
           });
         try {
@@ -3458,6 +3702,7 @@ async function cmdSync(argv, context = {}) {
           const replacementDeviceToken = legacyBaseUrlMigration?.replacementDeviceToken;
           const stateAfterFailure = (await readJson(queueStatePath)) || { offset: 0 };
           const canFallbackWithoutSplittingHistory =
+            !Object.hasOwn(process.env, "TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN") &&
             (error?.status === 401 || error?.status === 403) &&
             replacementDeviceToken &&
             fallbackDeviceToken &&
@@ -3496,13 +3741,25 @@ async function cmdSync(argv, context = {}) {
         }
         // Record success so the exponential backoff step resets — otherwise
         // a single past failure keeps us pessimistically throttled forever.
-        uploadThrottleState = recordUploadSuccess({
-          nowMs: Date.now(),
-          state: uploadThrottleState,
-          config: AUTO_UPLOAD_CONFIG,
-        });
-        await writeJson(uploadThrottlePath, uploadThrottleState);
+        if (uploadResult.batches > 0) {
+          uploadThrottleState = recordUploadSuccess({
+            nowMs: Date.now(),
+            state: uploadThrottleState,
+            config: AUTO_UPLOAD_CONFIG,
+            cloudAccess: uploadResult.cloudAccess,
+            attemptId: process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID,
+          });
+          await writeJson(uploadThrottlePath, uploadThrottleState);
+        }
       } catch (e) {
+        if (e.uploadResult?.batches > 0) {
+          uploadResult = e.uploadResult;
+          uploadThrottleState = recordUploadSuccess({
+            nowMs: Date.now(), state: uploadThrottleState, config: AUTO_UPLOAD_CONFIG,
+            cloudAccess: uploadResult.cloudAccess,
+            attemptId: process.env.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID,
+          });
+        }
         // Persist a backoff on 429 / 5xx so the next auto-sync waits instead
         // of retrying immediately and making the rate-limit worse. The
         // throttle module already parses Retry-After when we surface it on
@@ -3531,6 +3788,12 @@ async function cmdSync(argv, context = {}) {
     // and can keep auto retry alive even after cloud sync has drained.
     const pendingBytes = Math.max(0, queueSize - Number(afterState.offset || 0));
 
+    if (pendingBytes === 0 && canUpload() && runtime.deviceToken) {
+      await finishCloudDeviceUsageReset({ trackerDir, ownerId: process.env.TOKENTRACKER_CLOUD_OWNER_ID,
+        baseUrl: runtime.baseUrl, anonKey: runtime.anonKey, deviceToken: runtime.deviceToken,
+        deviceId: process.env.TOKENTRACKER_CLOUD_DEVICE_ID });
+    }
+
     if (pendingBytes <= 0 || !canUpload()) {
       await clearAutoRetry(trackerDir);
     } else if (opts.auto && uploadAttempted && !opts.publishAccount) {
@@ -3555,9 +3818,11 @@ async function cmdSync(argv, context = {}) {
           "Sync finished:",
           `- Parsed files: ${totalParsed}`,
           `- New 30-min buckets queued: ${totalBuckets}`,
-          runtime.deviceToken
-            ? `- Uploaded: ${uploadResult.inserted} inserted, ${uploadResult.skipped} skipped`
-            : "- Uploaded: skipped (no device token)",
+          formatSyncUploadSummaryLine({
+            runtimeDeviceToken: runtime.deviceToken,
+            uploadResult,
+            tokenPresentOnDisk: resolveDeviceTokenPresence({ trackerDir, config, runtime }).set,
+          }),
           runtime.deviceToken && pendingBytes > 0 && !opts.drain
             ? `- Remaining: ${formatBytes(pendingBytes)} pending (run sync again, or use --drain)`
             : null,
@@ -3692,6 +3957,7 @@ function recordCodexColdScanAudit(
 }
 
 module.exports = {
+  formatSyncUploadSummaryLine,
   cmdSync,
   acquireSyncLock,
   readQueueBatch,
@@ -3710,6 +3976,9 @@ module.exports = {
   repairMimoClaudeMislabel,
   repairZcodeNativeUsageMigration,
   repairZcodeInclusiveTokenMigration,
+  repairZcodePruneWindowRestore,
+  resolveZcodeRebuildFloorMs,
+  ZCODE_PRUNE_WINDOW_RESTORE_KEY,
   reincludeClaudeMemObserverFiles,
   repairGrokQueueFromSessionSnapshots,
   applyCloudConversationsBackfill,
@@ -4185,88 +4454,121 @@ const AUTO_RETRY_MAX_DELAY_MS = 2 * 60 * 60 * 1000;
 const INGEST_SLUG = "tokentracker-ingest";
 const MAX_INGEST_BUCKETS = 500;
 
-async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, queueStatePath, maxBatches = 5, batchSize = 200, canUpload = () => true }) {
+async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, queueStatePath, maxBatches = 5, batchSize = 200, maxDurationMs = UPLOAD_BUDGET_MS, canUpload = () => true }) {
   const state = (await readJson(queueStatePath)) || { offset: 0 };
   let offset = Number(state.offset || 0);
   let inserted = 0;
   let skipped = 0;
   let batches = 0;
+  let cloudAccess = null;
+  const uploadId = crypto.randomUUID();
+  const deadline = Date.now() + maxDurationMs;
+  let batchBudget = Math.min(maxBatches, 100);
+  let requestSignal = null;
+  const resultSoFar = () => ({ inserted, skipped, batches, ...(cloudAccess?.next_allowed_at ? { cloudAccess } : {}) });
 
   const queueSize = await safeStatSize(queuePath);
   const limit = Math.min(Math.max(1, Math.floor(Number(batchSize || 200))), MAX_INGEST_BUCKETS);
 
-  for (let batch = 0; batch < maxBatches; batch++) {
-    if (offset >= queueSize) break;
-    const result = await readQueueBatch(queuePath, offset, limit);
-    // A states-only tail (e.g. a retry batch whose bucket rows already
-    // uploaded) is still a meaningful upload: it advances the canonical
-    // session corrections cloud-side.
-    if (result.buckets.length === 0 && result.sessionStates.length === 0) break;
+  try {
+    for (let batch = 0; batch < batchBudget; batch++) {
+      if (Date.now() >= deadline) break;
+      if (offset >= queueSize) break;
+      const result = await readQueueBatch(queuePath, offset, limit);
+      // A states-only tail (e.g. a retry batch whose bucket rows already
+      // uploaded) is still a meaningful upload: it advances the canonical
+      // session corrections cloud-side.
+      if (result.buckets.length === 0 && result.sessionStates.length === 0) {
+        // Complete ignored control/malformed rows need no cloud request, but
+        // must not leave a permanent pending tail. Incomplete bytes stay put.
+        if (result.nextOffset > offset) {
+          offset = result.nextOffset;
+          state.offset = offset;
+          state.updatedAt = new Date().toISOString();
+          await writeJson(queueStatePath, state);
+        }
+        break;
+      }
 
-    const root = baseUrl.replace(/\/$/, "");
-    const headers = {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Bearer ${deviceToken}`,
-    };
-    if (anonKey) headers.apikey = anonKey;
-    // Re-read after parsing/each batch so switching off stops an active drain.
-    if (!canUpload()) break;
-    const res = await fetchFunctionResponse(functionUrlFor(root, INGEST_SLUG), {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        hourly: result.buckets,
-        ...(result.sessionStates.length > 0
-          ? { account_session_states: result.sessionStates }
-          : {}),
-      }),
-    });
+      const root = baseUrl.replace(/\/$/, "");
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${deviceToken}`,
+      };
+      if (anonKey) headers.apikey = anonKey;
+      // Re-read after parsing/each batch so switching off stops an active drain.
+      if (!canUpload()) break;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      requestSignal = AbortSignal.timeout(Math.max(1, Math.ceil(remainingMs)));
+      const res = await fetchFunctionResponse(functionUrlFor(root, INGEST_SLUG), {
+        method: "POST",
+        headers,
+        signal: requestSignal,
+        body: JSON.stringify({
+          upload_id: uploadId,
+          hourly: result.buckets,
+          ...(result.sessionStates.length > 0
+            ? { account_session_states: result.sessionStates }
+            : {}),
+        }),
+      });
 
-    const rawText = await res.text().catch(() => "");
-    let data = {};
-    try { data = JSON.parse(rawText); } catch { data = {}; }
-    if (!res.ok) {
-      const err = new Error(`HTTP ${res.status}: ${rawText.substring(0, 500)}`);
-      err.status = res.status;
-      err.code = res.status === 401 ? "CLOUD_DEVICE_TOKEN_REJECTED"
-        : res.status === 403 ? "CLOUD_UPLOAD_FORBIDDEN"
-          : "CLOUD_UPLOAD_FAILED";
-      const retryAfter = res.headers?.get?.("Retry-After") ?? null;
-      const retryAfterMs = parseRetryAfterMs(retryAfter);
-      if (retryAfterMs !== null) err.retryAfterMs = retryAfterMs;
-      throw err;
+      const rawText = await res.text();
+      let data = {};
+      try { data = JSON.parse(rawText); } catch { data = {}; }
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status}: ${rawText.substring(0, 500)}`);
+        err.status = res.status;
+        err.code = res.status === 401 ? "CLOUD_DEVICE_TOKEN_REJECTED"
+          : typeof data?.code === "string" ? data.code
+            : res.status === 403 ? "CLOUD_UPLOAD_FORBIDDEN" : "CLOUD_UPLOAD_FAILED";
+        const retryAfter = res.headers?.get?.("Retry-After") ?? null;
+        const retryAfterMs = parseRetryAfterMs(retryAfter);
+        if (retryAfterMs !== null) err.retryAfterMs = retryAfterMs;
+        throw err;
+      }
+
+      cloudAccess = data;
+      if (data.upload_scope === "community") batchBudget = Math.min(batchBudget, 10);
+      inserted += Number(data?.inserted || 0);
+      skipped += Number(data?.skipped || 0);
+      batches += 1;
+
+      offset = result.nextOffset;
+      state.offset = offset;
+      state.updatedAt = new Date().toISOString();
+      await writeJson(queueStatePath, state);
     }
-
-    inserted += Number(data?.inserted || 0);
-    skipped += Number(data?.skipped || 0);
-    batches += 1;
-
-    offset = result.nextOffset;
-    state.offset = offset;
-    state.updatedAt = new Date().toISOString();
-    await writeJson(queueStatePath, state);
+  } catch (error) {
+    // A bounded drain can finish partially without discarding successful
+    // offsets or the server cooldown. Other failures retain their retry path.
+    const requestTimedOut = requestSignal?.aborted && requestSignal.reason?.name === "TimeoutError" &&
+      (error === requestSignal.reason || error.name === "TimeoutError" || error.name === "AbortError");
+    if (!requestTimedOut || batches === 0) {
+      error.uploadResult = resultSoFar();
+      throw error;
+    }
   }
-
-  return { inserted, skipped, batches };
+  return resultSoFar();
 }
 
 async function readQueueBatch(queuePath, startOffset, maxBuckets) {
   const st = await fs.stat(queuePath).catch(() => null);
-  if (!st || !st.isFile()) return { buckets: [], nextOffset: startOffset };
-  if (startOffset >= st.size) return { buckets: [], nextOffset: startOffset };
+  if (!st || !st.isFile()) return { buckets: [], sessionStates: [], nextOffset: startOffset };
+  if (startOffset >= st.size) return { buckets: [], sessionStates: [], nextOffset: startOffset };
 
-  const stream = fssync.createReadStream(queuePath, { encoding: "utf8", start: startOffset });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const handle = await fs.open(queuePath, "r");
 
   const bucketMap = new Map();
   // Account session states (kind: "account_session_state") are queue
   // control records, not usage rows: collect them separately so they ride
   // the same upload (after the bucket rows in file order) without entering
-  // the bucket stream. Keyed by (source, session_id) LAST-WINS: the
-  // append-only queue writes a session's newer observation after its older
-  // one, and only the latest per session may reach the ingest batch (a
-  // duplicate would make the cloud ON CONFLICT affect one row twice).
+  // the bucket stream. Keyed by (source, session_id), use the strictly newer
+  // snapshot_verified_at and retain the first row on ties, matching account
+  // truth even after a clock rollback. Only one observation per session may
+  // reach the ingest batch (duplicates would affect one ON CONFLICT row twice).
   // snapshot_verified_at rides along verbatim from the ORIGINAL fetch, so a
   // transport retry never fakes logical freshness.
   //
@@ -4280,68 +4582,87 @@ async function readQueueBatch(queuePath, startOffset, maxBuckets) {
   // (and the MAX_INGEST_BUCKETS=500 clamp above), every request stays under
   // the edge cap while batching follows the existing design.
   const sessionStateMap = new Map();
+  const sessionStateStamps = new Map();
   let offset = startOffset;
   let linesRead = 0;
-  for await (const line of rl) {
-    const bytes = Buffer.byteLength(line, "utf8") + 1;
-    offset += bytes;
-    if (!line.trim()) continue;
-    let bucket;
-    try {
-      bucket = JSON.parse(line);
-    } catch (_e) {
-      continue;
-    }
-    if (bucket?.kind === "account_session_state") {
-      if (typeof bucket.source === "string" && typeof bucket.session_id === "string" && bucket.session_id.trim()) {
-        const ssSource = bucket.source.trim().toLowerCase();
-        sessionStateMap.set(ssSource + "|" + bucket.session_id.trim(), {
-          source: ssSource,
-          session_id: bucket.session_id.trim(),
-          model: typeof bucket.model === "string" ? bucket.model : "",
-          bucket_start: typeof bucket.bucket_start === "string" ? bucket.bucket_start : "",
-          input_tokens: Number(bucket.input_tokens) || 0,
-          output_tokens: Number(bucket.output_tokens) || 0,
-          cached_input_tokens: Number(bucket.cached_input_tokens) || 0,
-          cache_creation_input_tokens: Number(bucket.cache_creation_input_tokens) || 0,
-          reasoning_output_tokens: Number(bucket.reasoning_output_tokens) || 0,
-          total_tokens: Number(bucket.total_tokens) || 0,
-          ...(typeof bucket.snapshot_verified_at === "string" && bucket.snapshot_verified_at
-            ? { snapshot_verified_at: bucket.snapshot_verified_at }
-            : {}),
-        });
-        // Counted like a bucket row: the record rides THIS batch and its
-        // bytes are covered by nextOffset, so the next batch resumes right
-        // after it.
-        linesRead += 1;
-        if (linesRead >= maxBuckets) break;
+  try {
+    for await (const record of iterateQueueLines(handle, startOffset, st.size)) {
+      // A producer may still be writing the last row; retry it once complete.
+      if (!record.complete) break;
+      const line = record.bytes.toString("utf8");
+      offset += record.bytes.length;
+      if (!line.trim()) continue;
+      let bucket;
+      try {
+        bucket = JSON.parse(line);
+      } catch (_e) {
+        continue;
       }
-      continue;
+      if (bucket?.kind === "account_session_state") {
+        if (typeof bucket.source === "string" && typeof bucket.session_id === "string" && bucket.session_id.trim()) {
+          const ssSource = bucket.source.trim().toLowerCase();
+          const stateKey = ssSource + "|" + bucket.session_id.trim();
+          const sessionState = {
+            source: ssSource,
+            session_id: bucket.session_id.trim(),
+            model: typeof bucket.model === "string" ? bucket.model : "",
+            bucket_start: typeof bucket.bucket_start === "string" ? bucket.bucket_start : "",
+            input_tokens: Number(bucket.input_tokens) || 0,
+            output_tokens: Number(bucket.output_tokens) || 0,
+            cached_input_tokens: Number(bucket.cached_input_tokens) || 0,
+            cache_creation_input_tokens: Number(bucket.cache_creation_input_tokens) || 0,
+            reasoning_output_tokens: Number(bucket.reasoning_output_tokens) || 0,
+            total_tokens: Number(bucket.total_tokens) || 0,
+            ...(typeof bucket.snapshot_verified_at === "string" && bucket.snapshot_verified_at
+              ? { snapshot_verified_at: bucket.snapshot_verified_at }
+              : {}),
+          };
+          const priorState = sessionStateMap.get(stateKey);
+          const verifiedMs = sessionSnapshotMs(bucket);
+          const priorVerifiedMs = sessionStateStamps.get(stateKey) ?? null;
+          if (!priorState || (verifiedMs !== null && (priorVerifiedMs === null || verifiedMs > priorVerifiedMs))) {
+            sessionStateMap.set(stateKey, sessionState);
+            sessionStateStamps.set(stateKey, verifiedMs);
+          }
+          // Counted like a bucket row: the record rides THIS batch and its
+          // bytes are covered by nextOffset, so the next batch resumes right
+          // after it.
+          linesRead += 1;
+          if (linesRead >= maxBuckets) break;
+        }
+        continue;
+      }
+      // Pre-release watermark records from this feature branch's dev queues
+      // are obsolete control records: drop them instead of letting them enter
+      // the bucket stream (they carry no hour_start and would be skipped
+      // downstream anyway, but be explicit).
+      if (bucket?.kind === "account_sync_watermark") continue;
+      const hourStart = typeof bucket?.hour_start === "string" ? bucket.hour_start : null;
+      if (!hourStart) continue;
+      const source = (typeof bucket?.source === "string" ? bucket.source.trim().toLowerCase() : "") || "codex";
+      const model = (typeof bucket?.model === "string" ? bucket.model.trim() : "") || "unknown";
+      bucket.source = source;
+      bucket.model = model;
+      // Apply the same legacy-row corrections every local reader applies
+      // (local-api readQueueData / project queue / wrapped aggregator). Without
+      // this the cloud permanently kept the RAW legacy values — e.g. old Codex
+      // rows whose input_tokens still include cached tokens (6-7x inflated) —
+      // while the local dashboard showed corrected numbers.
+      bucket = require("../lib/local-api").normalizeQueueRow(bucket);
+      // Backend origins are local provenance; the current cloud accounting
+      // schema has no backend dimension. Do not disclose gateway hosts there.
+      if (bucket.backend_usage) {
+        bucket = { ...bucket };
+        delete bucket.backend_usage;
+      }
+      bucketMap.set(`${source}|${model}|${hourStart}`, bucket);
+      linesRead += 1;
+      if (linesRead >= maxBuckets) break;
     }
-    // Pre-release watermark records from this feature branch's dev queues
-    // are obsolete control records: drop them instead of letting them enter
-    // the bucket stream (they carry no hour_start and would be skipped
-    // downstream anyway, but be explicit).
-    if (bucket?.kind === "account_sync_watermark") continue;
-    const hourStart = typeof bucket?.hour_start === "string" ? bucket.hour_start : null;
-    if (!hourStart) continue;
-    const source = (typeof bucket?.source === "string" ? bucket.source.trim().toLowerCase() : "") || "codex";
-    const model = (typeof bucket?.model === "string" ? bucket.model.trim() : "") || "unknown";
-    bucket.source = source;
-    bucket.model = model;
-    // Apply the same legacy-row corrections every local reader applies
-    // (local-api readQueueData / project queue / wrapped aggregator). Without
-    // this the cloud permanently kept the RAW legacy values — e.g. old Codex
-    // rows whose input_tokens still include cached tokens (6-7x inflated) —
-    // while the local dashboard showed corrected numbers.
-    bucket = require("../lib/local-api").normalizeQueueRow(bucket);
-    bucketMap.set(`${source}|${model}|${hourStart}`, bucket);
-    linesRead += 1;
-    if (linesRead >= maxBuckets) break;
-  }
 
-  rl.close();
-  stream.close?.();
+  } finally {
+    await handle.close();
+  }
   return {
     buckets: Array.from(bucketMap.values()),
     sessionStates: Array.from(sessionStateMap.values()),
@@ -4708,17 +5029,194 @@ async function resetUploadOffsetForZcodeRepair(queueStatePath, note) {
   return true;
 }
 
-async function dropZcodeQueueRows(filePath, { retainRetractions = false } = {}) {
+function zcodeHourStartMs(hourStart) {
+  if (typeof hourStart !== "string" || !hourStart.trim()) return null;
+  const ms = Date.parse(hourStart);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function zcodeHourFromMainBucketKey(key) {
+  if (typeof key !== "string" || !key.startsWith("zcode|")) return null;
+  const parts = key.split("|");
+  return parts.length >= 3 ? parts.slice(2).join("|") : null;
+}
+
+function zcodeHourFromProjectBucketKey(key) {
+  if (typeof key !== "string") return null;
+  const marker = "|zcode|";
+  const idx = key.indexOf(marker);
+  if (idx < 0) return null;
+  const hour = key.slice(idx + marker.length);
+  return hour || null;
+}
+
+function zcodeHourFromGroupQueuedKey(key) {
+  if (typeof key !== "string" || !key.startsWith("zcode|")) return null;
+  return key.slice("zcode|".length) || null;
+}
+
+function zcodeHourIsPreWindow(hourStart, preserveBeforeMs) {
+  if (!Number.isFinite(preserveBeforeMs)) return false;
+  const hourMs = zcodeHourStartMs(hourStart);
+  return hourMs != null && hourMs < preserveBeforeMs;
+}
+
+// Per-install rebuild floor. Prefer native model_usage MIN(started_at) when the
+// native schema exists — an ancient legacy message does not prove continuous
+// coverage through pruned native gaps (#828).
+function resolveZcodeDbRebuildFloorMs(dbPath) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return null;
+  if (hasZcodeNativeUsageSchema(dbPath)) {
+    try {
+      const rows = readSqliteJsonRows(
+        dbPath,
+        `SELECT MIN(started_at) AS floor
+           FROM model_usage
+          WHERE status = 'completed'
+            AND trim(model_id) != ''
+            AND (
+              input_tokens > 0 OR output_tokens > 0 OR reasoning_tokens > 0 OR
+              cache_creation_input_tokens > 0 OR cache_read_input_tokens > 0
+            )`,
+        { label: "ZCode", timeout: 10_000, maxBuffer: 1024 * 1024, readOnly: true },
+      );
+      const floor = coerceEpochMs(Array.isArray(rows) ? rows[0]?.floor : null);
+      return floor > 0 ? floor : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+  let messages;
+  try {
+    messages = readZcodeDbMessages(dbPath, { readOnly: true });
+  } catch (_error) {
+    return null;
+  }
+  let floor = Number.POSITIVE_INFINITY;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const ms = coerceEpochMs(
+      message?.timeUpdated ?? message?.data?.time?.completed ?? message?.data?.time?.created,
+    );
+    if (ms > 0) floor = Math.min(floor, ms);
+  }
+  return Number.isFinite(floor) ? floor : null;
+}
+
+// Shared wipe window across installs: the LATEST per-install floor (most
+// conservative). Any listed install that exists but cannot report a floor
+// defers the wipe — silently taking min() would erase another install's history.
+function resolveZcodeRebuildFloorMs(dbPaths = []) {
+  const paths = [...new Set((Array.isArray(dbPaths) ? dbPaths : []).filter(Boolean))];
+  if (paths.length === 0) return null;
+  let latestFloor = 0;
+  for (const dbPath of paths) {
+    if (!fssync.existsSync(dbPath)) continue;
+    const floor = resolveZcodeDbRebuildFloorMs(dbPath);
+    if (!Number.isFinite(floor)) return null;
+    latestFloor = Math.max(latestFloor, floor);
+  }
+  return latestFloor > 0 ? latestFloor : null;
+}
+
+// Wipe starts at the half-hour bucket that contains the first live message so
+// that bucket is rebuilt (not preserved) and cannot be double-counted after
+// cursors.zcode is cleared.
+function zcodePreserveBeforeMsFromFloor(floorMs) {
+  if (!Number.isFinite(floorMs)) return null;
+  const iso = toUtcHalfHourStart(floorMs);
+  const ms = iso ? Date.parse(iso) : floorMs;
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function hasZcodeCursorHistory(cursors) {
+  return hasZcodeCursorState(cursors);
+}
+
+function pruneZcodeMessageIndexForRebuild(messages, preserveBeforeMs) {
+  if (!messages || typeof messages !== "object") return 0;
+  let removed = 0;
+  for (const key of Object.keys(messages)) {
+    const entry = messages[key];
+    const attribution = typeof entry?.attribution === "string"
+      ? entry.attribution.split("	")[0]
+      : entry?.attribution?.bucketStart;
+    const bucketStart = typeof attribution === "string" ? attribution : "";
+    // Keep unattributed entries: older cursors omit attribution, and deleting
+    // them re-adds still-present pre-window legacy messages onto preserved
+    // buckets (5000→10000). Prefer a possible in-window under-correction over
+    // permanent double-count (#828).
+    if (!bucketStart) continue;
+    if (zcodeHourIsPreWindow(bucketStart, preserveBeforeMs)) continue;
+    delete messages[key];
+    removed += 1;
+  }
+  return removed;
+}
+
+function pruneZcodeMessageCursorForRebuild(cursors, preserveBeforeMs) {
+  if (!cursors || typeof cursors !== "object") return;
+  if (!Number.isFinite(preserveBeforeMs)) {
+    delete cursors.zcode;
+    return;
+  }
+  const root = cursors.zcode;
+  if (!root || typeof root !== "object") {
+    delete cursors.zcode;
+    return;
+  }
+  pruneZcodeMessageIndexForRebuild(root.messages, preserveBeforeMs);
+  for (const nestedKey of ["native", "wsl"]) {
+    const nested = root[nestedKey];
+    if (nested && typeof nested === "object") {
+      pruneZcodeMessageIndexForRebuild(nested.messages, preserveBeforeMs);
+    }
+  }
+  const hasMessages = Object.keys(root.messages || {}).length > 0
+    || Object.keys(root.native?.messages || {}).length > 0
+    || Object.keys(root.wsl?.messages || {}).length > 0;
+  if (!hasMessages) delete cursors.zcode;
+}
+
+async function queueFileHasZcodeRows(filePath) {
+  if (typeof filePath !== "string" || !filePath) return false;
   let raw;
   try {
     raw = await fs.readFile(filePath, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") return { removed: 0, retractions: 0 };
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row?.source === "zcode") return true;
+    } catch (_error) {
+      // keep scanning
+    }
+  }
+  return false;
+}
+
+function isCompletedZcodeMigration(entry) {
+  return Boolean(entry) && !(typeof entry === "object" && entry.skipped);
+}
+
+async function dropZcodeQueueRows(filePath, {
+  retainRetractions = false,
+  preserveBeforeMs = null,
+} = {}) {
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { removed: 0, retractions: 0, preserved: 0 };
     throw error;
   }
   const kept = [];
   const retractions = new Map();
   let removed = 0;
+  let preserved = 0;
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let row;
@@ -4729,11 +5227,17 @@ async function dropZcodeQueueRows(filePath, { retainRetractions = false } = {}) 
       continue;
     }
     if (row?.source === "zcode") {
-      removed += 1;
       const model = typeof row.model === "string" && row.model.trim()
         ? row.model.trim()
         : "unknown";
       const hourStart = typeof row.hour_start === "string" ? row.hour_start : "";
+      // #828: keep pre-window rows intact — the live DB cannot rebuild them.
+      if (zcodeHourIsPreWindow(hourStart, preserveBeforeMs)) {
+        kept.push(line);
+        preserved += 1;
+        continue;
+      }
+      removed += 1;
       if (retainRetractions && hourStart) {
         retractions.set(`${model}|${hourStart}`, {
           source: "zcode",
@@ -4752,7 +5256,7 @@ async function dropZcodeQueueRows(filePath, { retainRetractions = false } = {}) 
     }
     kept.push(line);
   }
-  if (removed === 0) return { removed: 0, retractions: 0 };
+  if (removed === 0) return { removed: 0, retractions: 0, preserved };
   await backupExistingFile(filePath);
   const tmp = `${filePath}.zcoderepair.${process.pid}.${Date.now()}`;
   const rewritten = [
@@ -4761,7 +5265,7 @@ async function dropZcodeQueueRows(filePath, { retainRetractions = false } = {}) 
   ];
   await fs.writeFile(tmp, rewritten.length ? rewritten.join("\n") + "\n" : "", "utf8");
   await fs.rename(tmp, filePath);
-  return { removed, retractions: retractions.size };
+  return { removed, retractions: retractions.size, preserved };
 }
 
 async function repairZcodeUsageMigration({
@@ -4772,25 +5276,52 @@ async function repairZcodeUsageMigration({
   queueStatePath,
   projectQueuePath,
   projectQueueStatePath,
+  rebuildFloorMs = null,
 } = {}) {
   if (!cursors || typeof cursors !== "object") return false;
   const migrations = (cursors.migrations ||= {});
-  if (migrations[migrationKey]) return false;
+  // Mirror Codex: a prior {skipped:true} must retry once the live ledger can
+  // establish a rebuild floor (or the pre-window history is gone).
+  const prior = migrations[migrationKey];
+  if (isCompletedZcodeMigration(prior)) return false;
 
-  const mainRepair = await dropZcodeQueueRows(queuePath, { retainRetractions: true });
+  const preserveBeforeMs = zcodePreserveBeforeMsFromFloor(rebuildFloorMs);
+  // Empty / unreadable live ledger + existing history => refuse the wipe. The
+  // forward reader still works; only this historical correction defers (#828).
+  if (preserveBeforeMs == null) {
+    const hasQueueHistory = await queueFileHasZcodeRows(queuePath)
+      || await queueFileHasZcodeRows(projectQueuePath);
+    if (hasZcodeCursorHistory(cursors) || hasQueueHistory) {
+      migrations[migrationKey] = {
+        skipped: true,
+        reason: "zcode_rebuild_floor_unavailable",
+        at: new Date().toISOString(),
+      };
+      return false;
+    }
+  }
+
+  const mainRepair = await dropZcodeQueueRows(queuePath, {
+    retainRetractions: true,
+    preserveBeforeMs,
+  });
   const projectRepair = projectQueuePath
-    ? await dropZcodeQueueRows(projectQueuePath)
-    : { removed: 0, retractions: 0 };
+    ? await dropZcodeQueueRows(projectQueuePath, { preserveBeforeMs })
+    : { removed: 0, retractions: 0, preserved: 0 };
 
   const hourly = cursors.hourly && typeof cursors.hourly === "object" ? cursors.hourly : null;
   if (hourly?.buckets) {
     for (const key of Object.keys(hourly.buckets)) {
-      if (key.startsWith("zcode|")) delete hourly.buckets[key];
+      if (!key.startsWith("zcode|")) continue;
+      if (zcodeHourIsPreWindow(zcodeHourFromMainBucketKey(key), preserveBeforeMs)) continue;
+      delete hourly.buckets[key];
     }
   }
   if (hourly?.groupQueued) {
     for (const key of Object.keys(hourly.groupQueued)) {
-      if (key.startsWith("zcode|")) delete hourly.groupQueued[key];
+      if (!key.startsWith("zcode|")) continue;
+      if (zcodeHourIsPreWindow(zcodeHourFromGroupQueuedKey(key), preserveBeforeMs)) continue;
+      delete hourly.groupQueued[key];
     }
   }
   const projectHourly = cursors.projectHourly && typeof cursors.projectHourly === "object"
@@ -4798,10 +5329,15 @@ async function repairZcodeUsageMigration({
     : null;
   if (projectHourly?.buckets) {
     for (const key of Object.keys(projectHourly.buckets)) {
-      if (key.includes("|zcode|")) delete projectHourly.buckets[key];
+      if (!key.includes("|zcode|")) continue;
+      if (zcodeHourIsPreWindow(zcodeHourFromProjectBucketKey(key), preserveBeforeMs)) continue;
+      delete projectHourly.buckets[key];
     }
   }
-  delete cursors.zcode;
+  // Keep pre-window message dedup so preserved buckets are not double-counted
+  // when legacy rows still exist in the live DB. Clear only in-window (and
+  // unattributed) cursor entries so the rescan can rebuild those hours.
+  pruneZcodeMessageCursorForRebuild(cursors, preserveBeforeMs);
 
   if (mainRepair.removed > 0) {
     await resetUploadOffsetForZcodeRepair(queueStatePath, queueStateNote);
@@ -4814,6 +5350,236 @@ async function repairZcodeUsageMigration({
     removedMain: mainRepair.removed,
     removedProject: projectRepair.removed,
     retractions: mainRepair.retractions,
+    preservedMain: mainRepair.preserved || 0,
+    preservedProject: projectRepair.preserved || 0,
+    rebuildFloorMs: preserveBeforeMs,
+  };
+  return true;
+}
+
+function zcodeRowTotals(row) {
+  return {
+    input_tokens: Number(row?.input_tokens) || 0,
+    cached_input_tokens: Number(row?.cached_input_tokens) || 0,
+    cache_creation_input_tokens: Number(row?.cache_creation_input_tokens) || 0,
+    output_tokens: Number(row?.output_tokens) || 0,
+    reasoning_output_tokens: Number(row?.reasoning_output_tokens) || 0,
+    total_tokens: Number(row?.total_tokens) || 0,
+    conversation_count: Number(row?.conversation_count) || 0,
+  };
+}
+
+function zcodeTotalsDominate(candidate, baseline) {
+  if (!candidate) return false;
+  if (!baseline) return (candidate.total_tokens || 0) > 0;
+  return (candidate.total_tokens || 0) > (baseline.total_tokens || 0);
+}
+
+async function collectZcodeQueuePeaks(filePath, { beforeMs = null } = {}) {
+  const peaks = new Map();
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return peaks;
+    throw error;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch (_error) {
+      continue;
+    }
+    if (row?.source !== "zcode") continue;
+    const model = typeof row.model === "string" && row.model.trim()
+      ? row.model.trim()
+      : "unknown";
+    const hourStart = typeof row.hour_start === "string" ? row.hour_start : "";
+    if (!hourStart) continue;
+    if (beforeMs != null && !zcodeHourIsPreWindow(hourStart, beforeMs)) continue;
+    const key = `${model}|${hourStart}`;
+    const totals = zcodeRowTotals(row);
+    const prev = peaks.get(key);
+    if (!prev || zcodeTotalsDominate(totals, prev.totals)) {
+      peaks.set(key, { model, hour_start: hourStart, totals });
+    }
+  }
+  return peaks;
+}
+
+// Last-wins per key (cloud replay semantics). A historical peak of 9000 followed
+// by a repair retraction of 0 must report 0 so restore still re-appends.
+async function collectZcodeQueueLatest(filePath, { beforeMs = null } = {}) {
+  const latest = new Map();
+  let raw;
+  try {
+    raw = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return latest;
+    throw error;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch (_error) {
+      continue;
+    }
+    if (row?.source !== "zcode") continue;
+    const model = typeof row.model === "string" && row.model.trim()
+      ? row.model.trim()
+      : "unknown";
+    const hourStart = typeof row.hour_start === "string" ? row.hour_start : "";
+    if (!hourStart) continue;
+    if (beforeMs != null && !zcodeHourIsPreWindow(hourStart, beforeMs)) continue;
+    latest.set(`${model}|${hourStart}`, {
+      model,
+      hour_start: hourStart,
+      totals: zcodeRowTotals(row),
+    });
+  }
+  return latest;
+}
+
+async function listZcodeQueueBackupPaths(queuePath) {
+  if (typeof queuePath !== "string" || !queuePath) return [];
+  const dir = path.dirname(queuePath);
+  const base = path.basename(queuePath);
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  return names
+    .filter((name) => name.startsWith(`${base}.bak.`))
+    .map((name) => path.join(dir, name))
+    .sort();
+}
+
+async function repairZcodePruneWindowRestore({
+  cursors,
+  queuePath,
+  queueStatePath,
+  dbPaths = [],
+  rebuildFloorMs: rebuildFloorMsOption = null,
+} = {}) {
+  if (!cursors || typeof cursors !== "object") return false;
+  const migrations = (cursors.migrations ||= {});
+  const prior = migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY];
+  if (isCompletedZcodeMigration(prior)) return false;
+
+  const rebuildFloorMs = Number.isFinite(rebuildFloorMsOption)
+    ? rebuildFloorMsOption
+    : resolveZcodeRebuildFloorMs(dbPaths);
+  if (!Number.isFinite(rebuildFloorMs)) {
+    migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY] = {
+      skipped: true,
+      reason: "zcode_rebuild_floor_unavailable",
+      at: new Date().toISOString(),
+    };
+    return false;
+  }
+
+  const backupPaths = await listZcodeQueueBackupPaths(queuePath);
+  if (backupPaths.length === 0) {
+    migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY] = {
+      skipped: true,
+      reason: "zcode_queue_backup_missing",
+      at: new Date().toISOString(),
+      rebuildFloorMs,
+    };
+    return false;
+  }
+
+  const preserveBeforeMs = zcodePreserveBeforeMsFromFloor(rebuildFloorMs);
+  const backupPeaks = new Map();
+  for (const backupPath of backupPaths) {
+    const peaks = await collectZcodeQueuePeaks(backupPath, { beforeMs: preserveBeforeMs });
+    for (const [key, peak] of peaks) {
+      const prev = backupPeaks.get(key);
+      if (!prev || zcodeTotalsDominate(peak.totals, prev.totals)) {
+        backupPeaks.set(key, peak);
+      }
+    }
+  }
+  if (backupPeaks.size === 0) {
+    migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY] = {
+      appliedAt: new Date().toISOString(),
+      restored: 0,
+      rebuildFloorMs,
+      preserveBeforeMs,
+      note: "no_pre_window_peaks_in_backups",
+    };
+    return true;
+  }
+
+  const liveLatest = await collectZcodeQueueLatest(queuePath, { beforeMs: preserveBeforeMs });
+  const hourly = (cursors.hourly ||= { buckets: {}, groupQueued: {} });
+  hourly.buckets ||= {};
+  const restorations = [];
+  for (const [key, peak] of backupPeaks) {
+    const bucketKeyName = bucketKey("zcode", peak.model, peak.hour_start);
+    const live = liveLatest.get(key)?.totals || null;
+    // Compare against the latest queue emission (last-wins), not historical peaks
+    // or cursor buckets — a 9000→0 retraction must still restore.
+    if (!zcodeTotalsDominate(peak.totals, live)) {
+      const bucketTotals = hourly.buckets[bucketKeyName]?.totals
+        ? zcodeRowTotals(hourly.buckets[bucketKeyName].totals)
+        : null;
+      if (bucketTotals && zcodeTotalsDominate(peak.totals, bucketTotals)) {
+        hourly.buckets[bucketKeyName] = {
+          ...(hourly.buckets[bucketKeyName] || {}),
+          totals: { ...peak.totals },
+          hour_start: peak.hour_start,
+          source: "zcode",
+          model: peak.model,
+        };
+      }
+      continue;
+    }
+    restorations.push(peak);
+    hourly.buckets[bucketKeyName] = {
+      ...(hourly.buckets[bucketKeyName] || {}),
+      totals: { ...peak.totals },
+      hour_start: peak.hour_start,
+      source: "zcode",
+      model: peak.model,
+    };
+  }
+
+  if (restorations.length === 0) {
+    migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY] = {
+      appliedAt: new Date().toISOString(),
+      restored: 0,
+      rebuildFloorMs,
+      backupsConsidered: backupPaths.length,
+      note: "backup_peaks_not_higher",
+    };
+    return true;
+  }
+
+  await backupExistingFile(queuePath);
+  const append = restorations.map((peak) => JSON.stringify({
+    source: "zcode",
+    model: peak.model,
+    hour_start: peak.hour_start,
+    ...peak.totals,
+  }));
+  await fs.appendFile(queuePath, `${append.join("\n")}\n`, "utf8");
+  await resetUploadOffsetForZcodeRepair(
+    queueStatePath,
+    "reset_after_zcode_prune_window_restore_2026_10",
+  );
+  migrations[ZCODE_PRUNE_WINDOW_RESTORE_KEY] = {
+    appliedAt: new Date().toISOString(),
+    restored: restorations.length,
+    rebuildFloorMs,
+    backupsConsidered: backupPaths.length,
   };
   return true;
 }
@@ -5471,7 +6237,23 @@ async function repairWorkbuddyContextUsage({
   for (const [key, value] of Object.entries(tmpCursors.hourly.groupQueued || {})) {
     if (key.startsWith("workbuddy|")) nextHourly.groupQueued[key] = value;
   }
-  cursors.workbuddy = tmpCursors.workbuddy || {};
+  // This migration rebuilds totals from a temp queue using empty cursors, so
+  // `tmpCursors.workbuddy` carries no project state. Replacing the whole object
+  // would drop the project cursor while leaving the published project buckets
+  // (cursors.projectHourly and the real project queue) untouched, and the next
+  // parse would re-attribute every historical session on top of them. The
+  // migration only changes totals, so keep the project cursor as it is.
+  const previousWorkbuddyState =
+    cursors.workbuddy && typeof cursors.workbuddy === "object" ? cursors.workbuddy : {};
+  cursors.workbuddy = {
+    ...(tmpCursors.workbuddy || {}),
+    ...(previousWorkbuddyState.projectFileOffsets
+      ? { projectFileOffsets: previousWorkbuddyState.projectFileOffsets }
+      : {}),
+    ...(Array.isArray(previousWorkbuddyState.projectSeenIds)
+      ? { projectSeenIds: previousWorkbuddyState.projectSeenIds }
+      : {}),
+  };
 
   let uploadState = {};
   try { uploadState = JSON.parse(await fs.readFile(queueStatePath, "utf8")); } catch (_e) {}
@@ -5615,8 +6397,10 @@ async function repairCodexRescanInflation({
       }
     }
     rebuilt = {
+      version: tmpCursors.hourly.version,
       buckets: tmpCursors.hourly.buckets || {},
       groupQueued: tmpCursors.hourly.groupQueued || {},
+      modelAttributionPolicy: tmpCursors.hourly.modelAttributionPolicy,
       codexHashes: Array.isArray(tmpCursors.codexHashes) ? tmpCursors.codexHashes : [],
       codexCompactionResponseIds: Array.isArray(tmpCursors.codexCompactionResponseIds)
         ? tmpCursors.codexCompactionResponseIds
@@ -5753,6 +6537,9 @@ async function repairCodexRescanInflation({
   //    rebuilt per-file cursors (offset at EOF) so the later parse in THIS sync
   //    does not re-read codex (which would re-inflate project buckets).
   const hourly = (cursors.hourly ||= { buckets: {}, groupQueued: {} });
+  // Without the rebuilt schema version, the next normalization treats these
+  // per-model keys as v1 and overwrites them all with an unknown bucket (#927).
+  hourly.version = rebuilt.version;
   hourly.buckets ||= {};
   hourly.groupQueued ||= {};
   for (const k of Object.keys(hourly.buckets)) {
@@ -5767,6 +6554,12 @@ async function repairCodexRescanInflation({
   for (const [k, v] of Object.entries(rebuilt.groupQueued)) {
     if (k.startsWith("codex|")) hourly.groupQueued[k] = v;
   }
+  // The rebuilt queue already uses the parser's current attribution policy.
+  // Preserve it so the following parse does not re-emit every repaired row.
+  hourly.modelAttributionPolicy = {
+    ...hourly.modelAttributionPolicy,
+    codex: rebuilt.modelAttributionPolicy.codex,
+  };
   cursors.files ||= {};
   for (const fp of Object.keys(cursors.files)) {
     if (isCodexSessionCursorPath(fp)) delete cursors.files[fp];
@@ -6056,26 +6849,56 @@ async function scanCodexUsageLineages(filePath, maxBytes = Infinity) {
     const byteLimit = Number.isFinite(maxBytes) ? Math.max(0, maxBytes) : Infinity;
     let bytesRead = 0;
     let affected = false;
-    stream = fssync.createReadStream(filePath, { highWaterMark: 32 * 1024 });
-    for await (const record of physicalJsonlRecords(stream, {
-      maxPhysicalBytes: byteLimit,
-    })) {
-      const { line } = record;
-      bytesRead += record.physicalBytes;
-      if (bytesRead > byteLimit) return { affected: false, indeterminate: true };
-      if (!line.trim()) continue;
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch (_e) {
+    const isCompressed = typeof filePath === "string" && /\.jsonl\.zstd?$/i.test(filePath);
+    if (isCompressed) {
+      // Honor the background-sync lineage budget against compressed size so a
+      // pending repair with large archives stays bounded and returns
+      // indeterminate until a full sync can finish the scan.
+      if (!(byteLimit > 0) || before.size > byteLimit) {
         return { affected: false, indeterminate: true };
       }
-      const token = extractTokenCount(obj);
-      const info = token?.info;
-      if (!info || typeof info !== "object") continue;
-      consumeUsageDelta(state, info.last_token_usage, info.total_token_usage);
-      if (state.sawInterleaved || state.sawDivergentCumulative) {
-        affected = true;
+      const snapshot = await readCodexRolloutSnapshot(filePath);
+      if (!snapshot) return { affected: false, indeterminate: true };
+      for (const raw of snapshot.lines) {
+        const line = typeof raw === "string" ? raw : "";
+        if (!line.trim()) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch (_e) {
+          return { affected: false, indeterminate: true };
+        }
+        const token = extractTokenCount(obj);
+        const info = token?.info;
+        if (!info || typeof info !== "object") continue;
+        consumeUsageDelta(state, info.last_token_usage, info.total_token_usage);
+        if (state.sawInterleaved || state.sawDivergentCumulative) {
+          affected = true;
+        }
+      }
+      bytesRead = snapshot.size;
+    } else {
+      stream = fssync.createReadStream(filePath, { highWaterMark: 32 * 1024 });
+      for await (const record of physicalJsonlRecords(stream, {
+        maxPhysicalBytes: byteLimit,
+      })) {
+        const { line } = record;
+        bytesRead += record.physicalBytes;
+        if (bytesRead > byteLimit) return { affected: false, indeterminate: true };
+        if (!line.trim()) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch (_e) {
+          return { affected: false, indeterminate: true };
+        }
+        const token = extractTokenCount(obj);
+        const info = token?.info;
+        if (!info || typeof info !== "object") continue;
+        consumeUsageDelta(state, info.last_token_usage, info.total_token_usage);
+        if (state.sawInterleaved || state.sawDivergentCumulative) {
+          affected = true;
+        }
       }
     }
     const after = await readCodexFileSnapshot(filePath);
@@ -6180,6 +7003,23 @@ async function scanForForkedCodexRollout(rolloutFiles) {
     if (!fp || src !== "codex") continue;
     let fh = null;
     try {
+      if (typeof fp === "string" && /\.jsonl\.zstd?$/i.test(fp)) {
+        const snapshot = await readCodexRolloutSnapshot(fp);
+        if (!snapshot) {
+          indeterminate = true;
+          continue;
+        }
+        // Fork marker is in early session_meta; scan a bounded prefix of lines.
+        let head = "";
+        for (const raw of snapshot.lines) {
+          head += (typeof raw === "string" ? raw : "") + "\n";
+          if (head.length >= HEAD_BYTES) break;
+        }
+        if (head.includes('"forked_from_id"')) {
+          return { forked: true, indeterminate: false };
+        }
+        continue;
+      }
       fh = await fs.open(fp, "r");
       const buf = Buffer.alloc(HEAD_BYTES);
       const { bytesRead } = await fh.read(buf, 0, HEAD_BYTES, 0);

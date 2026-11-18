@@ -21,10 +21,10 @@ import { getDetailsSortColumns, sortDailyRows } from "../lib/daily";
 import { getRangeForPeriod } from "../lib/date-range";
 import { DETAILS_PAGE_SIZE, paginateRows, trimLeadingZeroMonths } from "../lib/details";
 import {
-  formatUsdCurrency,
   toDisplayNumber,
   toFiniteNumber,
 } from "../lib/format";
+import { formatSummaryCost } from "../lib/summary-cost";
 import { shouldShowInstallCard } from "../lib/install-status";
 import { getMockNow, isMockEnabled } from "../lib/mock-data";
 import { publishUsageLimitsPreloadState } from "../lib/dashboard-preload.js";
@@ -52,7 +52,14 @@ import { DashboardView } from "../ui/dashboard/views/DashboardView.jsx";
 import { useAccountDevices } from "../hooks/use-account-devices.js";
 import { DeviceUsageCard } from "../ui/dashboard/components/DeviceUsageCard.jsx";
 import { formatDeviceLabel } from "../lib/device-label.js";
+import { localDeviceUsage } from "../lib/local-usage-transfer";
+import {
+  DEVICE_FILTER_LOCAL_SCOPE,
+  resolveUnifiedDeviceFilterChange,
+  unifiedDeviceFilterValue,
+} from "../lib/unified-device-filter.js";
 import { CLOUD_USAGE_SYNCED_EVENT, getCurrentDeviceId } from "../lib/cloud-sync-prefs";
+import { recordCloudPromptIntent } from "../lib/cloud-prompt-policy.js";
 import { ShareModal } from "../ui/share/ShareModal";
 import { useShareCardData } from "../ui/share/use-share-card-data";
 import { runSingleFlight } from "../lib/single-flight";
@@ -67,12 +74,7 @@ const DETAILS_PAGED_PERIODS = new Set(["day", "total", "custom"]);
 
 // Default Overview card order — each column is dragged/persisted independently.
 const LEFT_CARD_ORDER_DEFAULTS = [
-  "islandOnboarding",
-  "linuxPetCard",
-  "macAppBanner",
   "statsPanel",
-  "widgetOnboarding",
-  "linuxTopBarCard",
   "installCopy",
   "activityHeatmap",
   "deviceUsage",
@@ -81,6 +83,8 @@ const LEFT_CARD_ORDER_DEFAULTS = [
   "sessionInsights",
 ];
 const RIGHT_CARD_ORDER_DEFAULTS = ["usageOverview", "dataDetails"];
+
+
 
 function hasUsageValue(value, level) {
   if (typeof level === "number" && level > 0) return true;
@@ -136,6 +140,7 @@ export function DashboardPage({
   signInUrl = "/sign-in",
   signUpUrl = "/sign-up",
   onMainContentVisible,
+  cloudNotice,
 }) {
   const { resolvedLocale } = useLocale();
   const { currency, rate } = useCurrency();
@@ -181,10 +186,15 @@ export function DashboardPage({
   // publicMode (shared link) opts out of account view entirely.
   const {
     accountView: accountViewBase,
-    revision: accountRevision,
+    revision: cloudAccountRevision,
     resolving: accountResolvingBase,
+    scopeSwitchable: accountScopeSwitchableBase,
+    setScopeOverride: setAccountScopeOverride,
   } = useAccountView();
   const accountView = accountViewBase && !publicMode;
+  // In-page scope switcher (issue 979 part 3): the override is view-only, so
+  // share views never offer it either.
+  const accountScopeSwitchable = accountScopeSwitchableBase && !publicMode;
   const accountAccessToken = accountView ? effectiveAuthToken : null;
   // While the resolved scope is still unknown (auth loading + cloud likely),
   // hooks hold a loading state instead of painting local data that would be
@@ -368,7 +378,8 @@ export function DashboardPage({
   const from = range.from;
   const to = range.to;
 
-  const [selectedDevice, setSelectedDevice] = useState(null);
+  const [storedDevice, setSelectedDevice] = useState(null);
+  const selectedDevice = storedDevice && (storedDevice.startsWith("local:") !== accountView) ? storedDevice : null;
   const [currentDeviceId, setCurrentDeviceId] = useState(() => getCurrentDeviceId());
   useEffect(() => {
     const refreshCurrentDevice = () => setCurrentDeviceId(getCurrentDeviceId());
@@ -379,35 +390,39 @@ export function DashboardPage({
       window.removeEventListener("storage", refreshCurrentDevice);
     };
   }, []);
-  const { devices: accountDevices, accountSources: accountDeviceSources, refresh: refreshAccountDevices } = useAccountDevices({
+  const { devices: accountDevices, accountSources: accountDeviceSources, refresh: refreshAccountDevices,
+    loading: devicesLoading, revision: localUsageRevision } = useAccountDevices({
     from,
     to,
     timeZone,
     tzOffsetMinutes,
     accountView,
     accountAccessToken,
-    accountRevision,
+    accountRevision: cloudAccountRevision,
+    localView: !publicMode && !mockEnabled,
   });
-  // Only devices with usage in the selected range are shown anywhere — a
-  // zero-usage registration (typically a stale fingerprint-drift duplicate) is
-  // noise in both the filter dropdown and the breakdown card.
+  const accountRevision = accountView ? cloudAccountRevision : localUsageRevision;
+  // Hide idle cloud registrations, but keep local snapshots selectable even
+  // when the chosen period has no usage.
   const activeDevices = useMemo(
     () => accountDevices
-      .filter((d) => (Number(d.total_tokens) || 0) > 0)
-      .map((d) => ({ ...d, isCurrent: d.id === currentDeviceId })),
-    [accountDevices, currentDeviceId],
+      .filter((d) => !accountView || (Number(d.total_tokens) || 0) > 0)
+      .map((d) => ({ ...d, isCurrent: d.isCurrent || d.id === currentDeviceId })),
+    [accountDevices, currentDeviceId, accountView],
   );
   const accountSourceRows = useMemo(
     () => accountDeviceSources.filter((s) => (Number(s.total_tokens) || 0) > 0),
     [accountDeviceSources],
   );
-  // Dropdown filter: choosing between devices needs 2+ of them.
-  const showDeviceFilter = accountView && activeDevices.length >= 2;
+  // Dropdown filter: 2+ devices, OR the unified scope/device select when both
+  // local and account scopes are live (This device · devices · Account-wide).
+  const showDeviceFilter = accountScopeSwitchable || activeDevices.length >= 2;
   // Breakdown card: needs 2+ rows; account-level sources count as rows.
-  const showDeviceCard = accountView && activeDevices.length + accountSourceRows.length >= 2;
+  const showDeviceCard = (accountView || activeDevices.length >= 2) && activeDevices.length + accountSourceRows.length >= 2;
   // Reset the filter when no selector is visible, or when the selected device
   // disappears (revoked / idle in the new range / not in the latest list).
   useEffect(() => {
+    if (devicesLoading) return;
     if (!showDeviceFilter && !showDeviceCard) {
       if (selectedDevice !== null) setSelectedDevice(null);
       return;
@@ -415,32 +430,51 @@ export function DashboardPage({
     if (selectedDevice && !activeDevices.some((d) => d.id === selectedDevice)) {
       setSelectedDevice(null);
     }
-  }, [showDeviceFilter, showDeviceCard, activeDevices, selectedDevice]);
+  }, [showDeviceFilter, showDeviceCard, activeDevices, selectedDevice, devicesLoading]);
 
   const deviceOptions = useMemo(() => {
     if (!showDeviceFilter) return [];
+    const deviceEntries = activeDevices.map((d) => {
+      const deviceLabel = formatDeviceLabel(d) || copy("dashboard.device_card.unnamed");
+      const currentSuffix = d.isCurrent ? ` (${copy("dashboard.device_card.current")})` : "";
+      return { value: d.id, label: `${deviceLabel}${currentSuffix}` };
+    });
+    // Fold This device / Account-wide into the same Select that lists devices
+    // (replaces the PR 986 segmented control). View-only: uploads keep following
+    // the cloud-sync preference via AccountViewContext.scopeOverride.
+    if (accountScopeSwitchable) {
+      return [
+        { value: DEVICE_FILTER_LOCAL_SCOPE, label: copy("usage.overview.scope_local") },
+        ...deviceEntries,
+        { value: "", label: copy("usage.overview.scope_account") },
+      ];
+    }
     return [
       { value: "", label: copy("dashboard.device_filter.all") },
-      ...activeDevices.map((d) => {
-        const deviceLabel = formatDeviceLabel(d) || copy("dashboard.device_card.unnamed");
-        const currentSuffix = d.isCurrent ? ` (${copy("dashboard.device_card.current")})` : "";
-        return { value: d.id, label: `${deviceLabel}${currentSuffix}` };
-      }),
+      ...deviceEntries,
     ];
-  }, [showDeviceFilter, activeDevices, resolvedLocale]);
+  }, [showDeviceFilter, accountScopeSwitchable, activeDevices, resolvedLocale]);
 
+  const deviceFilterValue = unifiedDeviceFilterValue({
+    accountScopeSwitchable,
+    accountView,
+    selectedDevice,
+  });
+
+  const deviceUsageData = accountView ? { devices: activeDevices, accountSources: accountSourceRows }
+    : localDeviceUsage(activeDevices, accountSourceRows, selectedDevice);
   const deviceUsageBlock = showDeviceCard ? (
     <DeviceUsageCard
-      devices={activeDevices}
-      accountSources={accountSourceRows}
+      devices={deviceUsageData.devices}
+      accountSources={deviceUsageData.accountSources}
       currentDeviceId={currentDeviceId}
       selectedDeviceId={selectedDevice || ""}
       onSelectDevice={(id) => setSelectedDevice(id || null)}
-      onRenameDevice={async (id, name) => {
+      onRenameDevice={accountView ? async (id, name) => {
         const token = await resolveAuthAccessToken(accountAccessToken);
         await renameAccountDevice({ deviceId: id, name, accessToken: token });
         await refreshAccountDevices();
-      }}
+      } : undefined}
     />
   ) : null;
 
@@ -619,10 +653,12 @@ export function DashboardPage({
       accountAccessToken,
       accountRevision,
       accountViewResolving,
+      deviceId: selectedDevice,
     }),
     [
       baseUrl, accessToken, guestAllowed, cacheKey, trendTimeZone, trendTzOffsetMinutes, mockNow,
       accountView, accountAccessToken, accountRevision, accountViewResolving,
+      selectedDevice,
     ],
   );
 
@@ -853,6 +889,7 @@ export function DashboardPage({
 
   const [prevPeriod, setPrevPeriod] = useState("month");
   const handlePeriodChange = useCallback((p) => {
+    if (accountView && !publicMode) recordCloudPromptIntent(auth?.userId, "history");
     if (p === "custom") {
       setPrevPeriod((prev) => (prev === "custom" ? "month" : prev));
       setSelectedPeriod((cur) => {
@@ -866,14 +903,15 @@ export function DashboardPage({
       setPrevPeriod(p);
       setCustomRangeOpen(false);
     }
-  }, [customFrom, customTo]);
+  }, [customFrom, customTo, accountView, publicMode, auth?.userId]);
 
   const handleCustomRangeApply = useCallback((fromDate, toDate) => {
+    if (accountView && !publicMode) recordCloudPromptIntent(auth?.userId, "history");
     setCustomFrom(fromDate);
     setCustomTo(toDate);
     setSelectedPeriod("custom");
     setCustomRangeOpen(false);
-  }, []);
+  }, [accountView, publicMode, auth?.userId]);
 
   const handleCustomRangeOpenChange = useCallback((open) => {
     setCustomRangeOpen(open);
@@ -928,11 +966,13 @@ export function DashboardPage({
         refreshModelBreakdown(),
         refreshProjectUsage(),
         refreshDailyBreakdown(),
+        ...(!accountView ? [refreshAccountDevices()] : []),
       ]);
     });
   }, [
     accountView,
     refreshDailyBreakdown,
+    refreshAccountDevices,
     refreshHeatmap,
     refreshModelBreakdown,
     refreshProjectUsage,
@@ -1250,8 +1290,8 @@ export function DashboardPage({
   );
 
   const summaryCostValue = useMemo(
-    () => formatUsdCurrency(summary?.total_cost_usd, { currency, rate }),
-    [summary?.total_cost_usd, currency, rate],
+    () => formatSummaryCost(summary?.total_cost_usd, { modelBreakdown, currency, rate }),
+    [summary?.total_cost_usd, modelBreakdown, currency, rate],
   );
   const summaryConversationsValue = useMemo(
     () => summary?.conversation_count ?? null,
@@ -1376,7 +1416,10 @@ export function DashboardPage({
   return (
     <>
     <DashboardView
+      cloudNotice={cloudNotice}
       copy={copy}
+      accountView={accountView}
+      accountScopeSwitchable={accountScopeSwitchable}
       onOpenShare={openShareModal}
       screenshotMode={screenshotMode}
       showExpiredGate={showExpiredGate}
@@ -1474,9 +1517,23 @@ export function DashboardPage({
       costModalOpen={costModalOpen}
       closeCostModal={closeCostModal}
       deviceOptions={deviceOptions}
-      selectedDevice={selectedDevice || ""}
-      onDeviceChange={(v) => setSelectedDevice(v || null)}
+      selectedDevice={deviceFilterValue}
+      onDeviceChange={(v) => {
+        if (accountScopeSwitchable) {
+          const next = resolveUnifiedDeviceFilterChange(v);
+          setAccountScopeOverride(next.scopeOverride);
+          if (next.scopeOverride === null && !publicMode) {
+            recordCloudPromptIntent(auth?.userId, "view");
+          }
+          setSelectedDevice(next.deviceId);
+          return;
+        }
+        if (accountView && !publicMode) recordCloudPromptIntent(auth?.userId, "view");
+        setSelectedDevice(v || null);
+      }}
       deviceUsageBlock={deviceUsageBlock}
+      localHistoryOnly={!accountView && activeDevices.some((device) => device.imported_at)}
+      localHistoryRevision={accountView ? 0 : localUsageRevision}
       leftCardOrder={dashboardCardOrder.left.order}
       onLeftReorder={dashboardCardOrder.left.reorder}
       rightCardOrder={dashboardCardOrder.right.order}

@@ -21,7 +21,6 @@ const {
   TRAE_CN_AUTH_KEY,
   TRAE_CN_USAGE_URL,
   TRAE_CN_USAGE_DELAY_MS,
-  resolveTraeCnHome,
   resolveTraeCnStoragePath,
   decryptTraeCnBase64,
   parseTraeCnAuthValue,
@@ -32,8 +31,6 @@ const {
   fetchTraeCnUsageWindowed,
   fetchTraeCnUsageWithAuth,
 } = require("../src/lib/trae-cn-config");
-
-const CN_APP_DIR = "TRAE SOLO CN";
 
 // Frozen fixture: encrypted with the documented KDF, fixed 32-byte salt.
 const FIXTURE_B64 =
@@ -108,46 +105,85 @@ function jsonResponse(status, body) {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-test("resolveTraeCnHome honors TOKENTRACKER_TRAE_CN_HOME override", () => {
-  assert.equal(
-    resolveTraeCnHome({ env: { [TRAE_CN_HOME_ENV]: "/custom/cn-home" } }),
-    path.resolve("/custom/cn-home"),
-  );
-  // Whitespace-only override falls back to the platform default.
-  const fallback = resolveTraeCnHome({ env: { [TRAE_CN_HOME_ENV]: "   " }, platform: "darwin", home: "/Users/t" });
-  assert.equal(fallback, path.join("/Users/t", "Library", "Application Support", CN_APP_DIR));
-});
-
-test("resolveTraeCnHome resolves the macOS and Windows defaults", () => {
-  const darwinHome = "/Users/tester";
-  assert.equal(
-    resolveTraeCnHome({ platform: "darwin", home: darwinHome }),
-    path.join(darwinHome, "Library", "Application Support", CN_APP_DIR),
-  );
-  // Windows keeps the CN Work app under APPDATA (or the roaming profile).
-  const winHome = "C:\\Users\\tester";
-  const appData = "C:\\Users\\tester\\AppData\\Roaming";
-  assert.equal(
-    resolveTraeCnHome({ platform: "win32", home: winHome, env: { APPDATA: appData } }),
-    path.join(appData, CN_APP_DIR),
-  );
-  // No verified CN Work app-data layout on other platforms yet.
-  assert.equal(resolveTraeCnHome({ platform: "linux", home: darwinHome, env: {} }), null);
-});
-
-test("resolveTraeCnStoragePath points at User/globalStorage/storage.json", () => {
+test("resolveTraeCnStoragePath honors TOKENTRACKER_TRAE_CN_HOME override", () => {
   const override = "/tmp/cn-install";
   assert.equal(
     resolveTraeCnStoragePath({ env: { [TRAE_CN_HOME_ENV]: override } }),
     path.join(path.resolve(override), "User", "globalStorage", "storage.json"),
   );
+});
+
+test("resolveTraeCnStoragePath discovers the classic Trae CN client without an override", () => {
+  const winParent = makeTraeCnHome();
+  writeStorage(path.join(winParent, "Trae CN"));
   assert.equal(
-    resolveTraeCnStoragePath({ platform: "darwin", home: "/Users/tester", env: {} }),
-    path.join("/Users/tester", "Library", "Application Support", CN_APP_DIR, "User", "globalStorage", "storage.json"),
+    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\u", env: { APPDATA: winParent } }),
+    path.join(winParent, "Trae CN", "User", "globalStorage", "storage.json"),
   );
+  const home = makeTraeCnHome();
+  writeStorage(path.join(home, "Library", "Application Support", "Trae CN"));
   assert.equal(
-    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\Users\\tester", env: { APPDATA: "C:\\Users\\tester\\AppData\\Roaming" } }),
-    path.join("C:\\Users\\tester\\AppData\\Roaming", CN_APP_DIR, "User", "globalStorage", "storage.json"),
+    resolveTraeCnStoragePath({ platform: "darwin", home, env: {} }),
+    path.join(home, "Library", "Application Support", "Trae CN", "User", "globalStorage", "storage.json"),
+  );
+});
+
+test("resolveTraeCnStoragePath prefers TRAE SOLO CN when both clients are installed", () => {
+  const parent = makeTraeCnHome();
+  writeStorage(path.join(parent, "Trae CN"));
+  writeStorage(path.join(parent, "TRAE SOLO CN"));
+  assert.equal(
+    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\u", env: { APPDATA: parent } }),
+    path.join(parent, "TRAE SOLO CN", "User", "globalStorage", "storage.json"),
+  );
+});
+
+test("resolveTraeCnStoragePath returns null when no CN client is installed", () => {
+  const parent = makeTraeCnHome();
+  assert.equal(resolveTraeCnStoragePath({ platform: "win32", home: "C:\\u", env: { APPDATA: parent } }), null);
+  assert.equal(resolveTraeCnStoragePath({ platform: "darwin", home: parent, env: {} }), null);
+  // A whitespace-only override falls back to discovery, which finds nothing.
+  assert.equal(
+    resolveTraeCnStoragePath({ env: { [TRAE_CN_HOME_ENV]: "   " }, platform: "darwin", home: parent }),
+    null,
+  );
+  // No verified CN app-data layout on other platforms yet.
+  assert.equal(resolveTraeCnStoragePath({ platform: "linux", home: parent, env: {} }), null);
+});
+
+test("resolveTraeCnStoragePath finds and reads the classic client through a junction", (t) => {
+  const parent = makeTraeCnHome();
+  const realHome = makeTraeCnHome();
+  t.after(() => {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(realHome, { recursive: true, force: true });
+  });
+  writeStorage(realHome, { token: "junction-jwt-canary" });
+  // Windows creates a real junction; POSIX exercises equivalent symlink IO.
+  fs.symlinkSync(realHome, path.join(parent, "Trae CN"), "junction");
+  assert.equal(
+    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\u", env: { APPDATA: parent } }),
+    path.join(parent, "Trae CN", "User", "globalStorage", "storage.json"),
+  );
+  assert.equal(readTraeCnAuthFromStorage({ platform: "win32", home: parent, env: { APPDATA: parent } }).token, "junction-jwt-canary");
+});
+
+test("resolveTraeCnStoragePath hands a non-file storage.json to the reader (fail-closed)", () => {
+  const parent = makeTraeCnHome();
+  const soloHome = path.join(parent, "TRAE SOLO CN");
+  const storagePath = path.join(soloHome, "User", "globalStorage", "storage.json");
+  fs.mkdirSync(storagePath, { recursive: true }); // directory named storage.json
+  assert.equal(
+    resolveTraeCnStoragePath({ platform: "win32", home: "C:\\u", env: { APPDATA: parent } }),
+    storagePath,
+  );
+  assert.throws(
+    () => readTraeCnAuthFromStorage({ platform: "win32", home: "C:\\u", env: { APPDATA: parent } }),
+    (error) => {
+      assert.equal(error.code, "TRAE_CN_STORAGE_UNREADABLE");
+      assert.match(error.message, /could not be read/);
+      return true;
+    },
   );
 });
 
@@ -967,5 +1003,62 @@ test("readTraeCnAuthFromStorage: ENOENT / ENOTDIR mean absent (null), other IO e
       },
       code,
     );
+  }
+});
+
+test("TRAE CN doctor probe is local, opt-in, and credential-safe", () => {
+  const { inspectTraeCnAuth } = require("../src/lib/trae-cn-config");
+  const home = makeTraeCnHome();
+  try {
+    const env = { [TRAE_CN_HOME_ENV]: home };
+    const storagePath = writeStorage(home, { token: "doctor-jwt-canary", refreshToken: "doctor-refresh-canary" });
+    assert.equal(inspectTraeCnAuth({ env, fsModule: {
+      readFileSync() { assert.fail("opted-out doctor must not read auth"); },
+    } }).auth, "unchecked");
+    env.TOKENTRACKER_TRAE_CN_USAGE = "1";
+    const state = inspectTraeCnAuth({ env });
+    assert.deepEqual(state, { usage_opt_in: true, storage_path: storagePath, auth: "readable" });
+    assert.doesNotMatch(JSON.stringify(state), /canary/);
+    fs.writeFileSync(storagePath, "doctor-jwt-canary malformed json");
+    assert.equal(inspectTraeCnAuth({ env }).auth, "malformed");
+    assert.equal(inspectTraeCnAuth({ env, fsModule: {
+      readFileSync() { throw Object.assign(new Error("doctor-jwt-canary"), { code: "EACCES" }); },
+    } }).auth, "unreadable");
+    fs.rmSync(storagePath);
+    assert.equal(inspectTraeCnAuth({ env }).auth, "not-signed-in");
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("persistent TRAE CN rejection explains recovery without reading the response body", async () => {
+  for (const status of [401, 403]) {
+    let calls = 0;
+    await assert.rejects(fetchTraeCnUsageWithAuth({
+      start_time: START, end_time: END,
+      readAuth: () => ({ token: "auth-jwt-canary", refreshToken: "auth-refresh-canary" }),
+      fetchImpl: async () => {
+        calls++;
+        return { status, ok: false, json() { assert.fail("auth error body must not be read"); } };
+      },
+    }), (error) => {
+      assert.equal(error.status, status);
+      assert.match(error.message, /Sign in again/);
+      assert.match(error.message, /TOKENTRACKER_TRAE_CN_HOME/);
+      assert.doesNotMatch(error.message, /canary/);
+      return true;
+    });
+    assert.equal(calls, 2);
+  }
+});
+
+test("TRAE CN API error codes cannot echo credentials", async () => {
+  for (const code of ["jwt-canary", { token: "jwt-canary" }, ["jwt-canary"], true]) {
+    await assert.rejects(fetchTraeCnUsagePage({
+      jwt: JWT, start_time: START, end_time: END, page_num: 1,
+      fetchImpl: async () => jsonResponse(200, { code, message: "jwt-canary" }),
+    }), (error) => {
+      assert.equal(error.message, "Trae CN usage API returned an invalid error code.");
+      assert.doesNotMatch(JSON.stringify(error), /canary/);
+      return true;
+    });
   }
 });

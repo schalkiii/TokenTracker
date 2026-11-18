@@ -2,6 +2,15 @@ import { copy } from "../../../lib/copy";
 
 /** Window + optional extra metadata for UsageLimitsPanel (no JSX — keeps hardcode scan clean). */
 
+// Qoder reports an empty 0/0 bucket for a plan-less account or a missing
+// add-on pack. The row carries no quota to read and would render as a full
+// bar in remaining mode, so it is dropped like a missing window (the panel
+// already shows its no-data state when every row drops out).
+function dropEmptyQoderWindow(window) {
+  if (!window) return null;
+  return Number(window.limit_credits) === 0 ? null : window;
+}
+
 export const PROVIDER_LIMIT_SPECS = {
   claude: {
     windows(data) {
@@ -99,6 +108,10 @@ export const PROVIDER_LIMIT_SPECS = {
     // Grok unified billing is weekly for SuperGrok / free-tier accounts and
     // monthly for legacy credit counters. period_type comes from the billing
     // API (USAGE_PERIOD_TYPE_WEEKLY / MONTHLY) via grok-limits.js.
+    // Products are shares of that same pool, not separate quotas, so they ride
+    // on the pool row as `segments` instead of rows that read as independent
+    // 100% quotas. The headline follows used/remaining. The stack itself is
+    // drawn only in used mode, where the slices add up to that headline.
     windows(data) {
       const period = typeof data.period_type === "string" ? data.period_type : null;
       const primaryLabelKey =
@@ -115,6 +128,8 @@ export const PROVIDER_LIMIT_SPECS = {
           labelKey: primaryLabelKey,
           window: data.primary_window,
           windowSeconds,
+          productPool: true,
+          segments: grokProductSegments(data),
         },
         { key: "ondemand", labelKey: "limits.label.grok_ondemand", window: data.secondary_window },
       ];
@@ -140,6 +155,7 @@ export const PROVIDER_LIMIT_SPECS = {
     },
   },
   zcode: {
+    extra: "zcode_reset_bank",
     /** Limit rows for ZCode: fixed coding-plan windows, or one row per labelled start-plan bucket. */
     windows(data) {
       // Coding plans expose 5h / weekly / tools windows (ZCode 3.3.x).
@@ -154,7 +170,12 @@ export const PROVIDER_LIMIT_SPECS = {
       }
       const labeled = Array.isArray(data.buckets) ? data.buckets.filter((b) => b?.label && b.window) : [];
       if (labeled.length) {
-        return labeled.map((b, i) => ({ key: `bucket-${b.entitlement_id || i}`, label: b.label, window: b.window }));
+        return labeled.map((b, i) => ({
+          key: `bucket-${b.entitlement_id || i}`,
+          label: b.label,
+          window: b.window,
+          ...(b.period === "one_time" ? { timeKind: "expiry" } : {}),
+        }));
       }
       // Payloads from older servers carry no bucket labels.
       return [
@@ -176,28 +197,39 @@ export const PROVIDER_LIMIT_SPECS = {
       ];
     },
   },
+  // Every Qoder fetch path (desktop RPC, CN CLI OpenAPI, cookie API, log
+  // summary) already carries used/limit/remaining per window, so the inline
+  // detail mirrors WorkBuddy's card. creditPrecision must be explicit: the
+  // default rounds amounts ≥100 to integers, which would hide fractional
+  // add-on credits. The three buckets mirror Qoder's own Credits page.
   qoder: {
     windows(data) {
       return [
-        { key: "credits", labelKey: "limits.label.qoder_credits", window: data.primary_window },
+        { key: "credits", labelKey: "limits.label.qoder_credits", window: dropEmptyQoderWindow(data.primary_window), creditPrecision: 2, showCreditDetail: true },
+        { key: "addon", labelKey: "limits.label.qoder_addon_credits", window: dropEmptyQoderWindow(data.tertiary_window), creditPrecision: 2, showCreditDetail: true },
         {
           key: "ultimate",
           labelKey: "limits.label.qoder_ultimate",
           window: data.secondary_window,
           timeKind: "expiry",
+          showCreditDetail: true,
         },
       ];
     },
   },
+  // Same windows and detail as the international edition; only the labels
+  // differ between the two installs.
   qoderCn: {
     windows(data) {
       return [
-        { key: "credits", labelKey: "limits.label.qoder_cn_credits", window: data.primary_window },
+        { key: "credits", labelKey: "limits.label.qoder_cn_credits", window: dropEmptyQoderWindow(data.primary_window), creditPrecision: 2, showCreditDetail: true },
+        { key: "addon", labelKey: "limits.label.qoder_cn_addon_credits", window: dropEmptyQoderWindow(data.tertiary_window), creditPrecision: 2, showCreditDetail: true },
         {
           key: "ultimate",
           labelKey: "limits.label.qoder_cn_ultimate",
           window: data.secondary_window,
           timeKind: "expiry",
+          showCreditDetail: true,
         },
       ];
     },
@@ -248,7 +280,63 @@ export const PROVIDER_LIMIT_SPECS = {
       ];
     },
   },
+  workbuddy: {
+    // One row per signed-in edition, mirroring the desktop app's split: the
+    // subscription plan's base credits on the plan cycle, plus one pooled
+    // resource-package window for every non-plan credit group (gift, top-up,
+    // platform rewards). An empty 0/0 pool yields no window and drops out.
+    windows(data) {
+      return [
+        { key: "plan", labelKey: "limits.label.workbuddy_plan", window: data.primary_window, creditPrecision: 2, showCreditDetail: true },
+        { key: "addon", labelKey: "limits.label.workbuddy_addon", window: data.secondary_window, creditPrecision: 2, showCreditDetail: true },
+      ];
+    },
+  },
+  // WorkBuddy AI publishes the same two-window shape as the China edition.
+  workbuddyAi: {
+    windows(data) {
+      return PROVIDER_LIMIT_SPECS.workbuddy.windows(data);
+    },
+  },
+  // DeepSeek (platform.deepseek.com) is pay-as-you-go and publishes no quota
+  // windows: the balance card renders through the deepseek_balance extra, so
+  // the window list stays empty and no fake "used 0" bar can appear (issue 960).
+  deepseek: {
+    extra: "deepseek_balance",
+    windows() {
+      return [];
+    },
+  },
 };
+
+const GROK_PRODUCT_LABEL_KEYS = {
+  GrokBuild: "limits.label.grok_build",
+  GrokBot: "limits.label.grok_bot",
+  GrokChat: "limits.label.grok_chat",
+  GrokImagine: "limits.label.grok_imagine",
+  GrokVoice: "limits.label.grok_voice",
+  Cursor: "limits.label.grok_cursor",
+};
+
+/**
+ * Per-product slices of the pool bar, in API order. Known ids use copy keys; a
+ * future product uses the server label. Null when there is nothing to split,
+ * so the pool falls back to a plain bar.
+ */
+function grokProductSegments(data) {
+  if (!Array.isArray(data?.products)) return null;
+  const segments = [];
+  for (const entry of data.products) {
+    const product = typeof entry?.product === "string" ? entry.product : "";
+    const pct = Number(entry?.window?.used_percent);
+    if (!product || !(pct > 0)) continue;
+    const labelKey = GROK_PRODUCT_LABEL_KEYS[product];
+    const label = typeof entry.label === "string" ? entry.label.trim() : "";
+    if (!labelKey && !label) continue;
+    segments.push({ key: product, ...(labelKey ? { labelKey } : { label }), pct });
+  }
+  return segments.length > 0 ? segments : null;
+}
 
 /** Static copy() anchors for validate:copy — labels resolve at runtime via spec.labelKey. */
 export function usageLimitsLabelCopyAnchor() {
@@ -279,6 +367,12 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.grok_week"),
     copy("limits.label.grok_day"),
     copy("limits.label.grok_ondemand"),
+    copy("limits.label.grok_build"),
+    copy("limits.label.grok_bot"),
+    copy("limits.label.grok_chat"),
+    copy("limits.label.grok_imagine"),
+    copy("limits.label.grok_voice"),
+    copy("limits.label.grok_cursor"),
     copy("limits.label.antigravity_claude_weekly"),
     copy("limits.label.antigravity_claude_5h"),
     copy("limits.label.antigravity_gemini_weekly"),
@@ -296,6 +390,7 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.qoder_credits"),
     copy("limits.label.qoder_ultimate"),
     copy("limits.label.qoder_cn_credits"),
+    copy("limits.label.qoder_cn_addon_credits"),
     copy("limits.label.qoder_cn_ultimate"),
     copy("limits.label.command_code_5h"),
     copy("limits.label.command_code_weekly"),
@@ -307,5 +402,7 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.ark_agent_plan_monthly"),
     copy("limits.label.devin_daily"),
     copy("limits.label.devin_weekly"),
+    copy("limits.label.workbuddy_plan"),
+    copy("limits.label.workbuddy_addon"),
   ];
 }

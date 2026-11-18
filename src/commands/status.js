@@ -3,6 +3,7 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const pkg = require("../../package.json");
+const { resolveDumateDbPaths } = require("../lib/dumate");
 
 const { readJson } = require("../lib/fs");
 const { readCursorStateSummary } = require("../lib/cursor-store");
@@ -46,6 +47,7 @@ const {
   probeOpenclawSessionPluginState,
 } = require("../lib/openclaw-session-plugin");
 const { resolveTrackerPaths } = require("../lib/tracker-paths");
+const { resolveDeviceTokenPresence } = require("../lib/cloud-device-token");
 const {
   resolveKimiWireFiles,
   resolveKimiCodeWireFiles,
@@ -73,12 +75,15 @@ const {
   resolveCraftConfigDir,
   resolveReasonixHome,
   resolveReasonixTelemetryFiles,
+  resolveMuseHome,
+  resolveMuseSessionFiles,
   resolveKilocodeTaskFiles,
   resolveRoocodeTaskFiles,
   resolveClineSessionFilesWithStatus,
   resolveZedDbPath,
   resolveLmstudioHome,
   resolveLmstudioLogFiles,
+  resolveOpenSquillaDbPaths,
   resolveUnslothDbPath,
   resolveQoderDbPaths,
   resolveQoderCnDbPaths,
@@ -105,6 +110,7 @@ const {
   resolveCopilotAppDbPath,
   resolveCopilotAppDbPaths,
   probeWslDistros,
+  resolveZcodeInstallPaths,
 } = require("../lib/rollout");
 const {
   TRAE_CN_USAGE_ENV,
@@ -114,6 +120,11 @@ const {
   extractTraeCnToken,
 } = require("../lib/trae-cn-config");
 const wsl = require("../lib/wsl-probe");
+const {
+  T3_ANTIGRAVITY_REL,
+  discoverT3AntigravityBrainDirs,
+  formatAntigravityHostStatus,
+} = require("../lib/antigravity-discovery");
 const { getWslMode, isInvalidWslMode, shouldProbeWsl, discoverWslHome } = wsl;
 const { resolveInstallPaths, resolveZcodeNativeDbPath, resolveMimoNativeDbPath } = require("../lib/install-resolver");
 const {
@@ -221,6 +232,11 @@ async function cmdStatus(argv = []) {
     resolveWorkbuddyHome(process.env) || path.join(home, ".workbuddy"),
     "settings.json",
   );
+  // WorkBuddy AI — international build, sibling home (~/.workbuddy-ai).
+  const workbuddyAiSettingsPath = path.join(
+    resolveWorkbuddyHome(process.env, "workbuddy-ai") || path.join(home, ".workbuddy-ai"),
+    "settings.json",
+  );
   const geminiConfigDir = resolveGeminiConfigDir({ home, env: process.env });
   const geminiSettingsPath = resolveGeminiSettingsPath({
     configDir: geminiConfigDir,
@@ -235,6 +251,7 @@ async function cmdStatus(argv = []) {
   const claudeHookCommand = buildClaudeHookCommand(notifyPath);
   const codebuddyHookCommand = buildHookCommand(notifyPath, "codebuddy");
   const workbuddyHookCommand = buildHookCommand(notifyPath, "workbuddy");
+  const workbuddyAiHookCommand = buildHookCommand(notifyPath, "workbuddy-ai");
   const geminiHookCommand = buildGeminiHookCommand(notifyPath);
 
   const config = await readJson(configPath);
@@ -307,6 +324,10 @@ async function cmdStatus(argv = []) {
   const workbuddyHookConfigured = await isClaudeHookConfigured({
     settingsPath: workbuddySettingsPath,
     hookCommand: workbuddyHookCommand,
+  });
+  const workbuddyAiHookConfigured = await isClaudeHookConfigured({
+    settingsPath: workbuddyAiSettingsPath,
+    hookCommand: workbuddyAiHookCommand,
   });
   const geminiHookConfigured = await isGeminiHookConfigured({
     settingsPath: geminiSettingsPath,
@@ -493,6 +514,15 @@ async function cmdStatus(argv = []) {
     ? fssync.existsSync(path.join(workbuddyHome, "workbuddy.db"))
     : false;
 
+  const workbuddyAiHome = resolveWorkbuddyHome(process.env, "workbuddy-ai");
+  const workbuddyAiInstalled = Boolean(workbuddyAiHome && fssync.existsSync(workbuddyAiHome));
+  const workbuddyAiFiles = workbuddyAiInstalled
+    ? resolveWorkbuddyProjectFiles(process.env, "workbuddy-ai")
+    : [];
+  const workbuddyAiDbExists = workbuddyAiInstalled
+    ? fssync.existsSync(path.join(workbuddyAiHome, "workbuddy.db"))
+    : false;
+
   // oh-my-pi — passive scan + optional notify extension.
   const ompAgentDir = resolveOmpAgentDir(process.env);
   const ompInstalled = Boolean(ompAgentDir) && fssync.existsSync(path.join(ompAgentDir, "sessions"));
@@ -531,6 +561,10 @@ async function cmdStatus(argv = []) {
   const reasonixInstalled = Boolean(reasonixHome && fssync.existsSync(reasonixHome));
   const reasonixFiles = reasonixInstalled ? resolveReasonixTelemetryFiles(process.env) : [];
 
+  // Muse Code (Meta) — passive scan of per-session session.jsonl logs.
+  const museInstalled = fssync.existsSync(path.join(resolveMuseHome(process.env), "sessions"));
+  const museFiles = museInstalled ? resolveMuseSessionFiles(process.env) : [];
+
   // Kilo CLI (kilo.ai @kilocode/plugin) — passive scan of kilo.db.
   const xdgDataHome = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
   const kiloHome = process.env.KILO_HOME || path.join(xdgDataHome, "kilo");
@@ -544,6 +578,10 @@ async function cmdStatus(argv = []) {
   const kiloActive = formatResolvedPaths(kiloPaths);
   const kiloInstalled = kiloActive.length > 0;
   const kiloDbPath = kiloActive.join(" | ");
+
+  const dumateDbPaths = resolveDumateDbPaths({ home });
+  const dumateInstalled = dumateDbPaths.length > 0;
+  const dumateDbPath = dumateDbPaths.join(" | ");
 
   // Mimo (mimocode — OpenCode-fork SQLite) — passive scan of mimocode.db.
   const mimoNativeValue = resolveMimoNativeDbPath({ home });
@@ -560,7 +598,10 @@ async function cmdStatus(argv = []) {
   const wslZcodeDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
     ? wsl.discoverWslHome(".zcode")
     : null;
-  const zcodePaths = resolveInstallPaths({ nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null });
+  const zcodePaths = resolveZcodeInstallPaths(
+    { nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null },
+    process.env, { cursors },
+  );
   const zcodeActive = formatResolvedPaths(zcodePaths);
   const zcodeInstalled = zcodeActive.length > 0;
   const zcodeDbPath = zcodeActive.join(" | ");
@@ -674,6 +715,7 @@ async function cmdStatus(argv = []) {
     const dirs = [
       path.join(geminiPaths.native, "antigravity", "brain"),
       path.join(geminiPaths.native, "antigravity-ide", "brain"),
+      path.join(geminiPaths.native, "antigravity-insiders", "brain"),
       path.join(geminiPaths.native, "antigravity-cli", "brain"),
     ];
     if (dirs.some(d => { try { return fssync.existsSync(d); } catch (_) { return false; } })) {
@@ -684,12 +726,28 @@ async function cmdStatus(argv = []) {
     const dirs = [
       path.join(geminiPaths.wsl, "antigravity", "brain"),
       path.join(geminiPaths.wsl, "antigravity-ide", "brain"),
+      path.join(geminiPaths.wsl, "antigravity-insiders", "brain"),
       path.join(geminiPaths.wsl, "antigravity-cli", "brain"),
     ];
     if (dirs.some(d => { try { return fssync.existsSync(d); } catch (_) { return false; } })) {
       antigravityActive.push(`WSL: ${geminiPaths.wsl}`);
     }
   }
+  const extraT3Parents = [];
+  if (process.platform === "win32" && shouldProbeWsl(process.env)) {
+    const wslT3Home = discoverWslHome(".t3");
+    if (wslT3Home) extraT3Parents.push(path.join(wslT3Home, T3_ANTIGRAVITY_REL));
+  }
+  const antigravityHost = await discoverT3AntigravityBrainDirs({
+    home,
+    env: process.env,
+    parents: extraT3Parents,
+  });
+  const antigravityHostLines = formatAntigravityHostStatus(antigravityHost.reports);
+  for (const line of antigravityHostLines) {
+    if (line.startsWith("T3: ")) antigravityActive.push(line);
+  }
+  const antigravityHostNotes = antigravityHostLines.filter((line) => !line.startsWith("T3: "));
   const antigravityInstalled = antigravityActive.length > 0;
 
   // Codex CLI (passive sessions scan). Mirrors the sync resolution exactly
@@ -793,6 +851,9 @@ async function cmdStatus(argv = []) {
   const lmstudioHome = resolveLmstudioHome(process.env);
   const lmstudioLogFiles = await resolveLmstudioLogFiles(process.env);
   const lmstudioInstalled = lmstudioLogFiles.length > 0;
+  const opensquillaDbPaths = resolveOpenSquillaDbPaths(process.env)
+    .filter((dbPath) => fssync.existsSync(dbPath));
+  const opensquillaInstalled = opensquillaDbPaths.length > 0;
   const unslothDbPath = resolveUnslothDbPath(process.env);
   const unslothInstalled = Boolean(unslothDbPath && fssync.existsSync(unslothDbPath));
 
@@ -817,13 +878,19 @@ async function cmdStatus(argv = []) {
   // official API, so status surfaces the opt-in flag, the resolved storage
   // path, and whether the auth blob decrypts — the three inputs a "why is my
   // TRAE CN data missing" diagnosis needs.
-  // A resolvable default path does NOT mean the app is installed - the
-  // macOS/Windows resolver always derives one. Match the sync path semantics
-  // exactly: installed iff the storage file actually exists on disk.
+  // Follow junctions with stat. Only missing paths mean absent; access/IO
+  // errors must reach the auth reader and be shown as unreadable, not hidden
+  // behind existsSync's false result. Explicit overrides can also be absent.
   const traeCnStoragePath = resolveTraeCnStoragePath({ env: process.env, home });
-  const traeCnInstalled = Boolean(
-    traeCnStoragePath && fssync.existsSync(traeCnStoragePath),
-  );
+  let traeCnInstalled = false;
+  if (traeCnStoragePath) {
+    try {
+      fssync.statSync(traeCnStoragePath);
+      traeCnInstalled = true;
+    } catch (error) {
+      traeCnInstalled = error?.code !== "ENOENT" && error?.code !== "ENOTDIR";
+    }
+  }
   let traeCnAuthState = "not-signed-in";
   if (traeCnInstalled) {
     try {
@@ -1003,8 +1070,14 @@ async function cmdStatus(argv = []) {
       openclaw_session_plugin: Boolean(openclawSessionPluginState?.configured),
       codebuddy: Boolean(codebuddyHookConfigured),
       workbuddy: Boolean(workbuddyHookConfigured),
+      "workbuddy-ai": Boolean(workbuddyAiHookConfigured),
       grok: Boolean(grokHookState?.configured),
     },
+  });
+
+  const deviceTokenPresence = resolveDeviceTokenPresence({
+    trackerDir,
+    config: config || {},
   });
 
   if (opts.json || opts.light) {
@@ -1012,7 +1085,7 @@ async function cmdStatus(argv = []) {
       version: pkg.version,
       generated_at: new Date().toISOString(),
       base_url: config?.baseUrl || null,
-      device_token_set: Boolean(config?.deviceToken),
+      device_token_set: deviceTokenPresence.set,
       queue: {
         pending_bytes: pendingBytes,
         size_bytes: queueSize,
@@ -1046,6 +1119,7 @@ async function cmdStatus(argv = []) {
         openclaw_legacy: Boolean(openclawHookState?.configured),
         codebuddy: codebuddyInstalled ? Boolean(codebuddyHookConfigured) : null,
         workbuddy: workbuddyInstalled ? Boolean(workbuddyHookConfigured) : null,
+        "workbuddy-ai": workbuddyAiInstalled ? Boolean(workbuddyAiHookConfigured) : null,
         grok: grokInstalled ? Boolean(grokHookState?.configured) : null,
       },
       providers: {
@@ -1077,6 +1151,9 @@ async function cmdStatus(argv = []) {
         workbuddy: workbuddyInstalled
           ? { installed: true, files: workbuddyFiles.length }
           : { installed: false },
+        workbuddy_ai: workbuddyAiInstalled
+          ? { installed: true, files: workbuddyAiFiles.length }
+          : { installed: false },
         omp: ompInstalled || ompHookState.ompPresent
           ? {
               installed: true,
@@ -1103,11 +1180,17 @@ async function cmdStatus(argv = []) {
         reasonix: reasonixInstalled
           ? { installed: true, files: reasonixFiles.length }
           : { installed: false },
+        muse: museInstalled
+          ? { installed: true, files: museFiles.length }
+          : { installed: false },
         anythingllm: anythingllmInstalled
           ? { installed: true, detail: anythingllmDbPath }
           : { installed: false },
         kilo_cli: kiloInstalled
           ? { installed: true, detail: kiloDbPath }
+          : { installed: false },
+        dumate: dumateInstalled
+          ? { installed: true, detail: dumateDbPath }
           : { installed: false },
         mimo: mimoInstalled
           ? { installed: true, detail: mimoDbPath }
@@ -1167,6 +1250,9 @@ async function cmdStatus(argv = []) {
           : { installed: false },
         unsloth: unslothInstalled
           ? { installed: true, detail: unslothDbPath }
+          : { installed: false },
+        opensquilla: opensquillaInstalled
+          ? { installed: true, detail: opensquillaDbPaths.join(" | ") }
           : { installed: false },
         devin: devinInstalled
           ? { installed: true, detail: devinDbPath }
@@ -1235,7 +1321,7 @@ async function cmdStatus(argv = []) {
       `TokenTracker v${pkg.version}`,
       "Status:",
       `- Base URL: ${config?.baseUrl || "unset"}`,
-      `- Device token: ${config?.deviceToken ? "set" : "unset"}`,
+      `- Device token: ${deviceTokenPresence.set ? "set" : "unset"}`,
       `- Queue: ${pendingBytes} bytes pending`,
       `- Last parse: ${cursors?.updatedAt || "never"}`,
       `- Last notify: ${lastNotify || "never"}`,
@@ -1264,7 +1350,7 @@ async function cmdStatus(argv = []) {
         ? `- Kimi Code: passive reader (${kimiWireFiles.length + kimiCodeWireFiles.length} wire.jsonl file${(kimiWireFiles.length + kimiCodeWireFiles.length) !== 1 ? "s" : ""} found, directories: ${kimiActive.join(" | ") || "none"})`
         : null,
       kiroCliInstalled
-        ? `- Kiro CLI: passive reader (${kiroCliFileCount} session file${kiroCliFileCount !== 1 ? "s" : ""} found, SQLite ${kiroCliDbFound ? "found" : "not found"}, installs: ${kiroCliActive.join(" | ")}; tokens approximated from char lengths and merged under 'kiro')`
+        ? `- Kiro CLI: passive reader (${kiroCliFileCount} session file${kiroCliFileCount !== 1 ? "s" : ""} found, SQLite ${kiroCliDbFound ? "found" : "not found"}, installs: ${kiroCliActive.join(" | ")}; missing token counts use new-text estimates at ~4 chars/token, excluding re-sent history, system context and cache usage; model-rate costs are separate from Kiro credit charges; merged under 'kiro')`
         : null,
       kiroIdeInstalled
         ? `- Kiro IDE: passive reader (${kiroIdeActive.join(" | ")})`
@@ -1274,6 +1360,9 @@ async function cmdStatus(argv = []) {
         : null,
       workbuddyInstalled
         ? `- WorkBuddy hooks: ${workbuddyHookConfigured ? "set" : "unset"} (${workbuddyFiles.length} session jsonl file${workbuddyFiles.length !== 1 ? "s" : ""} found, SQLite DB ${workbuddyDbExists ? "found" : "not found"})`
+        : null,
+      workbuddyAiInstalled
+        ? `- WorkBuddy AI hooks: ${workbuddyAiHookConfigured ? "set" : "unset"} (${workbuddyAiFiles.length} session jsonl file${workbuddyAiFiles.length !== 1 ? "s" : ""} found, SQLite DB ${workbuddyAiDbExists ? "found" : "not found"})`
         : null,
       ompInstalled || ompHookState.ompPresent
         ? `- oh-my-pi: passive reader (${ompFiles.length} session jsonl file${ompFiles.length !== 1 ? "s" : ""} found${ompHookState.configured ? ", notify extension: yes" : ", notify extension: no"})`
@@ -1296,11 +1385,17 @@ async function cmdStatus(argv = []) {
       reasonixInstalled
         ? `- Reasonix: passive reader (${reasonixFiles.length} telemetry file${reasonixFiles.length !== 1 ? "s" : ""} found)`
         : null,
+      museInstalled
+        ? `- Muse Code: passive reader (${museFiles.length} session jsonl file${museFiles.length !== 1 ? "s" : ""} found)`
+        : null,
       anythingllmInstalled
         ? `- AnythingLLM Desktop: passive reader (${anythingllmDbPath})`
         : null,
       kiloInstalled
         ? `- Kilo CLI: passive reader (${kiloDbPath})`
+        : null,
+      dumateInstalled
+        ? `- DuMate: passive reader (${dumateDbPath})`
         : null,
       mimoInstalled
         ? `- Mimo: passive reader (${mimoDbPath})`
@@ -1329,6 +1424,7 @@ async function cmdStatus(argv = []) {
       antigravityInstalled
         ? `- Antigravity: brain found (${antigravityActive.join(" | ")})`
         : null,
+      ...antigravityHostNotes.map((line) => `- Antigravity: ${line}`),
       (!geminiCliInstalled && !antigravityInstalled && geminiInstalledStatus)
         ? `- Gemini CLI / Antigravity: home found (${geminiActive.join(" | ")})`
         : null,
@@ -1376,6 +1472,9 @@ async function cmdStatus(argv = []) {
         : null,
       unslothInstalled
         ? `- Unsloth Studio: passive reader (${unslothDbPath})`
+        : null,
+      opensquillaInstalled
+        ? "- OpenSquilla: passive reader (" + opensquillaDbPaths.join(" | ") + ")"
         : null,
       devinInstalled
         ? `- Devin CLI: passive reader (${devinDbPath})`

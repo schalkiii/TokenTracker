@@ -129,6 +129,15 @@ test("serve respects explicit port from --port and PORT env", (t) => {
   });
 });
 
+test("serve does not open a browser when started by a native app", () => {
+  for (const shell of ["macos", "windows", "linux"]) {
+    assert.equal(parseArgs([], { TOKENTRACKER_APP_SHELL: shell }).open, false, shell);
+  }
+  assert.equal(parseArgs([], {}).open, true);
+  assert.equal(parseArgs([], { TOKENTRACKER_APP_SHELL: "cli" }).open, true);
+  assert.equal(parseArgs(["--no-open"], {}).open, false);
+});
+
 // #267: Windows Delivery Optimization (DoSvc) holds 0.0.0.0:7680 on the host,
 // so under WSL the default port must move off 7680. Explicit --port / PORT
 // always win.
@@ -236,11 +245,19 @@ test("port cleanup only targets a real TokenTracker package", (t) => {
   const theirs = install("theirs", "some-other-tracker");
   assert.equal(isTokenTrackerServeCommand(`node ${theirs} serve`), false);
 
-  // The npm bin shim is a symlink into the package; realpath must be followed.
+  // Follow realpath through a POSIX bin symlink or a Windows package junction.
+  // Windows file symlinks require privileges that a normal checkout lacks.
   const shimDir = path.join(root, "node_modules", ".bin");
   fs.mkdirSync(shimDir, { recursive: true });
-  const shim = path.join(shimDir, "tokentracker-cli");
-  fs.symlinkSync(ours, shim);
+  let shim;
+  if (process.platform === "win32") {
+    const linkedPackage = path.join(shimDir, "tokentracker-package");
+    fs.symlinkSync(path.dirname(path.dirname(ours)), linkedPackage, "junction");
+    shim = path.join(linkedPackage, "bin", "tracker.js");
+  } else {
+    shim = path.join(shimDir, "tokentracker-cli");
+    fs.symlinkSync(ours, shim);
+  }
   assert.equal(isTokenTrackerServeCommand(`node ${shim} serve`), true);
 
   // The same, end to end: a genuine package under a directory containing
@@ -395,6 +412,7 @@ test("real serve entry exits duplicate cleanly without replacing the first proce
   const trackerDir = path.join(home, ".tokentracker", "tracker");
   fs.mkdirSync(trackerDir, { recursive: true });
   fs.writeFileSync(path.join(trackerDir, "cursors.json"), "{}\n");
+  fs.writeFileSync(path.join(trackerDir, "config.json"), JSON.stringify({ proxy: { mode: "off" }, telemetry: false }));
 
   const port = await getFreePort();
   const entry = path.join(__dirname, "..", "bin", "tracker.js");
@@ -403,6 +421,9 @@ test("real serve entry exits duplicate cleanly without replacing the first proce
     HOME: home,
     USERPROFILE: home,
     TOKENTRACKER_SKIP_LOCAL_RUNTIME_COPY: "1",
+    // The port contract owns the direct child. Proxy relaunch is covered
+    // separately; killing its wrapper would leave inherited pipes open.
+    TOKENTRACKER_PROXY_ENV_APPLIED: "1",
   };
   const args = [entry, "serve", "--port", String(port), "--no-sync", "--no-open"];
 
@@ -417,6 +438,29 @@ test("real serve entry exits duplicate cleanly without replacing the first proce
 
   await waitForLocalAuth(port, CURRENT_PACKAGE_VERSION);
   assert.equal(first.exitCode, null, `first serve exited early: ${firstOutput.stderr}`);
+
+  // Exercise the real serve preflight dispatch, which runs before API routing.
+  for (const [origin, expected] of [["https://untrusted.example.invalid", 403], ["null", 403],
+    [`http://127.0.0.1:${port}`, 204]]) {
+    const response = await fetch(`http://127.0.0.1:${port}/api/auth/refresh`, {
+      method: "OPTIONS", headers: { Origin: origin },
+    });
+    assert.equal(response.status, expected);
+    assert.equal(response.headers.get("access-control-allow-origin"), null);
+    assert.equal(response.headers.get("set-cookie"), null);
+    if (expected === 403) assert.equal((await response.json()).code, "untrusted_auth_origin");
+  }
+  const { token: localToken } = await (await fetch(`http://127.0.0.1:${port}/api/local-auth`)).json();
+  const markerUrl = `http://127.0.0.1:${port}/api/auth-bridge/verifier`;
+  const marked = await fetch(markerUrl, { method: "PUT",
+    headers: { "Content-Type": "application/json", "X-TokenTracker-Local-Auth": localToken },
+    body: JSON.stringify({ native: true }) });
+  assert.equal(marked.status, 200);
+  const foreignMarker = await fetch(markerUrl, { headers: { "Sec-Fetch-Site": "cross-site" } });
+  assert.equal(foreignMarker.status, 403);
+  const localMarker = await fetch(markerUrl);
+  assert.equal((await localMarker.json()).native, true);
+  assert.equal((await (await fetch(markerUrl)).json()).native, false);
 
   const second = cp.spawn(process.execPath, args, {
     env,

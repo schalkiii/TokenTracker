@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 @main
 struct TokenTrackerBarApp: App {
@@ -21,9 +22,11 @@ struct TokenTrackerBarApp: App {
                         NSApp.activate(ignoringOtherApps: true)
                         NSApp.orderFrontStandardAboutPanel(nil)
                     }
+                    #if !TOKENTRACKER_NATIVE_QA
                     Button(Strings.menuCheckForUpdates) {
                         UpdateChecker.shared.check(silent: false)
                     }
+                    #endif
                 }
                 CommandGroup(replacing: .appSettings) {
                     Button(Strings.menuSettings + "…") {
@@ -32,6 +35,7 @@ struct TokenTrackerBarApp: App {
                     .keyboardShortcut(",", modifiers: .command)
                 }
                 // Default Help menu shows "Help isn't available" — open the website.
+                #if !TOKENTRACKER_NATIVE_QA
                 CommandGroup(replacing: .help) {
                     Button(Strings.menuHelp) {
                         if let url = URL(string: "https://www.tokentracker.cc") {
@@ -39,6 +43,7 @@ struct TokenTrackerBarApp: App {
                         }
                     }
                 }
+                #endif
             }
     }
 }
@@ -74,9 +79,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusBarController: StatusBarController?
     private var lastWakeCatchUpAttemptAt: Date?
-    private let viewModel = DashboardViewModel()
-    private let serverManager = ServerManager()
-    private let launchAtLoginManager = LaunchAtLoginManager()
+    private lazy var viewModel = DashboardViewModel()
+    private lazy var serverManager = ServerManager()
+    private lazy var launchAtLoginManager = LaunchAtLoginManager()
     private lazy var desktopPetController = DesktopPetWindowController(viewModel: viewModel)
     private lazy var dynamicIslandController = DynamicIslandController(viewModel: viewModel)
     private static var userInitiatedQuit = false
@@ -121,6 +126,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let profile = NativeQAProfile.current {
+            Task { @MainActor in
+                guard await profile.verifyServer() else { fatalError("Native QA server identity rejected") }
+                DashboardWindowController.shared.allowDashboardNavigation()
+                DashboardPresentationCoordinator.shared.showDashboard()
+            }
+            return
+        }
         removeLegacyAppBundleIfNeeded()
         NativeLocalization.synchronizeSharedPreference()
 
@@ -148,8 +161,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // A normal Finder/Dock launch should behave like opening an app, while
         // an SMAppService login launch should remain a quiet menu bar startup.
-        if NSAppleEventManager.shared().currentAppleEvent?
-            .attributeDescriptor(forKeyword: keyAELaunchedAsLogInItem) == nil {
+        // SMAppService spawns via launchd with no launch Apple Event at all, so
+        // treating "currentAppleEvent == nil" as a normal open was the #989 bug.
+        let launchEvent = NSAppleEventManager.shared().currentAppleEvent
+        let launchedAsLoginItem = launchEvent?
+            .attributeDescriptor(forKeyword: keyAELaunchedAsLogInItem) != nil
+        // SMAppService is macOS 13+; the app target still deploys to 12.0, so
+        // the direct call needs an availability guard (pre-13 legacy login
+        // items are still detected via the event's login-item attribute).
+        let loginItemRegistered: Bool
+        if #available(macOS 13, *) {
+            loginItemRegistered = SMAppService.mainApp.status == .enabled
+        } else {
+            loginItemRegistered = false
+        }
+        let launchedWithStartupArgument = ProcessInfo.processInfo.arguments.contains("--startup")
+        if LoginLaunchPresentationPolicy.shouldOpenDashboardOnLaunch(
+            launchAppleEventPresent: launchEvent != nil,
+            launchedAsLoginItem: launchedAsLoginItem,
+            loginItemRegistered: loginItemRegistered,
+            launchedWithStartupArgument: launchedWithStartupArgument
+        ) {
             DashboardPresentationCoordinator.shared.showDashboard()
         }
 
@@ -169,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         DashboardPresentationCoordinator.shared.prepareForTermination()
+        if NativeQAProfile.current != nil { return }
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         serverManager.stopServer()
     }
@@ -216,6 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func scheduleWakeCatchUp(_ notification: Notification) {
+        guard NativeQAProfile.current == nil else { return }
         let now = Date()
         if let lastWakeCatchUpAttemptAt,
            now.timeIntervalSince(lastWakeCatchUpAttemptAt) < Self.wakeCatchUpDebounceInterval {
@@ -230,9 +264,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        if let profile = NativeQAProfile.current {
+            for url in urls {
+                guard let order = try? profile.billingReturnOrder(url) else {
+                    fatalError("Native QA billing return rejected")
+                }
+                Task { @MainActor in
+                    guard await profile.approveOwnedOrder(order) else { fatalError("Native QA order ownership rejected") }
+                    DashboardWindowController.shared.handleNativeQABillingReturn(order: order)
+                }
+            }
+            return
+        }
         for url in urls {
             guard url.scheme == "tokentracker" else { continue }
-            if url.host == "auth" && url.path.hasPrefix("/done") {
+            if let order = NativeBillingReturn.orderID(from: url) {
+                DashboardWindowController.shared.handleBillingReturn(order: order)
+            } else if url.host == "auth" && url.path.hasPrefix("/done") {
                 DashboardWindowController.shared.handleAuthDone()
             } else if url.host == "auth" && url.path.hasPrefix("/callback") {
                 // Browser relays OAuth code back via tokentracker://auth/callback?insforge_code=xxx

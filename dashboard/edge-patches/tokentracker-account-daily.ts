@@ -3,6 +3,7 @@
  * Mirrors local-api.js `tokentracker-usage-daily` response schema.
  */
 import { createClient } from "npm:@insforge/sdk";
+import { cloudReadAccess, cloudFailure, cloudHistoryFailure } from "./cloud/access.ts";
 
 const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok", "cline"]);
 
@@ -141,15 +142,39 @@ async function verifiedUserIdFromJwt(authHeader: string | null): Promise<string 
 // Keep this block byte-identical with leaderboard-refresh.ts; see feedback_model_pricing_sync.
 const MODEL_PRICING: Record<string, { input: number; output: number; cache_read: number; cache_write?: number }> = {
   // ── Anthropic Claude ──
+  // Fable 5.2 standard tier ($8/$40, cache hit $0.20, 5-minute cache write $10),
+  // verified 2026-11-10. Exact keys only: edge has no Claude normalizer, so the
+  // dotted id and the OpenRouter-qualified ids never reach claude-fable-5-2.
+  // The 1-hour cache write ($16) cannot fit cache_write. Fast mode is the
+  // separate $16/$80 SKU below; floating -latest aliases stay unmatched.
+  "claude-fable-5-2": { input: 8, output: 40, cache_read: 0.2, cache_write: 10 },
+  "claude-fable-5.2": { input: 8, output: 40, cache_read: 0.2, cache_write: 10 },
+  "anthropic/claude-fable-5.2": { input: 8, output: 40, cache_read: 0.2, cache_write: 10 },
+  "anthropic/claude-fable-5.2-20261109": { input: 8, output: 40, cache_read: 0.2, cache_write: 10 },
+  "anthropic/claude-fable-5-2": { input: 8, output: 40, cache_read: 0.2, cache_write: 10 },
+  // Fast mode is 2x input/output. Cache dollars are not published; the pricing
+  // page says caching multipliers stack on fast pricing, so 0.025x and the
+  // 5-minute 1.25x are applied to the $16 fast input ($0.40 / $20).
+  "claude-fable-5-2-fast": { input: 16, output: 80, cache_read: 0.4, cache_write: 20 },
+  "claude-fable-5.2-fast": { input: 16, output: 80, cache_read: 0.4, cache_write: 20 },
   "claude-fable-5": { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
   "claude-opus-5": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   "claude-opus-5-fast": { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
   "claude-opus-4-6": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   "claude-opus-4-5-20250414": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
-  "claude-sonnet-5": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  // Bare undated alias (LiteLLM key "claude-opus-4-5", standard Opus tier).
+  // Promoted from LiteLLM-only coverage so cloud account views price the
+  // bare id exactly like local (#929).
+  "claude-opus-4-5": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
+  "claude-sonnet-5": { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  "claude-opus-5-5": { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
+  "claude-sonnet-5-5": { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
+  "k3-256k": { input: 3, output: 15, cache_read: 0.3 },
   "claude-sonnet-4-6": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "claude-sonnet-4-5-20250514": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "claude-sonnet-4-20250514": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  "claude-haiku-5-5": { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125 },
+  "claude-haiku-5.5": { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125 },
   "claude-haiku-4-5-20251001": { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
   "claude-3-5-sonnet-20241022": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "claude-3-5-haiku-20241022": { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 },
@@ -174,6 +199,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "gpt-5.2-codex-high": { input: 1.75, output: 14, cache_read: 0.175 },
   "gpt-5.3-codex": { input: 1.75, output: 14, cache_read: 0.175 },
   "gpt-5.3-codex-high": { input: 1.75, output: 14, cache_read: 0.175 },
+  // Codex spark capacity tier — not a separate LiteLLM key; local
+  // (reverse-substring) and the gpt-5.3 matcher below both bill the base
+  // gpt-5.3-codex rate. Exact entry pins that on the cloud side too (#929).
+  "gpt-5.3-codex-spark": { input: 1.75, output: 14, cache_read: 0.175 },
   "gpt-5.4": { input: 2.5, output: 15, cache_read: 0.25 },
   "gpt-5.4-mini": { input: 0.75, output: 4.5, cache_read: 0.075 },
   // gpt-5.4-pro per developers.openai.com/api/docs/pricing; cache_read 3
@@ -194,6 +223,11 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   // https://developers.openai.com/api/docs/models/gpt-6-astra
   // Cloud buckets do not retain per-request context/service tier. Use the
   // standard short-context estimate; never infer long context from totals.
+  // Official GPT-6.2 Standard short-context USD/MTok, verified 2026-11-18:
+  // https://developers.openai.com/api/docs/pricing (cloud has no request tier/retention).
+  "gpt-6.2-astra-law": { input: 8, output: 40, cache_read: 0.4, cache_write: 10 },
+  "gpt-6.2-astra": { input: 8, output: 40, cache_read: 0.4, cache_write: 10 },
+  "gpt-6.2-sol": { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
   "gpt-6-astra": { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
   // GPT-6 Sol Standard USD/MTok, verified 2026-09-24:
   // https://developers.openai.com/api/docs/models/gpt-6-sol
@@ -201,6 +235,15 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   // GPT-6.1 Sol Standard pricing (issue #737), verified 2026-10-02.
   // https://developers.openai.com/api/docs/models/gpt-6.1-sol
   "gpt-6.1-sol": { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
+  // GPT-6.1 Terra Standard USD/MTok, verified 2026-10-27.
+  // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+  // Cache write uses 30-minute retention ($1.25). Fast is 2x; Ultrafast not published.
+  "gpt-6.1-terra": { input: 1, output: 5, cache_read: 0.05, cache_write: 1.25 },
+  // GPT-6 Luna lightweight tier, Standard USD/MTok (LiteLLM entry sourced
+  // from developers.openai.com/api/docs/pricing, cached 2026-10-31):
+  // $0.10/$0.50, cache_read $0.01, cache_write $0.125. Distinct from
+  // gpt-5.6-luna. Promoted from LiteLLM-only coverage (#929).
+  "gpt-6-luna": { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125 },
   "gpt-5-mini": { input: 0.25, output: 2, cache_read: 0.025 },
   "o3": { input: 2, output: 8, cache_read: 0.5 },
   // ── Google Gemini ──
@@ -209,6 +252,13 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "gemini-2.5-pro-preview-05-06": { input: 1.25, output: 10, cache_read: 0.125 },
   "gemini-2.5-flash": { input: 0.3, output: 2.5, cache_read: 0.03 },
   "gemini-3-flash-preview": { input: 0.5, output: 3, cache_read: 0.05 },
+  // Gemini 3.8/3.7/3.6 Flash Global Standard introductory list rate through
+  // 2026-12-31 (issue #1063). Verified from cloud.google.com/model-garden/pricing
+  // and aistudio.google.com/docs/pricing. No published per-token cache-write rate.
+  "gemini-3.5-flash": { input: 1.5, output: 9, cache_read: 0.15 },
+  "gemini-3.8-flash": { input: 0.75, output: 3.75, cache_read: 0.075 },
+  "gemini-3.7-flash": { input: 0.75, output: 3.75, cache_read: 0.075 },
+  "gemini-3.6-flash": { input: 0.75, output: 3.75, cache_read: 0.075 },
   "gemini-3-pro-preview": { input: 2, output: 12, cache_read: 0.2 },
   "gemini-3.1-pro-preview": { input: 2, output: 12, cache_read: 0.2 },
   // ── Cursor Composer ──
@@ -216,12 +266,27 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "composer-1.5": { input: 3.5, output: 17.5, cache_read: 0.35 },
   "composer-2": { input: 0.5, output: 2.5, cache_read: 0.2 },
   "composer-2-fast": { input: 1.5, output: 7.5, cache_read: 0.15 },
+  "composer-2.5": { input: 0.5, output: 2.5, cache_read: 0.2 },
+  "composer-2.5-fast": { input: 3, output: 15, cache_read: 0.5 },
+  // Google Gemini 4 Argon (Cursor Other Models / Google introductory list rate)
+  "gemini-4-argon": { input: 2, output: 10, cache_read: 0.1, cache_write: 0 },
+  "gemini-4-carbon": { input: 2, output: 10, cache_read: 0.1, cache_write: 0 },
+  "gemini-4-hydrogen": { input: 1.5, output: 7.5, cache_read: 0.075, cache_write: 0 },
+  "muse-wonder-1.0": { input: 4, output: 20, cache_read: 0.2, cache_write: 0 },
   // ── Moonshot Kimi ──
   "kimi-for-coding": { input: 0.6, output: 2, cache_read: 0.15 },
   "kimi-k2.5": { input: 0.6, output: 2, cache_read: 0.15 },
   "kimi-k2.5-free": { input: 0, output: 0, cache_read: 0 },
   "kimi-k2.6": { input: 0.95, output: 4, cache_read: 0.16 },
   "kimi-k2.7-code": { input: 0.95, output: 4, cache_read: 0.19 },
+  // Kimi K3.1 Pro / Highspeed (official USD list https://platform.kimi.ai/ 2026-10-25).
+  // Must precede kimi-k3: substring "kimi-k3" would otherwise bill k3.1 at k3 rates.
+  "kimi-k3.1-pro": { input: 2, output: 10, cache_read: 0.2, cache_write: 2 },
+  "kimi-k3.1-pro-highspeed": { input: 4, output: 20, cache_read: 0.2, cache_write: 4 },
+  "k3.1-pro": { input: 2, output: 10, cache_read: 0.2, cache_write: 2 },
+  "k3.1pro": { input: 2, output: 10, cache_read: 0.2, cache_write: 2 },
+  "k3.1-pro-highspeed": { input: 4, output: 20, cache_read: 0.2, cache_write: 4 },
+  "k3.1pro-highspeed": { input: 4, output: 20, cache_read: 0.2, cache_write: 4 },
   // Kimi K3 (released 2026-07-16; reported rates $3/M in, $15/M out, $0.30/M
   // cached). Kimi Code records the alias as bare "k3" (kimi-code/k3), hence
   // the separate "k3" exact key below. Not yet in LiteLLM.
@@ -270,6 +335,15 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "grok-build": { input: 1.25, output: 2.50, cache_read: 0.20 },
   "cursor-grok-4.5": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
   "cursor-grok-4.5-fast": { input: 4, output: 18, cache_read: 1, cache_write: 0 },
+  "cursor-grok-4.6": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
+  "cursor-grok-4.6-fast": { input: 4, output: 12, cache_read: 1, cache_write: 0 },
+  "cursor-grok-4.7": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
+  "cursor-grok-4.7-fast": { input: 4, output: 12, cache_read: 1, cache_write: 0 },
+  // Bare ids for the same SKUs (ZCode / Grok Build record grok-4.7 and
+  // grok-4.7-build-fast). Explicit keys so they do not ride on the
+  // "grok-4.7" / "grok-4.7"+fast fuzzy matchers below.
+  "grok-4.7": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
+  "grok-4.7-build-fast": { input: 4, output: 12, cache_read: 1, cache_write: 0 },
   "grok-4-0709": { input: 3.00, output: 15.00, cache_read: 0.75 },
   "grok-4": { input: 3.00, output: 15.00, cache_read: 0.75 },
   "grok-4-latest": { input: 3.00, output: 15.00, cache_read: 0.75 },
@@ -290,12 +364,22 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   // Hy4 preview: 6 / 0.3 (cache hit) / 18 RMB per MTok at ~7.2 RMB/USD (#633).
   // Alibaba Model Studio Singapore reference rates; see curated-overrides.json (#715).
   "qwen3.8-flash": { input: 0.15, output: 0.47, cache_read: 0.016, cache_write: 0.2 },
+  "qwen3.8-max": { input: 2, output: 6, cache_read: 0.17, cache_write: 2.5 },
+  "qwen3.8-max-0902": { input: 2, output: 6, cache_read: 0.17, cache_write: 2.5 },
+  "qwen3.8-max-2026-09-02": { input: 2, output: 6, cache_read: 0.17, cache_write: 2.5 },
   "hy4-preview": { input: 0.833, output: 2.5, cache_read: 0.042, cache_write: 0.833 },
   "hy4-preview-agent": { input: 0.833, output: 2.5, cache_read: 0.042, cache_write: 0.833 },
   // ── Misc / Free ──
   "glm-4.7-free": { input: 0, output: 0, cache_read: 0 },
   "nemotron-3-super-free": { input: 0, output: 0, cache_read: 0 },
   "mimo-v2-pro-free": { input: 0, output: 0, cache_read: 0 },
+  "muse-spark-1.2-contributor-free": { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+  "muse-spark-1.3-contributor-free": { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+  // Paid Muse contributor SKUs — LiteLLM provider-qualified entries agree on
+  // $0.10/$0.20 per MTok, $0.002 cache read (meta and opencode_go). Promoted
+  // from LiteLLM prefix-strip coverage so cloud account views price them (#929).
+  "muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cache_read: 0.002 },
+  "muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cache_read: 0.002 },
   "minimax-m2.1-free": { input: 0, output: 0, cache_read: 0 },
   "MiniMax-M2.1": { input: 0.5, output: 3, cache_read: 0.05 },
   // ── Xiaomi MiMo (mirrored from src/lib/pricing/seed-snapshot.json LiteLLM
@@ -334,6 +418,9 @@ const ZERO_PRICING = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
 // AStudio homepage: https://agent.xfyun.cn/
 // Official pricing source: https://maas.xfyun.cn/modelSquare
 const IFLYTEK_MAAS_MODEL_PRICING: Record<string, { input: number; output: number; cache_read: number; cache_write?: number }> = {
+  "spark-x2.5": { input: 0.13, output: 0.50, cache_read: 0.02, cache_write: 0.13 },
+  "spark-x2.5-4b": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "spark-x2.5-1.7b": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
   "xopglm53": { input: 1.11, output: 3.89, cache_read: 0.28, cache_write: 1.11 },
   "xopdeepseekv4pro0813": { input: 1.25, output: 3.75, cache_read: 0.04, cache_write: 1.25 },
   "xopdeepseekv4flash0731": { input: 0.14, output: 0.28, cache_read: 0.03, cache_write: 0.14 },
@@ -404,6 +491,7 @@ function normalizeIFlytekMaasModel(model: string) {
 
 function getModelPricing(model: string, source = "") {
   if (!model) return ZERO_PRICING;
+  if (source.toLowerCase() === "workbuddy-ai" && model.trim().toLowerCase() === "auto") return ZERO_PRICING;
   if (source.toLowerCase() === "acode") {
     const normalized = normalizeIFlytekMaasModel(model);
     // Undisclosed routing must not inherit generic aliases or fuzzy prices.
@@ -415,6 +503,10 @@ function getModelPricing(model: string, source = "") {
   if (exact) return exact;
   const lower = model.toLowerCase();
   if (source === "cline" && lower.endsWith(":free")) return ZERO_PRICING;
+  // Free gateway SKUs append `-free` to the paid id (deepseek-v4.1-flash-free,
+  // minimax-m2.5-free, Muse *-contributor-free). Exact MODEL_PRICING hits above
+  // still win; this only blocks fuzzy/base-name inheritance (issue #744).
+  if (lower.endsWith("-free")) return ZERO_PRICING;
   // Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*`
   // flat-rate Cline Pass) bill nothing per token, and the model id after the
   // slash must not inherit a public rate — cline-pass/glm-5.3 is not GLM-5.3
@@ -423,17 +515,39 @@ function getModelPricing(model: string, source = "") {
   // reports its own positive cost still wins earlier via
   // SOURCES_WITH_AUTHORITATIVE_COST.
   if (lower.includes("cline-free/") || lower.includes("cline-pass/")) return ZERO_PRICING;
+  // Do not guess prices for unannounced GPT-6.2 SKUs or dated snapshots.
+  const gpt62 = lower.trim().match(/gpt-6[.-]2(?:-(.*))?$/);
+  if (gpt62) {
+    const known = /^(astra-law|astra|sol)(?:-?(?:low|medium|high|xhigh|max)(?:-fast)?|-fast)?$/.exec(gpt62[1] || "");
+    return known ? MODEL_PRICING[`gpt-6.2-${known[1]}`] : ZERO_PRICING;
+  }
+  // Fable 5.2 before the broad fable matcher, or claude-fable-5-2 bills at the
+  // Fable 5 $10/$50 rate. Fast before 5.2 (the "fable-5.2" needle is a prefix
+  // of "fable-5.2-fast"), and -latest never matches: it is a floating alias
+  // the Anthropic docs did not pin to 5.2 on 2026-11-10.
+  if (/(?:^|\/)claude-fable-latest(?:$|[^a-z0-9])/.test(lower)) return ZERO_PRICING;
+  const fableKey = lower.replace(/[^a-z0-9./]+/g, "-");
+  // The minor must end or be followed by a non-digit. Without that boundary
+  // the dated Fable 5 ids (claude-fable-5-20250901) and fable-5-20 contain
+  // "fable-5-2" / "fable-5.2" and bill at the 5.2 rate.
+  if (/fable-5[.-]2-fast(?:$|[^0-9])/.test(fableKey)) return MODEL_PRICING["claude-fable-5-2-fast"];
+  if (/fable-5[.-]2(?:$|[^0-9])/.test(fableKey)) return MODEL_PRICING["claude-fable-5-2"];
   if (lower.includes("fable")) return MODEL_PRICING["claude-fable-5"];
   // Opus 5 fast mode bills at 2x the standard Opus tier ($10/$50), so the
   // -fast matcher must precede both the opus-5 and the generic opus fallback.
+  if (/opus-5[.-]5(?:$|[^0-9.])/.test(lower)) return MODEL_PRICING["claude-opus-5-5"];
+  if (/sonnet-5[.-]5(?:$|[^0-9.])/.test(lower)) return MODEL_PRICING["claude-sonnet-5-5"];
+  if (/sonnet-5(?:$|[^0-9.-])/.test(lower)) return MODEL_PRICING["claude-sonnet-5"];
   if (lower.includes("opus-5-fast")) return MODEL_PRICING["claude-opus-5-fast"];
   if (lower.includes("opus-5")) return MODEL_PRICING["claude-opus-5"];
   if (lower.includes("opus")) return MODEL_PRICING["claude-opus-4-6"];
+  if (/haiku-5[.-]5(?:$|[^0-9.])/.test(lower)) return MODEL_PRICING["claude-haiku-5-5"];
   if (lower.includes("haiku")) return MODEL_PRICING["claude-haiku-4-5-20251001"];
   if (lower.includes("sonnet")) return MODEL_PRICING["claude-sonnet-4-6"];
   if (lower.includes("gpt-6-astra")) return MODEL_PRICING["gpt-6-astra"];
   if (lower.includes("gpt-6-sol")) return MODEL_PRICING["gpt-6-sol"];
   if (lower.includes("gpt-6.1-sol")) return MODEL_PRICING["gpt-6.1-sol"];
+  if (lower.includes("gpt-6.1-terra")) return MODEL_PRICING["gpt-6.1-terra"];
   // gpt-5.6 tiers: sol/terra/luna carry reasoning-effort suffixes (solhigh,
   // etc.), so match by substring. Specific tiers precede the generic gpt-5.6
   // fallback (the public gpt-5.6 alias points to the flagship sol tier).
@@ -452,6 +566,24 @@ function getModelPricing(model: string, source = "") {
   if (lower.includes("gpt-5.1-codex-mini")) return MODEL_PRICING["gpt-5.1-codex-mini"];
   if (lower.includes("gpt-5.1")) return MODEL_PRICING["gpt-5.1-codex"];
   if (lower.includes("gpt-5")) return MODEL_PRICING["gpt-5"];
+  // Standard Gemini 4 SKUs and their effort levels; other variants have
+  // independent prices, including Carbon Cyber Permissive.
+  if (lower.includes("gemini-4-argon") || lower.includes("gemini-4.argon")) return MODEL_PRICING["gemini-4-argon"];
+  const gemini4 = lower.trim().match(/(?:^|\/)gemini-4[.-](carbon|hydrogen)(?:-(?:minimal|low|medium|high|xhigh))?$/);
+  if (gemini4) return MODEL_PRICING[`gemini-4-${gemini4[1]}`];
+  if (/(?:^|\/)muse-wonder-1[.-]0(?:-(?:minimal|low|medium|high|xhigh|extra-high|max))?$/.test(lower)) return MODEL_PRICING["muse-wonder-1.0"];
+  // Gemini 3.8/3.7/3.6 Flash introductory Standard rates must precede the
+  // gemini-3 catch-all (which bills at gemini-3-flash-preview). Alternate
+  // SKUs (cyber, tts, lite, image, live) have different published rates.
+  // Unknown suffixes such as -n have no published independent SKU — return
+  // zero rather than inventing a rate or inheriting preview (#1063).
+  // Reasoning-effort suffixes (high/medium/low/...) match the local
+  // normalizeAntigravityModel strip and keep the published Flash rate.
+  if (/gemini-3\.[876]-flash-(?!cyber|tts|lite|image|live|thinking|xhigh|high|medium|low|fast)[a-z0-9]/.test(lower)) return ZERO_PRICING;
+  if (/gemini-3\.8-flash(?!-(?:cyber|tts|lite|image|live))/.test(lower)) return MODEL_PRICING["gemini-3.8-flash"];
+  if (/gemini-3\.7-flash(?!-(?:cyber|tts|lite|image|live))/.test(lower)) return MODEL_PRICING["gemini-3.7-flash"];
+  if (/gemini-3\.6-flash(?!-(?:cyber|tts|lite|image|live))/.test(lower)) return MODEL_PRICING["gemini-3.6-flash"];
+  if (/gemini-3\.5-flash(?!-(?:cyber|tts|lite|image|live))/.test(lower)) return MODEL_PRICING["gemini-3.5-flash"];
   // gemini-3 pro tiers (gemini-3-pro, gemini-3.1-pro, -high, -customtools…)
   // must not fall through to the flash rate (4x undercount).
   if (lower.includes("gemini-3") && lower.includes("pro")) return MODEL_PRICING["gemini-3-pro-preview"];
@@ -466,6 +598,12 @@ function getModelPricing(model: string, source = "") {
   if (lower.includes("deepseek-v4-pro")) return MODEL_PRICING["deepseek-v4-pro"];
   if (lower.includes("deepseek-reasoner")) return MODEL_PRICING["deepseek-reasoner"];
   if (lower.includes("deepseek-chat")) return MODEL_PRICING["deepseek-chat"];
+  // Cursor Grok 4.7/4.6/4.5 Fast SKUs must precede the generic grok-4 matcher
+  // (substring "grok-4" would otherwise bill Cursor Fast rows at xAI grok-4 rates).
+  if (lower.includes("grok-4.7") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.7-fast"];
+  if (lower.includes("grok-4.7")) return MODEL_PRICING["cursor-grok-4.7"];
+  if (lower.includes("grok-4.6") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.6-fast"];
+  if (lower.includes("grok-4.6")) return MODEL_PRICING["cursor-grok-4.6"];
   if (lower.includes("grok-4.5") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.5-fast"];
   if (lower.includes("grok-4.5")) return MODEL_PRICING["cursor-grok-4.5"];
   if (lower.includes("grok-build")) return MODEL_PRICING["grok-build"];
@@ -478,12 +616,29 @@ function getModelPricing(model: string, source = "") {
   // of the $0.20/$0.50 MTok fast-tier rate (15x / 30x overestimate).
   if (lower.includes("grok-4-1-fast")) return MODEL_PRICING["grok-4-1-fast-non-reasoning"];
   if (lower.includes("grok-4")) return MODEL_PRICING["grok-4"];
+  // k3.1-pro-highspeed before k3.1-pro before kimi-k3 (substring trap).
+  if (lower.includes("kimi-k3.1-pro-highspeed") || lower.includes("k3.1-pro-highspeed") || lower.includes("k3.1pro-highspeed")) {
+    return MODEL_PRICING["kimi-k3.1-pro-highspeed"];
+  }
+  if (lower.includes("kimi-k3.1-pro") || lower.includes("k3.1-pro") || lower.includes("k3.1pro")) {
+    return MODEL_PRICING["kimi-k3.1-pro"];
+  }
   if (lower.includes("kimi-k3")) return MODEL_PRICING["kimi-k3"];
   // Bare "k3" alias from Kimi Code (or provider-prefixed "*/k3"); the exact
-  // key above only catches the unprefixed form.
+  // key above only catches the unprefixed form. Do not treat k3.1* as bare k3.
   if (lower === "k3" || lower.endsWith("/k3")) return MODEL_PRICING["kimi-k3"];
   if (lower.includes("kimi-k2.7-code")) return MODEL_PRICING["kimi-k2.7-code"];
   if (lower.includes("kimi-k2.6")) return MODEL_PRICING["kimi-k2.6"];
+  // K2.8 Preview aliases must not inherit kimi-k2.5 (#766). Stay unpriced
+  // until an official per-token public rate exists (Kimi Code is mostly quota).
+  if (
+    lower.includes("kimicoding") ||
+    lower.includes("kimi-k2.8") ||
+    lower === "k2.8" ||
+    lower.endsWith("/k2.8")
+  ) {
+    return ZERO_PRICING;
+  }
   if (lower.includes("kimi")) return MODEL_PRICING["kimi-k2.5"];
   // MiMo ordering: more specific suffixes first (mimo-v2.5-pro before
   // mimo-v2.5 which is a substring; the free tier is a distinct name).
@@ -511,7 +666,13 @@ function getModelPricing(model: string, source = "") {
   if (lower.includes("kiro")) return MODEL_PRICING["kiro-cli-agent"];
   if (lower.includes("hy3")) return MODEL_PRICING["hy3-preview-agent"];
   if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim())) return MODEL_PRICING["qwen3.8-flash"];
+  if (/(?:^|\/)qwen3[.-]8-max(?:-0902|-\d{4}-\d{2}-\d{2})?$/.test(lower.trim())) return MODEL_PRICING["qwen3.8-max"];
   if (lower.includes("hy4")) return MODEL_PRICING["hy4-preview"];
+  if (lower.includes("composer-2.5") && lower.includes("fast")) return MODEL_PRICING["composer-2.5-fast"];
+  if (lower.includes("composer-2.5")) return MODEL_PRICING["composer-2.5"];
+  if (lower.includes("composer-2-fast")) return MODEL_PRICING["composer-2-fast"];
+  if (lower.includes("composer-2")) return MODEL_PRICING["composer-2"];
+  if (lower.includes("composer-1.5")) return MODEL_PRICING["composer-1.5"];
   if (lower.includes("composer")) return MODEL_PRICING["composer-1"];
   if (lower.includes("fugu")) return MODEL_PRICING["sakana/fugu-ultra"];
   if (lower.includes("longcat")) return MODEL_PRICING["longcat-2.0"];
@@ -735,7 +896,7 @@ function computeRowCost(row: GroupedRow): number {
   // tokentracker-leaderboard-refresh.ts (both guard on source).
   const reasoningCost =
     row.source === "codex" || row.source === "acode" || row.source === "every-code" ||
-      row.source === "cline"
+      row.source === "cline" || row.source === "omo" || row.source === "muse"
       ? 0
       : (Number(row.reasoning_output_tokens) || 0) * (p.output || 0);
   return (
@@ -788,6 +949,14 @@ export default async function (req: Request): Promise<Response> {
 
   const userId = await verifiedUserIdFromJwt(req.headers.get("Authorization"));
   if (!userId) return json({ error: "Unauthorized" }, 401);
+
+  let cloudAccess;
+  try { cloudAccess = await cloudReadAccess(client, userId, "daily"); }
+  catch { return json({ error: "Cloud access unavailable", code: "cloud_access_unavailable" }, 503); }
+  if (!cloudAccess.ok) return cloudFailure(cloudAccess, corsHeaders);
+  const historyFailure = cloudHistoryFailure(cloudAccess, to);
+  if (historyFailure) return cloudFailure(historyFailure, corsHeaders);
+  if (cloudAccess.available_from && from < cloudAccess.available_from) from = cloudAccess.available_from;
 
   const rawDeviceId = url.searchParams.get("device_id");
   const requestedDeviceId = rawDeviceId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawDeviceId)

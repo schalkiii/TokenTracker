@@ -19,6 +19,9 @@ export const LIMIT_PROVIDER_IDS = [
   "codingPlan",
   "agentPlan",
   "devin",
+  "workbuddy",
+  "workbuddyAi",
+  "deepseek",
 ];
 
 /** Keys for ProviderIcon — mono logos use inline SVG; colored logos use /brand-logos/. */
@@ -49,6 +52,13 @@ export const LIMIT_PROVIDER_ICON_KEYS = {
   agentPlan: "VOLCANO-ARK",
   // Devin (devin.ai) — the three-hexagon "nodes" mark under /brand-logos/.
   devin: "DEVIN",
+  // WorkBuddy China and WorkBuddy AI each publish their own signed-in row.
+  // Both share the CodeBuddy brand mark.
+  workbuddy: "WORKBUDDY",
+  workbuddyAi: "WORKBUDDY",
+  // DeepSeek (platform.deepseek.com) — the whale mark under /brand-logos/,
+  // already present for the service-status card.
+  deepseek: "DEEPSEEK",
 };
 
 export function limitProviderIconKey(id) {
@@ -91,6 +101,12 @@ export function limitProviderName(id) {
       return copy("limits.provider.ark_agent_plan");
     case "devin":
       return copy("limits.provider.devin");
+    case "workbuddy":
+      return copy("limits.provider.workbuddy");
+    case "workbuddyAi":
+      return copy("limits.provider.workbuddy_ai");
+    case "deepseek":
+      return copy("limits.provider.deepseek");
     default:
       return String(id || "");
   }

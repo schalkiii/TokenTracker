@@ -1,3 +1,4 @@
+const { hasUnknownBackendCost, TOKEN_FIELDS } = require("../claude-backend");
 // Public pricing API. Replaces the hard-coded MODEL_PRICING table that used
 // to live in src/lib/local-api.js. Keeps the same synchronous shape so all
 // existing callers (computeRowCost, /functions/* handlers, tests) work
@@ -125,10 +126,83 @@ function getModelPricing(model, opts = {}) {
     litellm: state.litellmPerMillionMap,
     source: lookupSource,
   });
-  if (result.hit) return result.value;
+  if (result.hit) {
+    const value = result.value;
+    // Price the recorded bucket, not today's date, across the GPT-6.2 launch
+    // promotion. Undated model displays use the currently effective multiplier.
+    const at = typeof opts === "object" ? opts.at : undefined;
+    const parsed = at == null ? NaN : Date.parse(at);
+    const timestamp = Number.isFinite(parsed) ? parsed : Date.now();
+    if (value.ultrafast_promotion_ends_at &&
+        timestamp >= Date.parse(value.ultrafast_promotion_ends_at)) {
+      return { ...value, ultrafast_multiplier: value.ultrafast_regular_multiplier };
+    }
+    return value;
+  }
 
   state.negativeCache.add(cacheKey);
   return ZERO_PRICING;
+}
+
+// Callers hit this once per queue row, and a miss walks the whole LiteLLM map,
+// so results are memoized per pricing revision. Copies go out so a caller that
+// mutates its object cannot poison the cache.
+const pricingInfoCache = { revision: -1, entries: new Map() };
+
+// Preserve matcher provenance: a known zero rate is free, a missing model is
+// unpriced. Both return zero dollars, but they mean different things in the UI.
+function getModelPricingInfo(model, opts = {}) {
+  if (hasUnknownBackendCost(opts)) return { status: "unpriced", source: null, ...ZERO_PRICING };
+  const source = typeof opts === "string" ? opts : opts.source;
+  const sourceKey = typeof source === "string" ? source.toLowerCase() : null;
+  if (pricingInfoCache.revision !== state.revision) {
+    pricingInfoCache.revision = state.revision;
+    pricingInfoCache.entries.clear();
+  }
+  const cacheKey = `${sourceKey || ""}\0${model || ""}`;
+  let info = pricingInfoCache.entries.get(cacheKey);
+  if (!info) {
+    info = computeModelPricingInfo(model, opts, sourceKey);
+    pricingInfoCache.entries.set(cacheKey, info);
+  }
+  // The info cache must not freeze a time-limited speed promotion.
+  const rates = info.ultrafast_multiplier == null ? null : getModelPricing(model, opts);
+  return { ...info, ...(rates ? { ultrafast_multiplier: rates.ultrafast_multiplier } : null) };
+}
+
+function computeModelPricingInfo(model, opts, sourceKey) {
+  if (sourceKey === "cursor" && /^grok-bot-(default|automation|cua)$/i.test(String(model).trim())) {
+    return { status: "unpriced", source: "cursor_subscription", ...ZERO_PRICING };
+  }
+  if (LOCAL_INFERENCE_SOURCES.has(sourceKey) || PI_SUBSCRIPTION_SOURCES.has(sourceKey)) {
+    return { status: "free", source: LOCAL_INFERENCE_SOURCES.has(sourceKey) ? "local_inference" : "subscription", ...ZERO_PRICING };
+  }
+  const result = lookupPricing(model, {
+    curated: curatedOverrides,
+    litellm: state.litellmPerMillionMap,
+    source: sourceKey,
+  });
+  const rates = getModelPricing(model, opts);
+  return {
+    status: !result.hit ? "unpriced" : [rates.input, rates.output, rates.cache_read, rates.cache_write]
+      .some((value) => Number(value) > 0) ? "priced" : "free",
+    source: result.hit ? result.source : null,
+    input: Number(rates.input) || 0,
+    output: Number(rates.output) || 0,
+    cache_read: Number(rates.cache_read) || 0,
+    cache_write: Number(rates.cache_write) || 0,
+    // Speed-tier multipliers so the dashboard can label Fast/Ultrafast
+    // sub-rows with the actual premium instead of hardcoding 2x/6x (issue 886).
+    // Mirrored from the raw entry only when it publishes them — the info
+    // object must keep matching getModelPricing key-for-key
+    // (session-performance.test.js pins that contract).
+    ...(Number.isFinite(Number(rates.priority_multiplier))
+      ? { priority_multiplier: Number(rates.priority_multiplier) }
+      : null),
+    ...(Number.isFinite(Number(rates.ultrafast_multiplier))
+      ? { ultrafast_multiplier: Number(rates.ultrafast_multiplier) }
+      : null),
+  };
 }
 
 function isDeepSeekTimePricedModel(model) {
@@ -163,7 +237,7 @@ function isDeepSeekOffPeak(row) {
 }
 
 function getRowPricing(row) {
-  const pricing = getModelPricing(row?.model, { source: row?.source });
+  const pricing = getModelPricing(row?.model, { source: row?.source, at: row?.hour_start || row?.timestamp });
   // AStudio uses iFlytek MaaS fixed prices and does not inherit DeepSeek public API
   // time-based discounts.
   if (String(row?.source || "").toLowerCase() === "acode") return pricing;
@@ -177,63 +251,37 @@ function getRowPricing(row) {
   };
 }
 
-// Same formula and Codex/every-code reasoning-folding rule as the previous
-// computeRowCost in src/lib/local-api.js. Moved here so vite mock + local
-// server share one source of truth.
-function computeRowCost(row) {
-  if (LOCAL_INFERENCE_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
-  // Pi can route a turn through a subscription-backed Copilot provider. Pi's
-  // usage record reports a zero marginal cost for those turns; do not
-  // reinterpret the Claude model name as an Anthropic API bill.
-  if (PI_SUBSCRIPTION_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
-  // Some providers (currently Grok) persist an exact server-reported cost on
-  // the usage bucket. Prefer it when positive; zero remains the legacy
-  // "unreported" sentinel and falls through to model pricing.
-  const reportedCost = Number(row?.total_cost_usd);
-  if (
-    SOURCES_WITH_AUTHORITATIVE_COST.has(row?.source) &&
-    Number.isFinite(reportedCost) &&
-    reportedCost > 0
-  ) return reportedCost;
-  const pricing = getRowPricing(row);
-  // OmO, like Codex, reports reasoning as a subset of `output` (its own
-  // usage.cost bills no separate reasoning component), so charging it again
-  // here would double-bill every reasoning token. Cline is the same: its
-  // `outputTokens` is the AI SDK total (text + reasoning), so
-  // reasoning_output_tokens is a subset marker, never a second line item.
-  const reasoningIncludedInOutput =
+// Codex-family reasoning folding, shared by computeRowCost and the speed-tier
+// allocation below. OmO, like Codex, reports reasoning as a subset of `output`
+// (its own usage.cost bills no separate reasoning component), so charging it
+// again here would double-bill every reasoning token. Cline is the same: its
+// `outputTokens` is the AI SDK total (text + reasoning), so
+// reasoning_output_tokens is a subset marker, never a second line item.
+function reasoningFoldsIntoOutput(row) {
+  return (
     row.source === "codex" ||
     row.source === "acode" ||
     row.source === "every-code" ||
     row.source === "omo" ||
-    row.source === "cline";
-  const reasoningCost = reasoningIncludedInOutput
-    ? 0
-    : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
-  const baseCost = (
-    ((row.input_tokens || 0) * (pricing.input || 0) +
-      (row.output_tokens || 0) * (pricing.output || 0) +
-      (row.cached_input_tokens || 0) * (pricing.cache_read || 0) +
-      (row.cache_creation_input_tokens || 0) * (pricing.cache_write || 0) +
-      reasoningCost) /
-    1_000_000
+    row.source === "cline" ||
+    row.source === "muse"
   );
+}
 
-  const model = String(row?.model || "").toLowerCase();
-  const usesOpenAILongContextTier =
-    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
-    model.includes("gpt-6-sol") || model.includes("gpt-6.1-sol");
-  // Only models whose curated entry carries an explicit Fast/priority rate get
-  // the tier premium. The other OpenAI tiers have no published priority price,
-  // and inventing one is worse than reporting Standard.
-  const priorityMultiplier = Number(pricing.priority_multiplier);
-  const hasPriorityRates = Number.isFinite(priorityMultiplier) && priorityMultiplier > 1;
-  if (!usesOpenAILongContextTier && !hasPriorityRates) return baseCost;
-
+// One row's observed-subset context: the bounded long-context columns that the
+// speed-tier subsets intersect with, plus whether the row's model prices a
+// long-context tier at all. Pure arithmetic on the row; both computeRowCost
+// and computeRowTierCosts build it so their per-tier math cannot drift.
+function rowSubsetContext(row, reasoningIncludedInOutput) {
   const bounded = (value, total) => Math.min(
     Math.max(0, Number(value) || 0),
     Math.max(0, Number(total) || 0),
   );
+  const model = String(row?.model || "").toLowerCase();
+  const usesOpenAILongContextTier =
+    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
+    model.includes("gpt-6-sol") || model.includes("gpt-6.1-sol") ||
+    model.includes("gpt-6.1-terra") || /gpt-6[.-]2-(?:astra|sol)/.test(model);
   // Both premium families below read "observed subset" columns: how much of the
   // row's own token columns came from requests with a given property. They are
   // annotations, never addends — total_tokens stays the sum of the base columns
@@ -253,15 +301,131 @@ function computeRowCost(row) {
   const longReasoning = reasoningIncludedInOutput
     ? 0
     : bounded(row.long_context_reasoning_output_tokens, row.reasoning_output_tokens);
+  return {
+    bounded,
+    usesOpenAILongContextTier,
+    longInput,
+    longCached,
+    longCacheWrite,
+    longOutput,
+    longReasoning,
+  };
+}
+
+// Standard-rate cost of one observed speed-tier subset (priority_/ultrafast_):
+// the tier's own token columns priced at the row's base rates, plus the same
+// treatment for its long-context intersection. computeRowCost multiplies this
+// by (multiplier - 1) for the premium; computeRowTierCosts books it to the
+// tier itself.
+function speedTierSubsetCost(row, prefix, pricing, ctx) {
+  const { bounded, usesOpenAILongContextTier, longInput, longCached, longCacheWrite, longOutput, longReasoning } = ctx;
+  const tierInput = bounded(row[`${prefix}input_tokens`], row.input_tokens);
+  const tierCached = bounded(row[`${prefix}cached_input_tokens`], row.cached_input_tokens);
+  const tierCacheWrite = bounded(
+    row[`${prefix}cache_creation_input_tokens`],
+    row.cache_creation_input_tokens,
+  );
+  const tierOutput = bounded(row[`${prefix}output_tokens`], row.output_tokens);
+  const tierReasoning = ctx.reasoningIncludedInOutput
+    ? 0
+    : bounded(row[`${prefix}reasoning_output_tokens`], row.reasoning_output_tokens);
+  const tierBase = (
+    tierInput * (pricing.input || 0) +
+    tierCached * (pricing.cache_read || 0) +
+    tierCacheWrite * (pricing.cache_write || 0) +
+    tierOutput * (pricing.output || 0) +
+    tierReasoning * (pricing.output || 0)
+  ) / 1_000_000;
+  const tierLong = usesOpenAILongContextTier ? (
+    bounded(row[`${prefix}long_context_input_tokens`], Math.min(tierInput, longInput)) *
+      (pricing.input || 0) +
+    bounded(row[`${prefix}long_context_cached_input_tokens`], Math.min(tierCached, longCached)) *
+      (pricing.cache_read || 0) +
+    bounded(
+      row[`${prefix}long_context_cache_creation_input_tokens`],
+      Math.min(tierCacheWrite, longCacheWrite),
+    ) * (pricing.cache_write || 0) +
+    0.5 * bounded(row[`${prefix}long_context_output_tokens`], Math.min(tierOutput, longOutput)) *
+      (pricing.output || 0) +
+    0.5 * bounded(
+      row[`${prefix}long_context_reasoning_output_tokens`],
+      Math.min(tierReasoning, longReasoning),
+    ) * (pricing.output || 0)
+  ) / 1_000_000 : 0;
+  return tierBase + tierLong;
+}
+
+// Same formula and Codex/every-code reasoning-folding rule as the previous
+// computeRowCost in src/lib/local-api.js. Moved here so vite mock + local
+// server share one source of truth.
+function computeRowCost(row) {
+  if (hasUnknownBackendCost(row)) {
+    // Existing totals without provenance retain their historical estimate. Only
+    // the custom-gateway subset is excluded from model pricing.
+    const priced = { ...row, backend_usage: undefined };
+    for (const part of row.backend_usage) {
+      if (part.backend !== "custom") continue;
+      for (const field of TOKEN_FIELDS) priced[field] = Math.max(0, (priced[field] || 0) - (part[field] || 0));
+    }
+    return computeRowCost(priced);
+  }
+  if (LOCAL_INFERENCE_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
+  // Pi can route a turn through a subscription-backed Copilot provider. Pi's
+  // usage record reports a zero marginal cost for those turns; do not
+  // reinterpret the Claude model name as an Anthropic API bill.
+  if (PI_SUBSCRIPTION_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
+  // Some providers (currently Grok) persist an exact server-reported cost on
+  // the usage bucket. Prefer it when positive; zero remains the legacy
+  // "unreported" sentinel and falls through to model pricing.
+  const reportedCost = Number(row?.total_cost_usd);
+  if (
+    SOURCES_WITH_AUTHORITATIVE_COST.has(row?.source) &&
+    Number.isFinite(reportedCost) &&
+    reportedCost > 0
+  ) return reportedCost;
+  const pricing = getRowPricing(row);
+  const reasoningIncludedInOutput = reasoningFoldsIntoOutput(row);
+  const reasoningCost = reasoningIncludedInOutput
+    ? 0
+    : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
+  const baseCost = (
+    ((row.input_tokens || 0) * (pricing.input || 0) +
+      (row.output_tokens || 0) * (pricing.output || 0) +
+      (row.cached_input_tokens || 0) * (pricing.cache_read || 0) +
+      (row.cache_creation_input_tokens || 0) * (pricing.cache_write || 0) +
+      reasoningCost) /
+    1_000_000
+  );
+
+  const ctx = rowSubsetContext(row, reasoningIncludedInOutput);
+  const { usesOpenAILongContextTier } = ctx;
+  // Only models whose curated entry carries an explicit Fast/priority rate get
+  // the tier premium. The other OpenAI tiers have no published priority price,
+  // and inventing one is worse than reporting Standard.
+  const priorityMultiplier = Number(pricing.priority_multiplier);
+  const hasPriorityRates = Number.isFinite(priorityMultiplier) && priorityMultiplier > 1;
+  const ultrafastMultiplierEarly = Number(pricing.ultrafast_multiplier);
+  const hasUltrafastRatesEarly = Number.isFinite(ultrafastMultiplierEarly) && ultrafastMultiplierEarly > 1;
+  if (!usesOpenAILongContextTier && !hasPriorityRates && !hasUltrafastRatesEarly) return baseCost;
+
   const longContextPremium = usesOpenAILongContextTier ? (
-    longInput * (pricing.input || 0) +
-    longCached * (pricing.cache_read || 0) +
-    longCacheWrite * (pricing.cache_write || 0) +
-    0.5 * longOutput * (pricing.output || 0) +
-    0.5 * longReasoning * (pricing.output || 0)
+    ctx.longInput * (pricing.input || 0) +
+    ctx.longCached * (pricing.cache_read || 0) +
+    ctx.longCacheWrite * (pricing.cache_write || 0) +
+    0.5 * ctx.longOutput * (pricing.output || 0) +
+    0.5 * ctx.longReasoning * (pricing.output || 0)
   ) / 1_000_000 : 0;
 
-  if (!hasPriorityRates) return baseCost + longContextPremium;
+  const ultrafastMultiplier = ultrafastMultiplierEarly;
+  const hasUltrafastRates = hasUltrafastRatesEarly;
+  if (!hasPriorityRates && !hasUltrafastRates) return baseCost + longContextPremium;
+
+  // Shared helper: premium for one observed speed-tier subset. Fast and Ultrafast
+  // are mutually exclusive per request; both can appear in one aggregated row.
+  function tierPremium(multiplier, prefix) {
+    if (!(Number.isFinite(multiplier) && multiplier > 1)) return 0;
+    return (multiplier - 1) * speedTierSubsetCost(row, prefix, pricing, { ...ctx, reasoningIncludedInOutput });
+  }
 
   // Astra Fast is a flat multiple of whichever context tier the request was on
   // (short 10/1/12.5/50 -> 20/2/25/100; long 20/2/25/75 -> 40/4/50/150), so the
@@ -271,43 +435,67 @@ function computeRowCost(row) {
   // priority_long_context_* alongside priority_*; without it (queue rows, which
   // carry no context-length subset at all) the overlap is 0 and the premium
   // falls back to the short-context multiple, matching the row's own base.
-  const priorityInput = bounded(row.priority_input_tokens, row.input_tokens);
-  const priorityCached = bounded(row.priority_cached_input_tokens, row.cached_input_tokens);
-  const priorityCacheWrite = bounded(
-    row.priority_cache_creation_input_tokens,
-    row.cache_creation_input_tokens,
-  );
-  const priorityOutput = bounded(row.priority_output_tokens, row.output_tokens);
-  const priorityReasoning = reasoningIncludedInOutput
-    ? 0
-    : bounded(row.priority_reasoning_output_tokens, row.reasoning_output_tokens);
-  const priorityBase = (
-    priorityInput * (pricing.input || 0) +
-    priorityCached * (pricing.cache_read || 0) +
-    priorityCacheWrite * (pricing.cache_write || 0) +
-    priorityOutput * (pricing.output || 0) +
-    priorityReasoning * (pricing.output || 0)
-  ) / 1_000_000;
+  // Ultrafast mirrors the same shape with ultrafast_* / ultrafast_multiplier (6x).
+  const priorityPremium = tierPremium(priorityMultiplier, "priority_");
+  const ultrafastPremium = tierPremium(ultrafastMultiplier, "ultrafast_");
+  return baseCost + longContextPremium + priorityPremium + ultrafastPremium;
+}
 
-  const priorityLong = usesOpenAILongContextTier ? (
-    bounded(row.priority_long_context_input_tokens, Math.min(priorityInput, longInput)) *
-      (pricing.input || 0) +
-    bounded(row.priority_long_context_cached_input_tokens, Math.min(priorityCached, longCached)) *
-      (pricing.cache_read || 0) +
-    bounded(
-      row.priority_long_context_cache_creation_input_tokens,
-      Math.min(priorityCacheWrite, longCacheWrite),
-    ) * (pricing.cache_write || 0) +
-    0.5 * bounded(row.priority_long_context_output_tokens, Math.min(priorityOutput, longOutput)) *
-      (pricing.output || 0) +
-    0.5 * bounded(
-      row.priority_long_context_reasoning_output_tokens,
-      Math.min(priorityReasoning, longReasoning),
-    ) * (pricing.output || 0)
-  ) / 1_000_000 : 0;
+// Speed tiers computeRowCost can allocate: prefix of the observed subset
+// columns and the pricing multiplier key that prices them.
+const SPEED_TIERS = [
+  { prefix: "priority_", multiplierKey: "priority_multiplier" },
+  { prefix: "ultrafast_", multiplierKey: "ultrafast_multiplier" },
+];
 
-  const priorityPremium = (priorityMultiplier - 1) * (priorityBase + priorityLong);
-  return baseCost + longContextPremium + priorityPremium;
+// Cost of one speed-tier subset: its standard-rate portion plus, when the
+// model's pricing carries the tier multiplier, the same (multiplier - 1)
+// premium computeRowCost adds on top. Zero-cost (local inference, Pi
+// subscription) and authoritative-cost (Grok) rows have no tier allocation —
+// everything stays under standard there.
+const SPEED_TIER_COLUMN_SUFFIXES = [
+  "input_tokens",
+  "cached_input_tokens",
+  "cache_creation_input_tokens",
+  "output_tokens",
+  "reasoning_output_tokens",
+];
+
+function speedTierCost(row, prefix, multiplierKey) {
+  // Skip the pricing lookup entirely for rows without observed columns of
+  // this tier — the allocation below is 0 for them anyway, and the
+  // model-breakdown endpoint calls this for every row of every source.
+  if (!SPEED_TIER_COLUMN_SUFFIXES.some((suffix) => Number(row?.[`${prefix}${suffix}`]) > 0)) return 0;
+  if (LOCAL_INFERENCE_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
+  if (PI_SUBSCRIPTION_SOURCES.has(String(row?.source || "").toLowerCase())) return 0;
+  const reportedCost = Number(row?.total_cost_usd);
+  if (
+    SOURCES_WITH_AUTHORITATIVE_COST.has(row?.source) &&
+    Number.isFinite(reportedCost) &&
+    reportedCost > 0
+  ) return 0;
+  const pricing = getRowPricing(row);
+  const reasoningIncludedInOutput = reasoningFoldsIntoOutput(row);
+  const ctx = rowSubsetContext(row, reasoningIncludedInOutput);
+  const portion = speedTierSubsetCost(row, prefix, pricing, { ...ctx, reasoningIncludedInOutput });
+  const multiplier = Number(pricing[multiplierKey]);
+  if (!(Number.isFinite(multiplier) && multiplier > 1)) return portion;
+  return portion + (multiplier - 1) * portion;
+}
+
+// Exact per-tier allocation of computeRowCost for one usage row. Fast and
+// Ultrafast book their observed subset tokens at the tier's multiplier;
+// everything else — tokens outside the tier subsets, rows without tier
+// columns, provider-reported costs, zero-cost sources — stays under standard.
+// standard is computed as the residual, so the three values always add up to
+// computeRowCost(row) by construction (issue #886: surface the Fast/Ultrafast
+// split that the parser already records).
+function computeRowTierCosts(row) {
+  if (!row || typeof row !== "object") return { standard: 0, priority: 0, ultrafast: 0 };
+  const priority = speedTierCost(row, SPEED_TIERS[0].prefix, SPEED_TIERS[0].multiplierKey);
+  const ultrafast = speedTierCost(row, SPEED_TIERS[1].prefix, SPEED_TIERS[1].multiplierKey);
+  const standard = computeRowCost(row) - priority - ultrafast;
+  return { standard, priority, ultrafast };
 }
 
 // Backwards-compatible MODEL_PRICING export. Test at
@@ -322,8 +510,10 @@ module.exports = {
   ensurePricingLoaded,
   getPricingRevision,
   getModelPricing,
+  getModelPricingInfo,
   getRowPricing,
   computeRowCost,
+  computeRowTierCosts,
   resetPricingForTests,
   MODEL_PRICING,
   ZERO_PRICING,

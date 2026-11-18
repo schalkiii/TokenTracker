@@ -24,6 +24,7 @@ final class ServerManager: ObservableObject {
     /// wake, retry): when our own child process is alive and the server answers
     /// health checks, this is a no-op — it never tears down a healthy server.
     func ensureServerRunning() async {
+        guard !NativeQAProfile.isQABuild else { fatalError("Native QA cannot launch or replace a server") }
         if let process = serverProcess, process.isRunning,
            await APIClient.shared.checkServerHealth() {
             status = .running
@@ -224,7 +225,7 @@ final class ServerManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         // Use login shell so Node.js/npm PATH is available
-        process.arguments = ["-lc", "\(binaryPath) serve --port \(Constants.serverPort) --no-sync"]
+        process.arguments = ["-lc", "\(binaryPath) serve --port \(Constants.serverPort) --no-sync --no-open"]
         process.currentDirectoryURL = FileManager.default.temporaryDirectory
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

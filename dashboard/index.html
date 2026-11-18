@@ -122,7 +122,7 @@
               "price": "0",
               "priceCurrency": "USD"
             },
-            "description": "Local-first AI coding usage tracker for 43 tools, with a desktop pet, four widgets, achievements, native macOS and Windows apps, accurate cross-provider deduplication, and no prompt collection."
+            "description": "Local-first AI coding usage tracker for 47 tools, with a desktop pet, four widgets, achievements, native macOS and Windows apps, accurate cross-provider deduplication, and no prompt collection."
           },
           {
             "@type": "WebSite",
@@ -205,7 +205,11 @@
               { "@type": "ListItem", "position": 40, "name": "Cline" },
               { "@type": "ListItem", "position": 41, "name": "MiniMax Code" },
               { "@type": "ListItem", "position": 42, "name": "Command Code" },
-              { "@type": "ListItem", "position": 43, "name": "TRAE" }
+              { "@type": "ListItem", "position": 43, "name": "TRAE" },
+              { "@type": "ListItem", "position": 44, "name": "WorkBuddy AI" },
+              { "@type": "ListItem", "position": 45, "name": "DuMate" },
+              { "@type": "ListItem", "position": 46, "name": "Muse Code" },
+              { "@type": "ListItem", "position": 47, "name": "OpenSquilla" }
             ]
           },
           {
@@ -224,7 +228,7 @@
                 "name": "Which AI coding CLIs does Token Tracker support?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "Token Tracker supports 43 AI coding tools, including Claude Code, Codex CLI, AStudio, Cursor, Gemini CLI, Antigravity, Kiro, OpenCode, OpenClaw, Every Code, Hermes Agent, GitHub Copilot, Kimi Code, CodeBuddy, WorkBuddy, Grok Build, oh-my-pi, OmO, pi, Dots, Prime Agent, Craft Agents, Reasonix, Kilo CLI, Kilo Code, Roo Code, Zed Agent, Goose, Droid, Mimo Code, ZCode, Qoder, AnythingLLM Desktop, Claude Science, DeepSeek Harness, TRAE Work CN, LM Studio, Unsloth Studio, Devin CLI, Cline, MiniMax Code, Command Code, and TRAE."
+                  "text": "Token Tracker supports 47 AI coding tools, including Claude Code, Codex CLI, AStudio, Cursor, Gemini CLI, Antigravity, Kiro, OpenCode, OpenSquilla, OpenClaw, Every Code, Hermes Agent, GitHub Copilot, Kimi Code, CodeBuddy, WorkBuddy, WorkBuddy AI, Grok Build, oh-my-pi, OmO, pi, Dots, Prime Agent, Craft Agents, Reasonix, Muse Code, Kilo CLI, Kilo Code, Roo Code, Zed Agent, Goose, Droid, Mimo Code, DuMate, ZCode, Qoder, AnythingLLM Desktop, Claude Science, DeepSeek Harness, TRAE Work CN, LM Studio, Unsloth Studio, Devin CLI, Cline, MiniMax Code, Command Code, and TRAE."
                 }
               },
               {
@@ -256,7 +260,7 @@
                 "name": "How do I monitor AI token usage and cost across tools?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "Install Token Tracker with npx tokentracker-cli. It is an AI token usage and cost tracker that monitors token consumption and spend across all 43 supported tools in one dashboard, with per-model pricing across 2,200+ models so you can see cost by model, project, and time window without manual tracking."
+                  "text": "Install Token Tracker with npx tokentracker-cli. It is an AI token usage and cost tracker that monitors token consumption and spend across all 47 supported tools in one dashboard, with per-model pricing across 2,200+ models so you can see cost by model, project, and time window without manual tracking."
                 }
               },
               {
@@ -278,7 +282,7 @@
       <h1>Token Tracker: monitor AI token usage and cost with a local dashboard and desktop companion</h1>
       <p>
         Token Tracker is a free, open-source, local-first dashboard that automatically tracks and monitors token usage
-        and cost across 43 AI coding tools — including Claude Code, OpenAI Codex, AStudio, Cursor, Gemini CLI, LM Studio, and Unsloth Studio. A desktop pet
+        and cost across 47 AI coding tools — including Claude Code, OpenAI Codex, AStudio, Cursor, Gemini CLI, LM Studio, and Unsloth Studio. A desktop pet
         reacts to real token activity, four desktop widgets
         keep usage visible, and achievements turn coding history into progress. Native macOS and Windows apps
         sit on top of accurate cross-provider deduplication. Token counts only — never prompts or conversations.
@@ -303,7 +307,7 @@
         <li><strong>Desktop pet</strong> — a pixel companion that reacts to real token burn, streaks, and rest.</li>
         <li><strong>Four desktop widgets</strong> — usage, activity heatmap, top models, and limits at a glance.</li>
         <li><strong>Achievements</strong> — unlock milestones from local and optional account-wide activity.</li>
-        <li><strong>Unified usage dashboard</strong> — input, output, cached, and cache-creation tokens across 43 AI coding tools.</li>
+        <li><strong>Unified usage dashboard</strong> — input, output, cached, and cache-creation tokens across 47 AI coding tools.</li>
         <li><strong>Cost analysis</strong> — per-model pricing across 2,200+ models with an offline snapshot.</li>
         <li><strong>Usage limits view</strong> — __TOKENTRACKER_DISCOVERY_LIMITS_SUMMARY__</li>
         <li><strong>Service Status page</strong> — live operational and incident status from eight official provider status pages.</li>
@@ -314,11 +318,11 @@
       </ul>
       <p><em>Privacy by design</em>: token counts only, never prompts or conversation content. Local-first; cloud sync is optional and powers only the public leaderboard.</p>
 
-      <h2>Supported AI coding tools (43)</h2>
+      <h2>Supported AI coding tools (47)</h2>
       <p>
         Use Token Tracker as a Claude Code token tracker, Codex token tracker, Cursor token tracker,
         Gemini token tracker, OpenCode token tracker, GitHub Copilot token tracker, or DeepSeek Harness token tracker — one dashboard
-        covers all 43 tools below.
+        covers all 47 tools below.
       </p>
       <ul>
         <li><strong>Claude Code</strong> — Anthropic's official coding agent CLI; integrated via SessionEnd hook.</li>
@@ -329,6 +333,7 @@
         <li><strong>Antigravity</strong> — passive transcript reader.</li>
         <li><strong>Kiro</strong> — SQLite and JSONL readers.</li>
         <li><strong>OpenCode</strong> — open-source coding agent; plugin + SQLite audit.</li>
+        <li><strong>OpenSquilla</strong> — passive SQLite usage reader for finalized model rows; never reads transcript content.</li>
         <li><strong>OpenClaw</strong> — session plugin integration.</li>
         <li><strong>Every Code</strong> — Codex-compatible TOML notify hook.</li>
         <li><strong>Hermes Agent</strong> — SQLite sessions table at <code>~/.hermes/state.db</code>.</li>
@@ -336,6 +341,7 @@
         <li><strong>Kimi Code</strong> — passive <code>wire.jsonl</code> reader.</li>
         <li><strong>CodeBuddy (Tencent)</strong> — Claude-Code fork; SessionEnd hook in <code>~/.codebuddy/settings.json</code>.</li>
         <li><strong>WorkBuddy (Tencent)</strong> — SessionEnd hook and passive session reader.</li>
+        <li><strong>WorkBuddy AI</strong> — International WorkBuddy build with separate session tracking.</li>
         <li><strong>Grok Build</strong> — hook and passive cumulative usage reader.</li>
         <li><strong>oh-my-pi</strong> — passive JSONL session reader.</li>
         <li><strong>OmO</strong> — passive JSONL session reader, including nested subagent transcripts.</li>
@@ -344,12 +350,14 @@
         <li><strong>Prime Agent</strong> — metadata-only passive usage reader.</li>
         <li><strong>Craft Agents</strong> — passive session reader.</li>
         <li><strong>Reasonix</strong> — passive telemetry reader.</li>
+        <li><strong>Muse Code</strong> — passive session reader.</li>
         <li><strong>Kilo CLI</strong> — passive SQLite reader.</li>
         <li><strong>Kilo Code</strong> — passive editor task reader.</li>
         <li><strong>Roo Code</strong> — passive editor task reader.</li>
         <li><strong>Zed Agent</strong> — passive SQLite reader.</li>
         <li><strong>Goose</strong> — passive SQLite reader.</li>
         <li><strong>Droid (Factory)</strong> — passive cumulative session reader.</li>
+        <li><strong>DuMate</strong> — passive OpenCode SQLite reader with an independent source and reinstall-copy deduplication.</li>
         <li><strong>Mimo Code</strong> — passive SQLite reader that excludes mirrored Claude history.</li>
         <li><strong>ZCode</strong> — passive SQLite reader for Z.ai-native turns.</li>
         <li><strong>Qoder</strong> — passive SQLite reader with exact prompt, cached-input, and completion token counters.</li>
@@ -394,7 +402,7 @@
       <p>Run <code>npx tokentracker-cli</code>. The CLI auto-detects your AI coding tools, installs hooks, and opens the dashboard.</p>
 
       <h3>Which AI coding tools does Token Tracker support?</h3>
-      <p>Token Tracker supports 43 tools: Claude Code, Codex CLI, AStudio, Cursor, Gemini CLI, Antigravity, Kiro, OpenCode, OpenClaw, Every Code, Hermes Agent, GitHub Copilot, Kimi Code, CodeBuddy, WorkBuddy, Grok Build, oh-my-pi, OmO, pi, Dots, Prime Agent, Craft Agents, Reasonix, Kilo CLI, Kilo Code, Roo Code, Zed Agent, Goose, Droid, Mimo Code, ZCode, Qoder, AnythingLLM Desktop, Claude Science, DeepSeek Harness, TRAE Work CN, LM Studio, Unsloth Studio, Devin CLI, Cline, MiniMax Code, Command Code, and TRAE.</p>
+      <p>Token Tracker supports 47 tools: Claude Code, Codex CLI, AStudio, Cursor, Gemini CLI, Antigravity, Kiro, OpenCode, OpenSquilla, OpenClaw, Every Code, Hermes Agent, GitHub Copilot, Kimi Code, CodeBuddy, WorkBuddy, WorkBuddy AI, Grok Build, oh-my-pi, OmO, pi, Dots, Prime Agent, Craft Agents, Reasonix, Muse Code, Kilo CLI, Kilo Code, Roo Code, Zed Agent, Goose, Droid, Mimo Code, DuMate, ZCode, Qoder, AnythingLLM Desktop, Claude Science, DeepSeek Harness, TRAE Work CN, LM Studio, Unsloth Studio, Devin CLI, Cline, MiniMax Code, Command Code, and TRAE.</p>
 
       <h3>Is Token Tracker free and open source?</h3>
       <p>Yes. Source on GitHub at <a href="https://github.com/xiufengsun/TokenTracker">github.com/xiufengsun/TokenTracker</a>; npm package <code>tokentracker-cli</code>.</p>
@@ -406,7 +414,7 @@
       <p>__TOKENTRACKER_DISCOVERY_FAQ_USAGE__</p>
 
       <h3>How do I monitor AI token usage and cost across tools?</h3>
-      <p>Token Tracker is an AI token usage and cost tracker: install it with <code>npx tokentracker-cli</code>, and it monitors token consumption and spend across all 43 tools in one dashboard, with per-model pricing across 2,200+ models so you can see cost by model, project, and time window without manual tracking.</p>
+      <p>Token Tracker is an AI token usage and cost tracker: install it with <code>npx tokentracker-cli</code>, and it monitors token consumption and spend across all 47 tools in one dashboard, with per-model pricing across 2,200+ models so you can see cost by model, project, and time window without manual tracking.</p>
 
       <h3>Does Token Tracker work offline?</h3>
       <p>Yes. Token Tracker is local-first. All parsing, aggregation, and dashboard rendering happen on your machine. Cloud sync is optional and powers only the public leaderboard.</p>
@@ -420,6 +428,29 @@
         <li><a href="https://github.com/xiufengsun/TokenTracker">GitHub: xiufengsun/TokenTracker</a></li>
         <li><a href="https://github.com/xiufengsun/TokenTracker/issues">Report an issue</a></li>
       </ul>
+      <p class="directory-badges" style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:1rem">
+        <a href="https://submitby.ai/projects/6e2fa70e-9eb2-4c97-a9a9-fed567a3d4a9" data-submitby="802575ab1a4adbfcbcfd03f0afcf7fb2dd8931c29766b584bd210e05edb8dfa2"><img src="https://submitby.ai/badges/chip-light.svg" alt="Listed on submitby.ai" width="128" height="28" /></a>
+        <a href="https://theaitoolsdir.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://theaitoolsdir.com/badge/tokentracker.svg" alt="Featured on TheAIToolsDir" width="160" height="44"></a>
+        <a href="https://indielineup.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://indielineup.com/badge/tokentracker.svg" alt="Featured on IndieLineup" width="160" height="44"></a>
+        <a href="https://saaslineup.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://saaslineup.com/badge/tokentracker.svg" alt="Featured on SaaSLineup" width="160" height="44"></a>
+        <a href="https://themicrosaasdir.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://themicrosaasdir.com/badge/tokentracker.svg" alt="Featured on TheMicroSaaSDir" width="160" height="44"></a>
+        <a href="https://thesaasdir.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://thesaasdir.com/badge/tokentracker.svg" alt="Featured on TheSaaSDir" width="160" height="44"></a>
+        <a href="https://thedevtoolsdir.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://thedevtoolsdir.com/badge/tokentracker.svg" alt="Featured on TheDevToolsDir" width="160" height="44"></a>
+        <a href="https://thedevtoolsindex.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://thedevtoolsindex.com/badge/tokentracker.svg" alt="Featured on TheDevToolsIndex" width="160" height="44"></a>
+        <a href="https://thedevtoolslist.com/product/tokentracker?ref=badge" rel="dofollow"><img src="https://thedevtoolslist.com/badge/tokentracker.svg" alt="Featured on TheDevToolsList" width="160" height="44"></a>
+        <a href="https://altern.ai/ai/token-tracker" target="_blank" rel="noopener"><img src="https://data.altern.ai/alternbadge.png" alt="Featured on Altern" width="200" height="43"></a>
+        <a href="https://listai.tools/token-tracker?utm_source=listaitools&utm_medium=badge" target="_blank" rel="noopener">
+          <img src="https://listai.tools/token-tracker/badge.svg?theme=light" alt="Featured on listai.tools" width="200" height="50" loading="lazy" />
+        </a>
+        <a href="https://dang.ai" target="_blank" rel="dofollow noopener"><img src="https://assets.dang.ai/badges/dang-verified-light.png" alt="Verified on DANG!" width="260" height="94" style="display:block;width:260px;max-width:100%;height:auto;border:0;" /></a>
+        <a href="https://shapelessai.com/ai-tools/token-tracker?utm_source=tokentracker.cc" target="_blank" rel="noopener noreferrer"><img src="https://shapelessai.com/ai-tools/badge/featured-dark.png" alt="Token Tracker - Featured on ShapelessAI" width="277" height="74" style="display:block"></a>
+        <a href="https://curlship.com"><img src="https://curlship.com/badge.svg" alt="Listed on CurlShip" width="120" height="20" /></a>
+        <a href="https://promoteindex.com/p/token-tracker"><img src="https://promoteindex.com/api/v1/projects/token-tracker/badge.svg" alt="Token Tracker on PromoteIndex" height="28"></a>
+        <a href="https://postmake.io" target="_blank" rel="noopener noreferrer"><img src="https://postmake.io/postmake_badge_dark.png" alt="Featured on the Postmake directory" width="200" height="54" style="display:block;opacity:0.9"></a>
+        <a href="https://tooldirs.com" target="_blank" rel="dofollow noopener"><img src="https://tooldirs.com/badge/badge_dark.svg" alt="Listed on ToolDirs" width="160" height="40"></a>
+        <a href="https://indiehunt.io/project/token-tracker" target="_blank" rel="noopener"><img src="https://indiehunt.io/badges/indiehunt-badge-dark.svg" alt="Featured on IndieHunt" width="265" height="58" style="display:block;opacity:.9"></a>
+        <a href="https://twelve.tools" target="_blank" rel="noopener">twelve.tools</a>
+      </p>
       <p>
         <strong>Note:</strong> The usage dashboard, rate-limit panel, project attribution, skills browser,
         and widget previews are part of the local app at <code>http://localhost:7680</code> after install —

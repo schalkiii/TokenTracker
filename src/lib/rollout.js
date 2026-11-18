@@ -1,3 +1,4 @@
+const { preserveLegacyClaudeGroups, preserveLegacyClaudePrefix, createBackendResolver, mergeBackendUsage, claudeLines } = require("./claude-backend");
 const { claudeUserIdentity, collectClaudeForkAliases } = require("./claude-user-identity");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
@@ -12,6 +13,7 @@ const { physicalJsonlRecords } = require("./jsonl-lines");
 const { readSqliteJsonRows, readSqliteJsonRowsAsync } = require("./sqlite-reader");
 const wsl = require("./wsl-probe");
 const { resolveInstallPaths } = require("./install-resolver");
+const { expandHome } = require("./scan-roots");
 const {
   consumeUsageDelta,
   createUsageDeltaState,
@@ -27,12 +29,14 @@ const {
   CODEX_SERVICE_TIER_MARKER,
   readCodexServiceTier,
   isPriorityServiceTier,
+  isUltrafastServiceTier,
 } = require("./codex-service-tier");
 const {
   awaitsCompactedLine,
   createCompactionResponseIds,
   createUsageRecordState,
   extractTokenUsageRecord,
+  isCodexTotalOnlyResetSentinel,
   isCodexTurnEndEvent,
   isRecordOnly,
   noteLineAfterUsageRecord,
@@ -95,10 +99,13 @@ async function listRolloutFiles(sessionsDir, options = {}) {
       : null;
   const stats = options?.stats && typeof options.stats === "object" ? options.stats : null;
   if (dayInventoryCache) {
-    if (dayInventoryCache.version !== 1) {
+    // v2: isRolloutFileName also accepts rollout-*.jsonl.zst/.zstd. Old v1
+    // day lists omit archives that were already on disk when the directory
+    // metadata last matched, so bump to force a one-time rescan.
+    if (dayInventoryCache.version !== 2) {
       dayInventoryCache.days = {};
     }
-    dayInventoryCache.version = 1;
+    dayInventoryCache.version = 2;
     if (!dayInventoryCache.days || typeof dayInventoryCache.days !== "object") {
       dayInventoryCache.days = {};
     }
@@ -179,7 +186,75 @@ function isRolloutFileName(name) {
   if (typeof name !== "string") return false;
   if (name.includes("/") || name.includes("\\")) return false;
   if (name !== path.basename(name)) return false;
-  return name.startsWith("rollout-") && name.endsWith(".jsonl");
+  if (!name.startsWith("rollout-")) return false;
+  return name.endsWith(".jsonl") || isCompressedRolloutFileName(name);
+}
+
+// Compressed rollout archives cannot be tailed by byte offset: the cursor
+// stores compressed bytes while the parser consumes decompressed text. Treat
+// them as content-addressed snapshots — one parse per (inode, size) version —
+// reusing the DSH session's zstd machinery (built-in zlib first,
+// `@mongodb-js/zstd` fallback) including its multi-frame handling. Returns
+// null for a missing/non-file path; an empty archive yields no lines (the
+// same outcome as an empty uncompressed rollout).
+const CODEX_ROLLOUT_COMPRESSED_PATTERN = /^rollout-.*\.jsonl\.zstd?$/;
+const CODEX_ROLLOUT_TEXT_MAX_BYTES = 256 * 1024 * 1024;
+
+function isCompressedRolloutFileName(name) {
+  return typeof name === "string" && CODEX_ROLLOUT_COMPRESSED_PATTERN.test(name);
+}
+
+function isCompressedRolloutPath(filePath) {
+  if (typeof filePath !== "string") return false;
+  return isCompressedRolloutFileName(path.basename(filePath));
+}
+
+async function readCodexRolloutSnapshot(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
+  const handle = await fs.open(filePath, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    const initialStat = await handle.stat().catch(() => null);
+    if (!initialStat || !initialStat.isFile()) return null;
+    const outputLimit = Number.isSafeInteger(maxOutputBytes) && maxOutputBytes >= 0
+      ? maxOutputBytes
+      : CODEX_ROLLOUT_TEXT_MAX_BYTES;
+    let data;
+    try {
+      data = await handle.readFile();
+    } catch (_error) {
+      // Transient mount/IO failures (e.g. WSL ESTALE) must not abort the rest
+      // of sync; treat like a missing archive and keep the prior cursor.
+      return null;
+    }
+    const metadata = {
+      size: data.length,
+      mtimeMs: Number.isFinite(initialStat.mtimeMs) ? initialStat.mtimeMs : 0,
+      inode: initialStat.ino || 0,
+    };
+    if (data.length === 0) return { ...metadata, unchanged: false, lines: [] };
+    let decoded;
+    try {
+      const inspected = inspectDshZstdFrames(data, outputLimit);
+      decoded = await decodeDshZstd(data, { maxOutputBytes: outputLimit, inspected });
+    } catch (_error) {
+      // Malformed / truncated / oversized archives must not abort the rest of
+      // the sync: return null so the caller keeps the prior cursor and retries.
+      return null;
+    }
+    // Fatal UTF-8: uncompressed JSONL parsing rejects invalid bytes under
+    // invalidRecordPolicy=throw. toString("utf8") would silently replace them
+    // and claim utf8Valid, so a corrupted discriminator could drop usage
+    // during repairCodexRescanInflation. Fail the snapshot instead.
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    } catch (_error) {
+      return null;
+    }
+    return { ...metadata, unchanged: false, lines: text.length > 0 ? text.split("\n") : [] };
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function directoryInventoryStatKey(st) {
@@ -205,7 +280,7 @@ async function listRolloutFilesDeep(dir) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
         await walk(p);
-      } else if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+      } else if (e.isFile() && isRolloutFileName(e.name)) {
         out.push(p);
       }
     }
@@ -278,6 +353,7 @@ async function parseRolloutIncremental({
   const projectFreshnessNowMs = Date.now();
   const touchedBuckets = new Set();
   const defaultSource = normalizeSourceInput(source) || DEFAULT_SOURCE;
+  preserveCodexModelBuckets(hourlyState, touchedBuckets);
   const syncDiagnostics = diagnostics && typeof diagnostics === "object" ? diagnostics : null;
 
   if (!cursors.files || typeof cursors.files !== "object") {
@@ -516,6 +592,16 @@ async function parseRolloutIncremental({
       ? prev?.codexUsageRecord || (prev?.lastTotal ? { sawTokenCount: true } : null)
       : null;
 
+    // Compressed archives are whole-file snapshots. If the compressed bytes
+    // changed under the same inode, force historical dedup; parseRolloutFile
+    // ignores retained baselines for the parse itself. Do NOT clear cursor
+    // fields here — a soft decode failure must leave the prior cursor intact.
+    const compressedSnapshotRescan = isCompressedRolloutPath(filePath)
+      && sameInode
+      && !truncated
+      && prevOffset > 0
+      && prevOffset !== st.size;
+
     const codexProjectFastPath =
       projectEnabled && (fileSource === DEFAULT_SOURCE || fileSource === "acode");
     const projectOffset = sameInode && !truncated ? Number(prev.projectOffset || 0) : 0;
@@ -574,7 +660,8 @@ async function parseRolloutIncremental({
         ? getAcodeEventDedup()
         : null;
     const codexEventTracker = rolloutEventDedup
-      ? (needsHistoricalRolloutDedup({
+      ? (compressedSnapshotRescan
+          || needsHistoricalRolloutDedup({
           filePath,
           prev,
           sameInode,
@@ -627,6 +714,22 @@ async function parseRolloutIncremental({
           sessionId: codexSessionIdFromPath(filePath),
           invalidRecordPolicy,
         });
+
+    if (result.snapshotUnavailable) {
+      // Leave cursors.files[key] untouched so the next readable snapshot is
+      // compared against the prior (inode, offset, baselines).
+      if (cb) {
+        cb({
+          index: idx + 1,
+          total: totalFiles,
+          filePath,
+          filesProcessed,
+          eventsAggregated,
+          bucketsQueued: touchedBuckets.size,
+        });
+      }
+      continue;
+    }
 
     const nextCursor = {
       inode,
@@ -983,6 +1086,9 @@ async function parseClaudeIncremental({
   const prevHashes = Array.isArray(cursors.claudeHashes) ? cursors.claudeHashes : [];
   const seenMessageHashes = new Set(prevHashes);
   const defaultSource = normalizeSourceInput(source) || "claude";
+  preserveLegacyClaudeGroups(files.filter((entry) =>
+    (typeof entry === "string" ? defaultSource : normalizeSourceInput(entry?.source) || defaultSource) === "claude"
+  ).map((entry) => typeof entry === "string" ? entry : entry?.path), path.dirname(queuePath));
   // Resolve all changed-file lineage before counting: fork files may sort first.
   const forkTimes = new Map();
   const forkAliases = await collectClaudeForkAliases(files, cursors,
@@ -1052,6 +1158,7 @@ async function parseClaudeIncremental({
     const truncated = sameInode && prevOffset > st.size;
     const startOffset = sameInode && !truncated ? prevOffset : 0;
 
+    if (fileSource === "claude") preserveLegacyClaudePrefix(filePath, path.dirname(queuePath), startOffset);
     let fileId = null;
     if (seenFileIds) {
       const cachedFileId =
@@ -1186,6 +1293,7 @@ async function parseClaudeIncremental({
       projectKey,
       seenMessageHashes,
       forkAliases,
+      backendResolver: fileSource === "claude" ? createBackendResolver(filePath, path.dirname(queuePath)) : null,
     });
 
     cursors.files[key] = {
@@ -1634,9 +1742,19 @@ async function resolveOpenclawSessionFiles(env = process.env, deps = {}) {
           out.push(full);
         }
       }
+      for (const dbPath of [
+        path.join(agentsDir, agent.name, "agent", "openclaw-agent.sqlite"),
+        path.join(agentsDir, agent.name, "openclaw-agent.sqlite"),
+      ]) {
+        if ((await fs.stat(dbPath).catch(() => null))?.isFile()) {
+          out.push(dbPath);
+          break; // alternate layouts of one agent database, not two sources
+        }
+      }
     }
   }
-  out.sort((a, b) => a.localeCompare(b));
+  // Import archives must seed dedup before the corresponding SQLite history.
+  out.sort((a, b) => Number(a.endsWith(".sqlite")) - Number(b.endsWith(".sqlite")) || a.localeCompare(b));
   return out;
 }
 
@@ -1699,6 +1817,67 @@ async function parseOpenclawIncremental({
     const previousOffset = Number(prev?.offset || 0);
     let accepted = null;
     let openedRegularFile = false;
+    if (filePath.endsWith(".sqlite")) {
+      const sessionFilter = typeof entry?.sessionId === "string"
+        ? ` AND e.session_id = '${entry.sessionId.replace(/'/g, "''")}'` : "";
+      const rows = await readSqliteJsonRowsAsync(filePath, `
+        SELECT e.session_id, json_object(
+          'type', json_extract(e.event_json, '$.type'),
+          'id', json_extract(e.event_json, '$.id'),
+          'timestamp', json_extract(e.event_json, '$.timestamp'),
+          'message', json_object(
+            'role', json_extract(e.event_json, '$.message.role'),
+            'model', json_extract(e.event_json, '$.message.model'),
+            'provider', json_extract(e.event_json, '$.message.provider'),
+            'api', json_extract(e.event_json, '$.message.api'),
+            'timestamp', json_extract(e.event_json, '$.message.timestamp'),
+            'responseId', json_extract(e.event_json, '$.message.responseId'),
+            'usage', json_extract(e.event_json, '$.message.usage')
+          )) AS event
+        FROM transcript_events e JOIN session_windows w ON w.session_id = e.session_id
+        WHERE json_valid(e.event_json) AND COALESCE(w.reason, '') != 'compaction'
+          AND json_extract(e.event_json, '$.message.role') = 'assistant'
+          AND json_extract(e.event_json, '$.message.usage') IS NOT NULL
+          ${sessionFilter}
+        ORDER BY e.session_id, e.seq
+      `, { readOnly: true, throwOnReadFailure: true, label: "OpenClaw" });
+      const sessions = new Map();
+      for (const row of rows) {
+        if (!sessions.has(row.session_id)) sessions.set(row.session_id, []);
+        sessions.get(row.session_id).push(row.event);
+      }
+      for (const [sessionId, lines] of sessions) {
+        const sessionCursorKey = `${key}#${sessionId}`;
+        const prior = { ...(stagedFiles[sessionCursorKey]?.usageEvents || {}) };
+        const dbDir = path.dirname(filePath);
+        const agentDir = path.basename(dbDir) === "agent" && path.basename(path.dirname(path.dirname(dbDir))) === "agents"
+          ? path.dirname(dbDir) : dbDir;
+        const agentPrefix = openclawCursorKey(`${agentDir}${path.sep}`);
+        // SQLite imports retain transcript identities. Carry forward counts
+        // from this session's legacy transcript, including reset archives.
+        for (const [legacyPath, cursor] of Object.entries(stagedFiles)) {
+          const basename = path.basename(legacyPath);
+          if (cursor.provider !== "openclaw" || !openclawCursorKey(legacyPath).startsWith(agentPrefix)) continue;
+          if (!basename.startsWith(`${sessionId}.jsonl`) &&
+              !(basename.startsWith(`${sessionId}-topic-`) && basename.includes(".jsonl"))) continue;
+          for (const [identity, count] of Object.entries(cursor.usageEvents || {})) {
+            prior[identity] = Math.max(prior[identity] || 0, count);
+          }
+        }
+        const result = await parseOpenclawSessionFile({
+          lines, previousUsageEvents: prior, appendOnly: false,
+          hourlyState, touchedBuckets, source: fileSource,
+        });
+        stagedFiles[sessionCursorKey] = {
+          provider: "openclaw", usageEvents: result.usageEvents,
+          hasRealUsage: Object.keys(result.usageEvents).length > 0,
+          updatedAt: new Date().toISOString(),
+        };
+        eventsAggregated += result.eventsAggregated;
+      }
+      filesProcessed += 1;
+      continue;
+    }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const fileHandle = await fs.open(filePath, "r").catch(() => null);
       if (!fileHandle) break;
@@ -1913,6 +2092,7 @@ function mergeOpenclawAttemptBuckets(
 }
 
 async function parseOpenclawSessionFile({
+  lines,
   filePath,
   fileHandle,
   startOffset,
@@ -1928,7 +2108,8 @@ async function parseOpenclawSessionFile({
   projectState,
   projectTouchedBuckets,
 }) {
-  const st = fileHandle ? await fileHandle.stat() : await fs.stat(filePath);
+  const st = lines ? { size: lines.length } : fileHandle ? await fileHandle.stat() : await fs.stat(filePath);
+  startOffset = startOffset || 0;
   const endOffset =
     Number.isFinite(endOffsetLimit) && endOffsetLimit >= 0
       ? Math.min(st.size, endOffsetLimit)
@@ -1963,14 +2144,14 @@ async function parseOpenclawSessionFile({
     };
   }
 
-  const stream = fssync.createReadStream(filePath, {
+  const stream = lines ? null : fssync.createReadStream(filePath, {
     fd: fileHandle?.fd,
     autoClose: !fileHandle,
     encoding: "utf8",
     start: startOffset,
     end: endOffset - 1,
   });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const rl = lines || readline.createInterface({ input: stream, crlfDelay: Infinity });
 
   let eventsAggregated = 0;
   const scanCounts = appendOnly ? { ...priorCounts } : {};
@@ -2069,8 +2250,8 @@ async function parseOpenclawSessionFile({
     if (!collectOnly) eventsAggregated += 1;
   }
 
-  rl.close();
-  if (!fileHandle) stream.close?.();
+  if (!lines) rl.close();
+  if (!fileHandle) stream?.close?.();
   return {
     endOffset,
     eventsAggregated,
@@ -2182,7 +2363,7 @@ function openclawUsageEventIdentity(obj, msg, usage, model) {
 function codexSessionIdFromPath(filePath) {
   if (typeof filePath !== "string") return null;
   const m = filePath.match(
-    /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/,
+    /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl(?:\.zstd?)?$/,
   );
   return m ? m[1] : null;
 }
@@ -2217,6 +2398,108 @@ async function parseRolloutFile({
   const endOffset = st.size;
   const projectFileContexts = [];
   addProjectFileContext(projectFileContexts, projectContext);
+  // Compressed archives are immutable snapshots, not append-only logs: a byte
+  // range of the compressed file is not a prefix of the decompressed text, so
+  // resume-in-the-middle is impossible. Parse the whole snapshot whenever its
+  // (inode, size) identity is new; unchanged snapshots are skipped by the
+  // caller before reaching this function.
+  if (isCompressedRolloutPath(filePath)) {
+    // Mirror the uncompressed exhausted-cursor guard. When a custom
+    // publicRepoResolver disables the outer skip, an unchanged archive must
+    // not be re-parsed with retained baselines (that inflates totals).
+    if (startOffset >= endOffset) {
+      return {
+        endOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        lastServiceTier: typeof lastServiceTier === "string" ? lastServiceTier : null,
+        modelAttributionState: previousModelAttributionState,
+        usageRecordState: previousUsageRecordState,
+        eventsAggregated: 0,
+        projectFileContexts,
+      };
+    }
+    const snapshot = await readCodexRolloutSnapshot(filePath);
+    if (!snapshot) {
+      // Soft sync skips a bad archive and keeps the prior cursor so later
+      // files still count. Strict rebuilds (invalidRecordPolicy=throw), used
+      // by repairCodexRescanInflation, must fail closed: a silent skip here
+      // would let another readable session satisfy the non-empty-bucket
+      // safeguard and permanently delete this archive's prior usage.
+      if (invalidRecordPolicy === "throw") {
+        throw new Error(`unreadable Codex compressed archive: ${filePath}`);
+      }
+      return {
+        endOffset: startOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        lastServiceTier: typeof lastServiceTier === "string" ? lastServiceTier : null,
+        modelAttributionState: previousModelAttributionState,
+        usageRecordState: previousUsageRecordState,
+        eventsAggregated: 0,
+        projectFileContexts,
+        // Tell the incremental caller not to rewrite cursors.files[key]. If the
+        // archive inode changed under a transient decode miss, overwriting the
+        // prior cursor would drop historical-dedup baselines and double-count.
+        snapshotUnavailable: true,
+      };
+    }
+    // Decompressed lines have no meaningful compressed-byte offsets; the
+    // shared parser only needs their content plus termination flags. Byte
+    // counters stay at the snapshot's compressed size so the cursor records
+    // (inode, size) identity, not decompressed progress.
+    const records = (async function* snapshotRecords() {
+      for (let index = 0; index < snapshot.lines.length; index += 1) {
+        const raw = snapshot.lines[index];
+        const terminated = index + 1 < snapshot.lines.length || raw.endsWith("\n");
+        yield {
+          line: terminated ? raw : `${raw}`,
+          physicalBytes: 0,
+          terminated,
+          utf8Valid: true,
+        };
+      }
+    })();
+    // Size changed under the same inode: drop retained baselines for THIS
+    // parse only. Soft-fail above still returns the caller-supplied baselines
+    // so the prior cursor is preserved when decode fails.
+    const rescanBaselines = startOffset > 0 && startOffset < endOffset;
+    const parsed = await parseRolloutRecords({
+      records,
+      startOffset: 0,
+      endOffset: 0,
+      lastTotal: rescanBaselines ? null : lastTotal,
+      tokenUsageBaselines: rescanBaselines ? null : tokenUsageBaselines,
+      lastModel: rescanBaselines ? null : lastModel,
+      lastServiceTier: rescanBaselines ? null : lastServiceTier,
+      modelAttributionState: rescanBaselines ? null : previousModelAttributionState,
+      usageRecordState: rescanBaselines ? null : previousUsageRecordState,
+      compactionResponseIds,
+      hourlyState,
+      touchedBuckets,
+      source,
+      projectState,
+      projectTouchedBuckets,
+      projectRef,
+      projectKey,
+      projectMetaCache,
+      publicRepoCache,
+      publicRepoResolver,
+      projectContext,
+      projectFileContexts,
+      seenCodexEvents,
+      sessionId,
+      filePath,
+      invalidRecordPolicy,
+    });
+    // parseRolloutRecords counts streamed bytes; snapshots have none, so pin
+    // the cursor to the compressed size — the (inode, size) identity that
+    // makes an unchanged archive skip on the next sync.
+    parsed.endOffset = snapshot.size;
+    return parsed;
+  }
   if (startOffset >= endOffset) {
     return {
       endOffset,
@@ -2235,7 +2518,78 @@ async function parseRolloutFile({
     start: startOffset,
     end: endOffset - 1,
   });
+  // Compressed snapshots never reach this branch (parseRolloutFile routes them
+  // to parseRolloutRecords directly); the byte-counting stream below is only
+  // meaningful for append-only uncompressed logs.
+  const records = (async function* streamRecords() {
+    const invalidUtf8 = invalidRecordPolicy === "throw" ? "throw" : "record";
+    for await (const record of physicalJsonlRecords(stream, { invalidUtf8 })) {
+      yield record;
+    }
+  })();
 
+  return parseRolloutRecords({
+    records,
+    startOffset,
+    endOffset,
+    lastTotal,
+    tokenUsageBaselines,
+    lastModel,
+    lastServiceTier,
+    modelAttributionState: previousModelAttributionState,
+    usageRecordState: previousUsageRecordState,
+    compactionResponseIds,
+    hourlyState,
+    touchedBuckets,
+    source,
+    projectState,
+    projectTouchedBuckets,
+    projectRef,
+    projectKey,
+    projectMetaCache,
+    publicRepoCache,
+    publicRepoResolver,
+    projectContext,
+    projectFileContexts,
+    seenCodexEvents,
+    sessionId,
+    filePath,
+    invalidRecordPolicy,
+  });
+}
+
+async function parseRolloutRecords({
+  records,
+  startOffset,
+  endOffset,
+  lastTotal,
+  tokenUsageBaselines,
+  lastModel,
+  lastServiceTier,
+  modelAttributionState: previousModelAttributionState,
+  usageRecordState: previousUsageRecordState = null,
+  compactionResponseIds = null,
+  hourlyState,
+  touchedBuckets,
+  source,
+  projectState,
+  projectTouchedBuckets,
+  projectRef,
+  projectKey,
+  projectMetaCache,
+  publicRepoCache,
+  publicRepoResolver,
+  projectContext,
+  projectFileContexts: existingProjectFileContexts,
+  seenCodexEvents,
+  sessionId,
+  filePath,
+  invalidRecordPolicy,
+}) {
+  const projectFileContexts = Array.isArray(existingProjectFileContexts)
+    ? existingProjectFileContexts
+    : [];
+  addProjectFileContext(projectFileContexts, projectContext);
   let model = typeof lastModel === "string" ? lastModel : null;
   // Codex writes thread_settings_applied before the turn_context of the turn it
   // takes effect on, and token_count rows carry no turn id, so a row's tier is
@@ -2304,6 +2658,7 @@ async function parseRolloutFile({
     const bucket = getHourlyBucket(hourlyState, source, event.model, event.bucketStart);
     addTotals(bucket.totals, event.delta);
     if (isPriorityServiceTier(event.serviceTier)) addPriorityUsage(bucket.totals, event.delta);
+    if (isUltrafastServiceTier(event.serviceTier)) addUltrafastUsage(bucket.totals, event.delta);
     touchedBuckets.add(bucketKey(source, event.model, event.bucketStart));
     if (event.projectKey && projectState && projectTouchedBuckets) {
       const projectBucket = getProjectBucket(
@@ -2319,8 +2674,7 @@ async function parseRolloutFile({
     eventsAggregated += 1;
   }
 
-  const invalidUtf8 = invalidRecordPolicy === "throw" ? "throw" : "record";
-  for await (const record of physicalJsonlRecords(stream, { invalidUtf8 })) {
+  for await (const record of records) {
     scannedEndOffset += record.physicalBytes;
     if (record.terminated) committedEndOffset = scannedEndOffset;
     if (!record.utf8Valid) {
@@ -2559,6 +2913,7 @@ async function parseRolloutFile({
     // Only the model bucket gets the subset: the project bucket below carries
     // no model, so no per-model rate can be applied to it anyway.
     if (isPriorityServiceTier(serviceTier)) addPriorityUsage(bucket.totals, delta);
+    if (isUltrafastServiceTier(serviceTier)) addUltrafastUsage(bucket.totals, delta);
     touchedBuckets.add(bucketKey(source, model, bucketStart));
     if (currentProjectKey && projectState && projectTouchedBuckets) {
       const projectBucket = getProjectBucket(
@@ -2611,6 +2966,80 @@ async function scanRolloutProjectFileContexts({
   if (!projectState || endOffset <= 0) {
     return {
       endOffset,
+      lastTotal,
+      tokenUsageBaselines,
+      lastModel,
+      lastServiceTier: lastServiceTier || null,
+      modelAttributionState,
+      eventsAggregated: 0,
+      projectFileContexts,
+    };
+  }
+
+  // Compressed archives cannot be scanned as byte streams: JSONL newlines in
+  // the compressed payload are not record boundaries. Decode the snapshot,
+  // then walk decompressed lines for cwd changes. Pin the cursor to the
+  // compressed size so the next sync's unchanged check keeps working.
+  if (isCompressedRolloutPath(filePath)) {
+    const snapshot = await readCodexRolloutSnapshot(filePath);
+    if (!snapshot) {
+      if (invalidRecordPolicy === "throw") {
+        throw new Error(`unreadable Codex compressed archive: ${filePath}`);
+      }
+      return {
+        endOffset,
+        lastTotal,
+        tokenUsageBaselines,
+        lastModel,
+        lastServiceTier: lastServiceTier || null,
+        modelAttributionState,
+        eventsAggregated: 0,
+        projectFileContexts,
+        snapshotUnavailable: true,
+      };
+    }
+    let currentCwd = null;
+    for (const raw of snapshot.lines) {
+      const line = typeof raw === "string" ? raw : "";
+      if (
+        !line ||
+        !(
+          line.includes('"turn_context"') ||
+          line.includes('"session_meta"')
+        ) ||
+        !line.includes('"cwd"')
+      ) {
+        continue;
+      }
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (error) {
+        if (invalidRecordPolicy === "throw") throw error;
+        continue;
+      }
+      if (
+        (obj?.type !== "turn_context" && obj?.type !== "session_meta") ||
+        !obj?.payload ||
+        typeof obj.payload !== "object" ||
+        typeof obj.payload.cwd !== "string"
+      ) {
+        continue;
+      }
+      const nextCwd = obj.payload.cwd.trim();
+      if (!nextCwd || nextCwd === currentCwd) continue;
+      const context = await resolveProjectContextForPath({
+        startDir: wsl.mapWslCwdToUnc(nextCwd, filePath),
+        projectMetaCache,
+        publicRepoCache,
+        publicRepoResolver,
+        projectState,
+      });
+      currentCwd = nextCwd;
+      addProjectFileContext(projectFileContexts, context);
+    }
+    return {
+      endOffset: snapshot.size,
       lastTotal,
       tokenUsageBaselines,
       lastModel,
@@ -2712,6 +3141,7 @@ async function parseClaudeFile({
   projectKey,
   seenMessageHashes,
   forkAliases,
+  backendResolver,
 }) {
   const st = fileStat || (await fs.stat(filePath).catch(() => null));
   if (!st || !st.isFile()) return { endOffset: startOffset, eventsAggregated: 0 };
@@ -2719,15 +3149,14 @@ async function parseClaudeFile({
   const endOffset = st.size;
   if (startOffset >= endOffset) return { endOffset, eventsAggregated: 0 };
 
-  const stream = fssync.createReadStream(filePath, { encoding: "utf8", start: startOffset });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
   let eventsAggregated = 0;
   // Separator-agnostic: WSL installs are scanned over \\wsl$ UNC paths where
   // path.join produces backslashes, and a forward-slash-only check would
   // misclassify subagent transcripts as main sessions (#307).
   const isMainSession = !/[\\/]subagents[\\/]/.test(filePath);
-  for await (const line of rl) {
+  let byteOffset = startOffset;
+  for await (const { line, start: lineStart, end } of claudeLines(filePath, startOffset, endOffset)) {
+    byteOffset = end;
     if (!line) continue;
 
     // Count user-typed messages as conversations (main sessions only).
@@ -2772,6 +3201,8 @@ async function parseClaudeFile({
       continue;
     }
 
+    if (isOmOClaudeSdkMirror(obj)) continue;
+
     const usage = obj?.message?.usage || obj?.usage;
     if (!usage || typeof usage !== "object") continue;
 
@@ -2787,6 +3218,8 @@ async function parseClaudeFile({
 
     if (dedupHash) seenMessageHashes.add(dedupHash);
     delta.conversation_count = 0;
+    const backend = backendResolver?.(obj, lineStart, byteOffset);
+    if (backend) delta.backend_usage = [{ ...delta, ...backend }];
 
     const bucketStart = toUtcHalfHourStart(tokenTimestamp);
     if (!bucketStart) continue;
@@ -2808,9 +3241,7 @@ async function parseClaudeFile({
     eventsAggregated += 1;
   }
 
-  rl.close();
-  stream.close?.();
-  return { endOffset, eventsAggregated };
+  return { endOffset: byteOffset, eventsAggregated };
 }
 
 async function parseGeminiFile({
@@ -3090,6 +3521,80 @@ async function parseOpencodeMessageFile({
   };
 }
 
+// Codex models are observed per rollout/turn. A busier sibling agent in the
+// same half-hour is not evidence for the model of an unnamed request (#927).
+// Re-emit stored buckets once on upgrade, including idle historical groups:
+// their totals still retain the original attribution, so no log replay is
+// needed. Queue readers replace rows by (source, model, hour_start).
+//
+// Older repairs sometimes flattened per-model keys into `codex|unknown|<hour>`
+// while leaving `groupQueued` pointing at the already-correct named queue
+// rows (#1052). Re-emitting that flattened unknown invents an `unknown`
+// sibling (and can zero a stale alignedModel) beside the named rows. Skip
+// re-emit for those flattened legacy groups; clear the marker only.
+function preserveCodexModelBuckets(hourlyState, touchedBuckets) {
+  const upgrading = hourlyState.modelAttributionPolicy?.codex !== "observed";
+  const groupQueued =
+    hourlyState.groupQueued && typeof hourlyState.groupQueued === "object"
+      ? hourlyState.groupQueued
+      : {};
+  if (!upgrading && !Object.keys(groupQueued).some(
+    key => key.startsWith(`${DEFAULT_SOURCE}${BUCKET_SEPARATOR}`),
+  )) return;
+
+  const groupModels = new Map();
+  for (const [key, bucket] of Object.entries(hourlyState.buckets || {})) {
+    const parsed = parseBucketKey(key);
+    if (parsed.source !== DEFAULT_SOURCE || !bucket?.totals) continue;
+    const groupKey = groupBucketKey(parsed.source, parsed.hourStart);
+    const model = normalizeModelInput(parsed.model) || DEFAULT_MODEL;
+    let entry = groupModels.get(groupKey);
+    if (!entry) {
+      entry = { named: false };
+      groupModels.set(groupKey, entry);
+    }
+    if (model !== DEFAULT_MODEL) entry.named = true;
+  }
+
+  const legacyGroups = new Set();
+  const flattenedLegacyGroups = new Set();
+  for (const groupKey of Object.keys(groupQueued)) {
+    if (!groupKey.startsWith(`${DEFAULT_SOURCE}${BUCKET_SEPARATOR}`)) continue;
+    legacyGroups.add(groupKey);
+    const entry = groupModels.get(groupKey);
+    // No named model buckets left: the hour was flattened to unknown (or the
+    // buckets were dropped). Named queue rows from the repair are the truth.
+    if (!entry || !entry.named) flattenedLegacyGroups.add(groupKey);
+  }
+
+  for (const [key, bucket] of Object.entries(hourlyState.buckets || {})) {
+    const parsed = parseBucketKey(key);
+    if (parsed.source !== DEFAULT_SOURCE || !bucket?.totals) continue;
+    const groupKey = groupBucketKey(parsed.source, parsed.hourStart);
+    const legacy = legacyGroups.has(groupKey);
+    if (flattenedLegacyGroups.has(groupKey)) continue;
+    if (!upgrading && !legacy) continue;
+    bucket.queuedKey = null;
+    bucket.retractedUnknownKey = null;
+    touchedBuckets.add(key);
+  }
+  for (const groupKey of legacyGroups) {
+    if (flattenedLegacyGroups.has(groupKey)) {
+      delete groupQueued[groupKey];
+      continue;
+    }
+    const hourStart = groupKey.slice(DEFAULT_SOURCE.length + BUCKET_SEPARATOR.length);
+    // Legacy groups emitted a combined unknown row for multiple named models.
+    // Replace it with the actual unknown total (or zero) before splitting.
+    const unknown = getHourlyBucket(hourlyState, DEFAULT_SOURCE, DEFAULT_MODEL, hourStart);
+    unknown.queuedKey = null;
+    touchedBuckets.add(bucketKey(DEFAULT_SOURCE, DEFAULT_MODEL, hourStart));
+    delete groupQueued[groupKey];
+  }
+  hourlyState.groupQueued = groupQueued;
+  hourlyState.modelAttributionPolicy = { ...hourlyState.modelAttributionPolicy, codex: "observed" };
+}
+
 async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets }) {
   if (!touchedBuckets || touchedBuckets.size === 0) return 0;
 
@@ -3183,6 +3688,68 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
 
   const toAppend = [];
   for (const group of groupedBuckets.values()) {
+    // Codex defaults to observed-only attribution; reconstructions can opt
+    // other sources in. Preserve every model bucket, including unknown,
+    // instead of guessing from the busiest model in the same half-hour.
+    // Persist the policy so hooks, desktop refreshes and restarts agree.
+    if (hourlyState.modelAttributionPolicy?.[group.source] === "observed") {
+      // A group last aligned under the default policy must not keep the stale
+      // dominant attribution downstream. Mirror the default path's alignment
+      // correction — one zero row for the old model — then observed mode
+      // re-emits every bucket, unknown included, and the alignment state is
+      // dropped so the correction fires at most once per group.
+      const alignedModelBucket = group.buckets.get(DEFAULT_MODEL) || null;
+      const staleAlignedModel = (() => {
+        if (!alignedModelBucket?.alignedModel) return null;
+        const normalized = normalizeModelInput(alignedModelBucket.alignedModel);
+        return normalized && normalized !== DEFAULT_MODEL && !group.buckets.has(normalized)
+          ? normalized
+          : null;
+      })();
+      if (staleAlignedModel) {
+        const zeroTotals = initTotals();
+        toAppend.push(JSON.stringify({
+          source: group.source,
+          model: staleAlignedModel,
+          hour_start: group.hourStart,
+          input_tokens: zeroTotals.input_tokens,
+          cached_input_tokens: zeroTotals.cached_input_tokens,
+          cache_creation_input_tokens: zeroTotals.cache_creation_input_tokens,
+          output_tokens: zeroTotals.output_tokens,
+          reasoning_output_tokens: zeroTotals.reasoning_output_tokens,
+          total_tokens: zeroTotals.total_tokens,
+          billable_total_tokens: zeroTotals.billable_total_tokens,
+          total_cost_usd: zeroTotals.total_cost_usd,
+          conversation_count: zeroTotals.conversation_count,
+        }));
+      }
+      for (const bucket of group.buckets.values()) bucket.alignedModel = null;
+      for (const [model, bucket] of group.buckets.entries()) {
+        const totals = bucket.totals;
+        const usagePrecision = bucket.usage_precision || null;
+        const key = usagePrecision ? `${totalsKey(totals)}|${usagePrecision}` : totalsKey(totals);
+        if (bucket.queuedKey === key) continue;
+        toAppend.push(JSON.stringify({
+          source: group.source,
+          model,
+          hour_start: group.hourStart,
+          input_tokens: totals.input_tokens,
+          cached_input_tokens: totals.cached_input_tokens,
+          cache_creation_input_tokens: totals.cache_creation_input_tokens,
+          output_tokens: totals.output_tokens,
+          reasoning_output_tokens: totals.reasoning_output_tokens,
+          total_tokens: totals.total_tokens,
+          billable_total_tokens: totals.billable_total_tokens ?? totals.total_tokens,
+          total_cost_usd: totals.total_cost_usd || 0,
+          usage_precision: usagePrecision || undefined,
+          ...prioritySubsetOf(totals),
+          ...(totals.backend_usage ? { backend_usage: totals.backend_usage } : {}),
+          conversation_count: totals.conversation_count,
+        }));
+        bucket.queuedKey = key;
+      }
+      continue;
+    }
     const unknownBucket = group.buckets.get(DEFAULT_MODEL) || null;
     const dominantModel = pickDominantModel(group.buckets);
     let alignedModel = null;
@@ -3264,6 +3831,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
             total_cost_usd: totals.total_cost_usd || 0,
             usage_precision: usagePrecision || undefined,
             ...prioritySubsetOf(totals),
+            ...(totals.backend_usage ? { backend_usage: totals.backend_usage } : {}),
             conversation_count: totals.conversation_count,
           }),
         );
@@ -3345,6 +3913,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
         total_cost_usd: unknownBucket.totals.total_cost_usd || 0,
         usage_precision: usagePrecision || undefined,
         ...prioritySubsetOf(unknownBucket.totals),
+        ...(unknownBucket.totals.backend_usage ? { backend_usage: unknownBucket.totals.backend_usage } : {}),
         conversation_count: unknownBucket.totals.conversation_count,
       }),
     );
@@ -3394,6 +3963,7 @@ async function enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets })
           billable_total_tokens: group.totals.billable_total_tokens ?? group.totals.total_tokens,
           total_cost_usd: group.totals.total_cost_usd || 0,
           ...prioritySubsetOf(group.totals),
+          ...(group.totals.backend_usage ? { backend_usage: group.totals.backend_usage } : {}),
           conversation_count: group.totals.conversation_count,
         }),
       );
@@ -3441,6 +4011,7 @@ async function enqueueTouchedProjectBuckets({
         project_ref: projectRef,
         project_key: projectKey,
         source: bucket.source,
+        ...(totals.backend_usage ? { backend_usage: totals.backend_usage } : {}),
         hour_start: bucket.hour_start,
         input_tokens: totals.input_tokens,
         cached_input_tokens: totals.cached_input_tokens,
@@ -3553,14 +4124,29 @@ function normalizeHourlyState(raw) {
   const version = Number(state.version || 1);
   const rawBuckets = state.buckets && typeof state.buckets === "object" ? state.buckets : {};
   const buckets = {};
-  const groupQueued = {};
+  const existingGroupQueued =
+    state.groupQueued && typeof state.groupQueued === "object" ? state.groupQueued : {};
+  const modelAttributionPolicy = Object.fromEntries(
+    Object.entries(state.modelAttributionPolicy || {})
+      .filter(([, policy]) => policy === "observed"),
+  );
 
   if (!Number.isFinite(version) || version < 2) {
+    const groupQueued = { ...existingGroupQueued };
     for (const [key, value] of Object.entries(rawBuckets)) {
       const parsed = parseBucketKey(key);
       const hourStart = parsed.hourStart;
       if (!hourStart) continue;
       const source = normalizeSourceInput(parsed.source) || DEFAULT_SOURCE;
+      // Older repairs persisted model-aware keys without a schema version.
+      // Preserve them before v1 normalization can collapse sibling models into
+      // unknown; preserveCodexModelBuckets needs the original attribution (#927).
+      const firstSeparator = key.indexOf(BUCKET_SEPARATOR);
+      const hasModel = firstSeparator > 0 && key.indexOf(BUCKET_SEPARATOR, firstSeparator + 1) > 0;
+      if (hasModel) {
+        buckets[bucketKey(source, parsed.model, hourStart)] = value;
+        continue;
+      }
       const normalizedKey = bucketKey(source, DEFAULT_MODEL, hourStart);
       buckets[normalizedKey] = value;
       if (value?.queuedKey) {
@@ -3571,6 +4157,7 @@ function normalizeHourlyState(raw) {
       version: 3,
       buckets,
       groupQueued,
+      ...(Object.keys(modelAttributionPolicy).length > 0 ? { modelAttributionPolicy } : {}),
       updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : null,
     };
   }
@@ -3583,13 +4170,11 @@ function normalizeHourlyState(raw) {
     buckets[normalizedKey] = value;
   }
 
-  const existingGroupQueued =
-    state.groupQueued && typeof state.groupQueued === "object" ? state.groupQueued : {};
-
   return {
     version: 3,
     buckets,
     groupQueued: version >= 3 ? existingGroupQueued : {},
+    ...(Object.keys(modelAttributionPolicy).length > 0 ? { modelAttributionPolicy } : {}),
     updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : null,
   };
 }
@@ -4002,6 +4587,16 @@ const PRIORITY_SUBSET_FIELDS = [
   ["priority_reasoning_output_tokens", "reasoning_output_tokens"],
 ];
 
+const ULTRAFAST_SUBSET_FIELDS = [
+  ["ultrafast_input_tokens", "input_tokens"],
+  ["ultrafast_cached_input_tokens", "cached_input_tokens"],
+  ["ultrafast_cache_creation_input_tokens", "cache_creation_input_tokens"],
+  ["ultrafast_output_tokens", "output_tokens"],
+  ["ultrafast_reasoning_output_tokens", "reasoning_output_tokens"],
+];
+
+const SPEED_TIER_SUBSET_FIELDS = [...PRIORITY_SUBSET_FIELDS, ...ULTRAFAST_SUBSET_FIELDS];
+
 // The whole delta belongs to a priority request, so every base column it
 // carries is priority usage.
 function addPriorityUsage(target, delta) {
@@ -4011,9 +4606,16 @@ function addPriorityUsage(target, delta) {
   }
 }
 
+function addUltrafastUsage(target, delta) {
+  for (const [field, base] of ULTRAFAST_SUBSET_FIELDS) {
+    const value = Number(delta?.[base] || 0);
+    if (value > 0) target[field] = (Number(target[field]) || 0) + value;
+  }
+}
+
 function prioritySubsetOf(totals) {
   const subset = {};
-  for (const [field] of PRIORITY_SUBSET_FIELDS) {
+  for (const [field] of SPEED_TIER_SUBSET_FIELDS) {
     const value = Number(totals?.[field]) || 0;
     if (value > 0) subset[field] = value;
   }
@@ -4021,7 +4623,8 @@ function prioritySubsetOf(totals) {
 }
 
 function addTotals(target, delta) {
-  for (const [field] of PRIORITY_SUBSET_FIELDS) {
+  mergeBackendUsage(target, delta);
+  for (const [field] of SPEED_TIER_SUBSET_FIELDS) {
     const value = Number(delta?.[field]) || 0;
     if (value > 0) target[field] = (Number(target[field]) || 0) + value;
   }
@@ -4091,7 +4694,11 @@ function totalsKey(totals) {
   // Appended only when a priority subset exists, so buckets that never see the
   // tier keep their previously persisted queuedKey and are not re-enqueued.
   const priority = PRIORITY_SUBSET_FIELDS.map(([field]) => Number(totals[field]) || 0);
-  return priority.some((value) => value > 0) ? `${base}|p:${priority.join(",")}` : base;
+  const ultrafast = ULTRAFAST_SUBSET_FIELDS.map(([field]) => Number(totals[field]) || 0);
+  let key = base;
+  if (priority.some((value) => value > 0)) key += `|p:${priority.join(",")}`;
+  if (ultrafast.some((value) => value > 0)) key += `|u:${ultrafast.join(",")}`;
+  return key;
 }
 
 function toUtcHalfHourStart(ts) {
@@ -4802,20 +5409,6 @@ function normalizeUsage(u) {
   return out;
 }
 
-function isCodexTotalOnlyResetSentinel(lastUsage, totalUsage) {
-  const componentTotal = (usage) => [
-    usage?.input_tokens,
-    usage?.cached_input_tokens,
-    usage?.cache_creation_input_tokens ?? usage?.cache_write_input_tokens,
-    usage?.output_tokens,
-    usage?.reasoning_output_tokens,
-  ].reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
-  return Number(lastUsage?.total_tokens || 0) > 0
-    && Number(totalUsage?.total_tokens || 0) === 0
-    && componentTotal(lastUsage) === 0
-    && componentTotal(totalUsage) === 0;
-}
-
 // Stable dedup key for one Claude jsonl entry. Anthropic's official protocol
 // guarantees `message.id` is globally unique per response, so msgId alone is a
 // valid dedup key. Older code required both msgId AND requestId, which short-
@@ -4827,6 +5420,14 @@ function isCodexTotalOnlyResetSentinel(lastUsage, totalUsage) {
 // backward compatibility for the (msgId, reqId) format already persisted in
 // cursors.claudeHashes (msgId strings don't contain `:`, so the two formats
 // share the same Set without collision).
+// OmO Native routes Anthropic-subscription turns through the Claude Agent SDK,
+// which mirrors the same usage into ~/.claude/projects with entrypoint "sdk-ts"
+// and userType "external". OmO's passive reader already counts those turns
+// under source=omo — skip the mirrored Claude transcript copy (#726).
+function isOmOClaudeSdkMirror(obj) {
+  return obj?.entrypoint === "sdk-ts" && obj?.userType === "external";
+}
+
 function claudeMessageDedupKey(obj) {
   const msgId = typeof obj?.message?.id === "string" && obj.message.id ? obj.message.id : null;
   if (!msgId) return null;
@@ -5053,16 +5654,21 @@ function buildV2Sql(sessionTable, watermark = null) {
 // sessionTable (which session table exists, session_v2 preferred over session
 // via DESC). Returns null when the probe itself fails — callers treat that as
 // v1-only, matching the pre-existing silent-degradation contract.
-function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}) {
+function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   let rows;
   try {
     rows = readSqliteJsonRows(
       dbPath,
       `SELECT (SELECT 1 FROM session_message LIMIT 1) AS hasRows,
               (SELECT name FROM sqlite_master WHERE name IN ('session','session_v2') ORDER BY name DESC LIMIT 1) AS sessionTable`,
-      { label: "OpenCode", timeout: 10_000, maxBuffer: 1024 * 1024, ...sqliteOptions },
+      { label: "OpenCode", timeout: 10_000, maxBuffer: 1024 * 1024, ...sqliteOptions, throwOnReadFailure: true },
     );
-  } catch (_e) {
+  } catch (error) {
+    // A missing session_message table is the normal v1-only miss; with
+    // propagateReadFailure a real read failure must reach the caller — the
+    // session scanner would otherwise skip the v2 generation silently and
+    // cache a zero-token inventory over a readable-in-principle database.
+    if (propagateReadFailure && !isMissingSqliteTableError(error)) throw error;
     return null;
   }
   if (!Array.isArray(rows) || rows.length === 0) return null;
@@ -5076,13 +5682,27 @@ function detectOpencodeMessageLayout(dbPath, sqliteOptions = {}) {
 }
 
 // Shared provider resolver: v1 rows carry a top-level providerID, v2 rows nest
-// it under model.providerID. Used by the mimo/zcode discriminators so they work
-// against both generations without duplicating the resolution logic.
+// it under model.providerID. ZCode renamed the flat field to `providerId`
+// (lowercase d, ~2026-09, issue #1008); rows written since then only carry the
+// new spelling, so without it every post-rename native turn resolves to "" and
+// the zcode legacy-history leg silently drops it. Used by the mimo/zcode
+// discriminators so they work against all generations without duplicating the
+// resolution logic.
 function opencodeMessageProvider(data) {
-  return data?.providerID || data?.model?.providerID || "";
+  return data?.providerID || data?.model?.providerID || data?.providerId || "";
 }
 
-function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqliteOptions = {}) {
+// readSqliteJsonRows wraps its two backend errors into the thrown Error, so a
+// "table genuinely absent" miss and a "database unreadable" failure look the
+// same to a caller that only catches. Both backends spell a missing table
+// "no such table" — use that to keep the normal miss on the tolerant path
+// while real read failures can propagate.
+function isMissingSqliteTableError(error) {
+  const messages = [error?.message, error?.cliError?.message, error?.nodeSqliteError?.message];
+  return messages.some((m) => typeof m === "string" && m.includes("no such table"));
+}
+
+function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqliteOptions = {}, { propagateReadFailure = false, includeZeroMessage } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return { messages: [], cursor: null };
 
   const identity = opencodeDbIdentity(dbPath);
@@ -5126,16 +5746,19 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
         toNonNegativeInt(tokens.reasoning) > 0 ||
         toNonNegativeInt(tokens.cache?.read) > 0 ||
         toNonNegativeInt(tokens.cache?.write) > 0;
-      if (!hasTokens) continue;
-      if (isV2 && typeof row.directory === "string" && row.directory.trim()) {
-        data.path = { ...(typeof data.path === "object" && data.path ? data.path : {}), cwd: row.directory };
-      }
-      out.push({
+      const message = {
         id: row.id || data.id,
         sessionID: row.session_id || data.sessionID,
         timeUpdated: row.time_updated || 0,
         data,
-      });
+      };
+      // Providers can retain zero corrections for previously counted messages.
+      // New empty records remain excluded unless the caller recognizes them.
+      if (!hasTokens && !(typeof includeZeroMessage === "function" && includeZeroMessage(message))) continue;
+      if (isV2 && typeof row.directory === "string" && row.directory.trim()) {
+        data.path = { ...(typeof data.path === "object" && data.path ? data.path : {}), cwd: row.directory };
+      }
+      out.push(message);
     }
   };
 
@@ -5149,7 +5772,11 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
         throwOnReadFailure: true,
       });
       return Array.isArray(rows) ? rows : [];
-    } catch (_e) {
+    } catch (error) {
+      // A missing table is the normal "other generation's layout" miss; an
+      // unreadable database is not — with propagateReadFailure the session
+      // scan aborts instead of caching a zero-token inventory over it.
+      if (propagateReadFailure && !isMissingSqliteTableError(error)) throw error;
       return null; // query-level failure (e.g. wrong generation's table)
     }
   };
@@ -5227,7 +5854,7 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
     // baseline every database carries or degrades to), v2 runs only when the
     // probe confirms session_message has rows — this avoids firing a JOIN
     // against a non-existent session table on type-A databases.
-    const probe = detectOpencodeMessageLayout(effectiveDbPath, sqliteOptions);
+    const probe = detectOpencodeMessageLayout(effectiveDbPath, sqliteOptions, { propagateReadFailure });
     const out = [];
     const nextCursor = {
       version: OPENCODE_DB_CURSOR_VERSION,
@@ -5267,8 +5894,8 @@ function readOpencodeDbMessagesIncremental(dbPath, previousCursor = null, sqlite
   }
 }
 
-function readOpencodeDbMessages(dbPath, sqliteOptions = {}) {
-  return readOpencodeDbMessagesIncremental(dbPath, null, sqliteOptions).messages;
+function readOpencodeDbMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false, includeZeroMessage } = {}) {
+  return readOpencodeDbMessagesIncremental(dbPath, null, sqliteOptions, { propagateReadFailure, includeZeroMessage }).messages;
 }
 
 // mimocode mirrors the user's Claude Code + claude-mem history into its own
@@ -5384,7 +6011,7 @@ const ZCODE_NATIVE_USAGE_COLUMNS = new Set([
   "cache_read_input_tokens",
 ]);
 
-function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}) {
+function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return null;
   let rows;
   try {
@@ -5401,7 +6028,11 @@ function detectZcodeNativeUsageLayout(dbPath, sqliteOptions = {}) {
         throwOnReadFailure: true,
       },
     );
-  } catch (_error) {
+  } catch (error) {
+    // propagateReadFailure: an unreadable db is a failure, not "no native
+    // layout" — the session scanner must skip the file, not fall back to an
+    // empty legacy read and cache zero tokens.
+    if (propagateReadFailure) throw error;
     return null;
   }
   const modelUsageColumns = new Set(
@@ -5442,6 +6073,79 @@ function hasZcodeNativeUsageSchema(dbPath, sqliteOptions = {}) {
   }
 }
 
+// true: readable with content; false: confirmed empty; null: unavailable or
+// unreadable. Only a confirmed empty database is safe to replace during discovery.
+function zcodeDbHasContent(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return null;
+  let snapshot = null;
+  let effectiveDbPath = dbPath;
+  if (isUncPath(dbPath)) {
+    try {
+      snapshot = snapshotSqliteDb(dbPath);
+      effectiveDbPath = snapshot.path;
+    } catch (_error) {
+      // Preserve the existing direct-read fallback for transient snapshot
+      // failures and UNC implementations that support SQLite locking.
+    }
+  }
+  try {
+    const rows = readSqliteJsonRows(
+      effectiveDbPath,
+      "SELECT (SELECT COUNT(*) FROM session) AS sessions, (SELECT COUNT(*) FROM model_usage) AS requests",
+      {
+        label: "ZCode",
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        ...sqliteOptions,
+        throwOnReadFailure: true,
+      },
+    );
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return null;
+    return (Number(row.sessions) || 0) > 0 || (Number(row.requests) || 0) > 0;
+  } catch (_error) {
+    return null;
+  } finally {
+    if (snapshot) snapshot.cleanup();
+  }
+}
+
+function hasZcodeCursorState(cursors) {
+  return [cursors?.zcode, cursors?.zcode?.native, cursors?.zcode?.wsl]
+    .some((state) => Object.keys(state?.messages || {}).length > 0) ||
+    Object.keys(cursors?.hourly?.buckets || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.hourly?.groupQueued || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.projectHourly?.buckets || {}).some((key) => key.includes("|zcode|"));
+}
+
+// Sync, session discovery and status must select the same installs. Once sync
+// records a priority-mode choice, retain it: switching databases underneath a
+// flat cursor would accumulate both installs in the same usage ledger.
+function resolveZcodeInstallPaths({ nativeValue, wslValue } = {}, env = process.env, deps = {}) {
+  const mode = wsl.getWslMode(env);
+  const priorityMode = (deps.platform || process.platform) === "win32" && ["native-first", "wsl-first"].includes(mode);
+  const selection = deps.selection || deps.cursors?.zcodeInstallSelection;
+  if (priorityMode && selection?.mode === mode &&
+      selection.zcodeHome === (env.ZCODE_HOME?.trim() || null) &&
+      typeof selection.dbPath === "string" && selection.dbPath) {
+    // A newly discovered or temporarily unavailable install must not change
+    // the cursor's owner. Only an explicit mode/home override releases it.
+    return { native: selection.dbPath, wsl: null };
+  }
+  const paths = resolveInstallPaths({ nativeValue, wslValue }, env, deps);
+  if (!priorityMode || (!selection && hasZcodeCursorState(deps.cursors))) {
+    // Legacy cursors followed the original install resolver. Keep that choice
+    // rather than feeding another database into an already-owned flat ledger.
+    return paths;
+  }
+  const picked = paths.native || paths.wsl;
+  const alternate = picked === nativeValue ? wslValue : nativeValue;
+  if (picked && alternate && zcodeDbHasContent(picked) === false && zcodeDbHasContent(alternate) === true) {
+    return { native: alternate, wsl: null };
+  }
+  return paths;
+}
+
 function buildZcodeNativeUsageSql({ hasSessionDirectory }) {
   const directorySelect = hasSessionDirectory ? ", s.directory AS directory" : "";
   const directoryJoin = hasSessionDirectory
@@ -5471,7 +6175,13 @@ function buildZcodeNativeUsageSql({ hasSessionDirectory }) {
     ORDER BY mu.started_at ASC, mu.id ASC`;
 }
 
-function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
+// `propagateReadFailure` (off by default): when the native usage layout is
+// present but its row query fails, throw instead of returning null. The usage
+// queue treats that fallthrough as "no native table, use legacy" — correct for
+// its own resilience — but the session scanner must not cache a zero-token
+// inventory over a failed read (the browser then hides the sessions entirely
+// instead of reporting the db as skipped).
+function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   let snapshot = null;
   let effectiveDbPath = dbPath;
   if (isUncPath(dbPath)) {
@@ -5486,7 +6196,7 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
 
   let rows;
   try {
-    const layout = detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions);
+    const layout = detectZcodeNativeUsageLayout(effectiveDbPath, sqliteOptions, { propagateReadFailure });
     if (!layout) return null;
     rows = readSqliteJsonRows(effectiveDbPath, buildZcodeNativeUsageSql(layout), {
       label: "ZCode",
@@ -5495,7 +6205,8 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
       ...sqliteOptions,
       throwOnReadFailure: true,
     });
-  } catch (_error) {
+  } catch (error) {
+    if (propagateReadFailure) throw error;
     return null;
   } finally {
     if (snapshot) snapshot.cleanup();
@@ -5547,10 +6258,10 @@ function readZcodeNativeUsageMessages(dbPath, sqliteOptions = {}) {
 // table is authoritative from its first completed row onward, but it is not a
 // historical backfill. Keep legacy rows before that boundary so merely adding
 // the new table cannot make older usage disappear from TokenTracker.
-function readZcodeDbMessages(dbPath, sqliteOptions = {}) {
+function readZcodeDbMessages(dbPath, sqliteOptions = {}, { propagateReadFailure = false } = {}) {
   if (!dbPath || !fssync.existsSync(dbPath)) return [];
-  const nativeMessages = readZcodeNativeUsageMessages(dbPath, sqliteOptions);
-  const legacyMessages = readOpencodeDbMessages(dbPath, sqliteOptions)
+  const nativeMessages = readZcodeNativeUsageMessages(dbPath, sqliteOptions, { propagateReadFailure });
+  const legacyMessages = readOpencodeDbMessages(dbPath, sqliteOptions, { propagateReadFailure })
     .filter((message) => isZcodeNativeMessage(message.data))
     .map(normalizeZcodeLegacyMessage);
   if (nativeMessages === null) return legacyMessages;
@@ -6212,13 +6923,35 @@ async function parseQoderDbIncremental({
 //
 // Qoder 2026-08 (app 0.1.2+) migrated from SharedClientCache/cache/db/local.db
 // to Electron main.sqlite + ~/.qoder/projects/<slug>/<sessionId>.jsonl.
-// The new transcript's message.usage no longer carries prompt_tokens — it is a
-// credit-billed SDK: {input_tokens:0, output_tokens:0, credits:3.2, billable:true}.
-// Only rows with authoritative token fields are counted: credit-only usage
-// without tokens is intentionally not counted (usage stays unsupported, no
-// token delta) because there is no first-party evidence for a credit→token
-// rate. Cost was never estimated — no authoritative credit→USD rate is
-// published, so total_cost_usd stays 0.
+//
+// The transcript's message.usage shape has drifted at least once, and BOTH
+// shapes occur in real user history:
+//   - app 0.1.8 / agent 1.1.44: Anthropic-style precise token fields, on the
+//     main transcript AND on subagent transcripts
+//     (see test/qoder-new-parser.test.js "Real CN record shape").
+//   - app 0.4.x, model "qfmodel": every row is
+//     {input_tokens:0, output_tokens:0, cache_*:0, credits:>0, billable:false}.
+// The old comment here claimed the credit-billed shape was `{credits, billable:
+// true}`; that assumption is what made the gate below drop 100% of modern Qoder
+// rows, so Qoder vanished from the dashboard instead of showing up as
+// "0 tokens / N requests". `billable` means "charged to the account", NOT
+// "a call happened" — free-tier models report false while still reporting
+// credits. Admission therefore needs all three signals, and dropping any of
+// them regresses a shape that used to count.
+//
+// Non-goals: credit→token conversion stays out. There is no first-party credit
+// → token (or → USD) rate, so fabricating one would push an invented number
+// into totals, trends, achievements and the cloud leaderboard. Rows without
+// authoritative tokens contribute conversation activity only, and
+// total_cost_usd stays 0. Transcript `usage.credits` is deliberately NOT copied
+// into bucket totals — there is no first-party credit→USD rate to book cost
+// from, and carrying it forward invites someone to divide by it later.
+//
+// conversation_count here follows this provider's existing per-response
+// convention (`: 1` per admitted main-transcript row). That field is NOT
+// comparable across providers — same rule as the Claude branch's isMainSession
+// (#307) and Claude Science's `isRoot ? 1 : 0` (see the Claude Science parser).
+//
 // Old local.db is kept as a legacy fallback; both sources now use distinct
 // cursor namespaces (qoder vs qoderNew) via disjoint messageKey prefixes
 // (row: vs jsonl:) but upload under the same source="qoder".
@@ -6297,6 +7030,80 @@ function qoderNewModelFromRecord(record) {
   return normalizeModelInput(stripped) || "qoder-agent";
 }
 
+function isQoderGenericAutoModel(model) {
+  return (normalizeModelInput(model) || "").toLowerCase() === "auto";
+}
+
+function qoderRuntimeConfigModel(record) {
+  if (record?.type !== "runtime-config") return null;
+  const direct = typeof record?.model === "string" ? record.model.trim() : "";
+  const stripped = direct.replace(
+    /^qoder-custom-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\//i,
+    "",
+  );
+  const model = normalizeModelInput(stripped);
+  return model || null;
+}
+
+function qoderRuntimeSessionId(record) {
+  const sessionId = record?.sessionId || record?.session_id;
+  return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : "";
+}
+
+// Collect explicit runtime-config models per session, ordered by timestamp.
+// Assistant rows that only say "auto" inherit the latest config at or before
+// their timestamp (#1092). A later config in the same session must not rewrite
+// earlier turns, and a session that really selected Auto stays "auto".
+function collectQoderRuntimeModels(files) {
+  const bySession = new Map();
+  for (const filePath of files) {
+    let raw;
+    try {
+      raw = fssync.readFileSync(filePath, "utf8");
+    } catch (_e) {
+      continue;
+    }
+    const lines = raw.split("\n");
+    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+      const line = lines[lineIdx];
+      if (!line.trim() || !line.includes("runtime-config")) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch (_e) {
+        continue;
+      }
+      const model = qoderRuntimeConfigModel(record);
+      const sessionId = qoderRuntimeSessionId(record);
+      if (!model || !sessionId) continue;
+      const ts = qoderNewTimestampMs(record);
+      if (!ts) continue; // Undated configs cannot be ordered against timestamped usage.
+      const list = bySession.get(sessionId) || [];
+      list.push({ ts, model, lineIdx, filePath });
+      bySession.set(sessionId, list);
+    }
+  }
+  for (const list of bySession.values()) {
+    list.sort((a, b) => a.ts - b.ts || a.lineIdx - b.lineIdx || a.filePath.localeCompare(b.filePath));
+  }
+  return bySession;
+}
+
+function resolveQoderRuntimeModel(record, runtimeModels, fallbackModel) {
+  if (!isQoderGenericAutoModel(fallbackModel)) return fallbackModel;
+  const sessionId = qoderRuntimeSessionId(record);
+  const events = sessionId ? runtimeModels.get(sessionId) : null;
+  if (!events || events.length === 0) return fallbackModel;
+  const ts = qoderNewTimestampMs(record);
+  if (!ts) return fallbackModel;
+  let chosen = null;
+  for (const ev of events) {
+    if (ts && ev.ts > ts) break;
+    chosen = ev.model;
+  }
+  return chosen || fallbackModel;
+}
+
 function qoderNewMessageKey(record, filePath, lineIndex = 0) {
   const msgId = normalizeMessageKeyPart(record?.message?.id)
     || normalizeMessageKeyPart(record?.uuid)
@@ -6312,17 +7119,52 @@ function qoderNewMessageKey(record, filePath, lineIndex = 0) {
   return `jsonl:${fallbackSuffix}|${record?.uuid || ""}`;
 }
 
+// 8.64e15 is the ECMAScript TimeClip limit. A larger finite number (nanosecond
+// epochs, clock garbage) passes coerceEpochMs untouched, and `new Date(ms)`
+// yields Invalid Date whose .toISOString() THROWS RangeError — outside the
+// per-line JSON.parse try/catch, aborting the whole source on one bad row and
+// silently removing Qoder from every later sync (warnProviderParseFailure is
+// quiet in auto syncs). Clamp to a drop instead.
+const MAX_QODER_TIMESTAMP_MS = 8.64e15;
+
 function qoderNewTimestampMs(record) {
-  return coerceEpochMs(record?.timestamp)
+  const ms = coerceEpochMs(record?.timestamp)
     || coerceEpochMs(record?.message?.timestamp)
     || parseIsoTimestampMs(record?.timestamp)
     || parseIsoTimestampMs(record?.message?.timestamp)
     || 0;
+  return ms > MAX_QODER_TIMESTAMP_MS ? 0 : ms;
+}
+
+// Nominal credits for one transcript row. `credits` and `original_credits`
+// coexist (the latter is the pre-discount value), and either alone can be 0,
+// so take the larger instead of `credits ?? original_credits` — `??` does not
+// skip a present-but-zero `credits`, which would drop real activity.
+//
+// The epsilon floor is load-bearing: the activity gate below only needs "some
+// credits were reported", and upstream float noise like 1e-9 would otherwise
+// admit rows that carry no usage at all. Real Qoder credits observed in the
+// wild start around 0.2 (2026-10 CN corpus), so 1e-6 never suppresses genuine
+// activity.
+const MIN_QODER_CREDIT_ACTIVITY = 1e-6;
+
+function readQoderNominalCredits(usage) {
+  let max = 0;
+  for (const raw of [usage?.credits, usage?.original_credits]) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) continue;
+    if (raw > max) max = raw;
+  }
+  return max >= MIN_QODER_CREDIT_ACTIVITY ? max : 0;
+}
+
+function isQoderCacheInclusiveUsage(usage) {
+  const ratio = usage?.context_usage_ratio;
+  return typeof ratio === "number" && Number.isFinite(ratio);
 }
 
 function normalizeQoderNewTokens(usage) {
   if (!usage || typeof usage !== "object") return null;
-  const credits = Number(usage.credits ?? usage.original_credits ?? 0);
+  const credits = readQoderNominalCredits(usage);
   let input = Number(usage.input_tokens ?? 0);
   let cached = Number(usage.cache_read_input_tokens ?? usage.cached_tokens ?? 0);
   let cacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
@@ -6340,23 +7182,48 @@ function normalizeQoderNewTokens(usage) {
     const cach = Math.max(0, Math.trunc(cached));
     const out = Math.max(0, Math.trunc(output));
     const cc = Math.max(0, Math.trunc(cacheCreation));
+    // Qoder's remote-chat route (CLI 1.1.8x, agent 1.1.79+) copies Chat
+    // Completions prompt_tokens straight into input_tokens, so it already
+    // includes the cache counts — same contract as legacy normalizeQoderTokens.
+    // Those records also carry context_usage_ratio (= input_tokens / context
+    // window), which is only meaningful for a cache-inclusive prompt count.
+    // Rows without it (older Anthropic-shaped CN/BYOK transcripts) or whose
+    // cache counts exceed input stay disjoint.
+    const inclusive = isQoderCacheInclusiveUsage(usage) && cach + cc <= inp;
+    const ordinary = inclusive ? inp - cach - cc : inp;
+    const total = ordinary + cach + cc + out;
     return {
-      input_tokens: inp,
+      input_tokens: ordinary,
       cached_input_tokens: cach,
       cache_creation_input_tokens: cc,
       output_tokens: out,
       reasoning_output_tokens: 0,
-      total_tokens: inp + cach + cc + out,
-      billable_total_tokens: inp + cach + cc + out,
+      total_tokens: total,
+      billable_total_tokens: total,
       credits: Number.isFinite(credits) && credits > 0 ? credits : 0,
+      // `credits` dies at the totals boundary — parseQoderNewIncremental never
+      // copies it into bucket totals or the cursor, and must not start: there
+      // is no first-party credit→token or credit→USD rate to divide it by.
       usage_precision: null,
     };
   }
-  // Credit-only usage without authoritative token fields is intentionally
-  // not counted (no token delta): there is no first-party evidence for a
-  // credit→token rate. The caller still counts billable messages as
-  // conversation activity.
+  // Credit-only usage without authoritative token fields yields null: no token
+  // delta, because there is no first-party credit→token rate. The caller still
+  // counts it as conversation activity when nominal credits prove the call
+  // really happened.
   return null;
+}
+
+// Subagent transcripts are internal turns of the same conversation, so they
+// must not add to conversation activity — same rule the Claude branch enforces
+// with isMainSession (#307) and Claude Science encodes with `isRoot ? 1 : 0`.
+// A row that carries neither tokens nor activity is still tracked in the cursor:
+// a streamed rewrite can hand it real tokens later, and the cursor entry is what
+// makes that transition subtract/add correctly. It must not touch an hourly or
+// project bucket though, because getHourlyBucket() creates buckets on demand and
+// would publish an all-zero row.
+function qoderRowCountsAsUsage(totals) {
+  return (totals?.total_tokens || 0) > 0 || (totals?.conversation_count || 0) > 0;
 }
 
 async function parseQoderNewIncremental({
@@ -6407,6 +7274,7 @@ async function parseQoderNewIncremental({
   const publicRepoCache = projectEnabled ? new Map() : null;
   const touchedBuckets = new Set();
   const cb = typeof onProgress === "function" ? onProgress : null;
+  const runtimeModels = collectQoderRuntimeModels(files);
 
   // Build current snapshot from all JSONL files
   const currentByKey = new Map();
@@ -6419,6 +7287,9 @@ async function parseQoderNewIncremental({
     } catch (_e) {
       continue;
     }
+    // Separator-agnostic: WSL installs are walked over \\wsl$ UNC paths where
+    // path.join emits backslashes (#307).
+    const isMainSession = !/[\\/]subagents[\\/]/.test(filePath);
     const lines = raw.split("\n");
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
       const line = lines[lineIdx];
@@ -6436,16 +7307,26 @@ async function parseQoderNewIncremental({
       const usage = msg.usage;
       if (!usage || typeof usage !== "object") continue;
       const base = normalizeQoderNewTokens(usage);
-      // Allow billable zero-token messages to still count conversation (no token delta)
+      // Three independent admission signals, kept as a superset of the previous
+      // behaviour — dropping any one regresses rows that used to count:
+      //   base            authoritative tokens (app 0.1.8 / agent 1.1.44 shape)
+      //   isBillable      billable is absent or true (the older credit-billed shape)
+      //   nominalCredits  credits > 0 even though billable is false: Qoder 0.4.x
+      //                   reports billable=false for its free model while still
+      //                   reporting real credits, and gate-on-billable alone
+      //                   discarded every row so the whole source vanished.
+      // Rows that are not billable AND carry no credits stay dropped: that is
+      // the synthetic / cancelled / empty-call case we must not count.
       const isBillable = usage.billable !== false;
-      if (!base && !isBillable) continue;
+      const nominalCredits = readQoderNominalCredits(usage);
+      if (!base && !isBillable && nominalCredits <= 0) continue;
       const timestampMs = qoderNewTimestampMs(record);
       if (!timestampMs) continue;
       const bucketStart = toUtcHalfHourStart(new Date(timestampMs).toISOString());
       if (!bucketStart) continue;
       const messageKey = qoderNewMessageKey(record, filePath, lineIdx);
       if (!messageKey) continue;
-      const model = qoderNewModelFromRecord(record);
+      const model = resolveQoderRuntimeModel(record, runtimeModels, qoderNewModelFromRecord(record));
       const totals = base ? {
         input_tokens: base.input_tokens,
         cached_input_tokens: base.cached_input_tokens,
@@ -6456,7 +7337,7 @@ async function parseQoderNewIncremental({
         billable_total_tokens: base.billable_total_tokens,
         total_cost_usd: 0,
         usage_precision: base.usage_precision || undefined,
-        conversation_count: 1,
+        conversation_count: isMainSession ? 1 : 0,
       } : {
         input_tokens: 0,
         cached_input_tokens: 0,
@@ -6466,7 +7347,7 @@ async function parseQoderNewIncremental({
         total_tokens: 0,
         billable_total_tokens: 0,
         total_cost_usd: 0,
-        conversation_count: 1,
+        conversation_count: isMainSession ? 1 : 0,
       };
       let projectKey = null;
       let projectRef = null;
@@ -6485,6 +7366,16 @@ async function parseQoderNewIncremental({
           projectRef = context?.projectRef || null;
         }
       }
+      // Same sessionId+msgId can appear in both the main transcript and a
+      // subagent transcript (mirrored id). currentByKey is last-wins and
+      // listQoderNewSessionFiles orders by localeCompare, so an unguarded
+      // subagent copy (conversation_count 0) could silently replace the main
+      // row's activity depending on file order. Precedence: a main-session
+      // record always wins a subagent copy; within the same class, last-wins
+      // stands so a streamed rewrite (the later, final token counts) is what
+      // gets booked — first-wins here would under-count subagent tokens.
+      const existing = currentByKey.get(messageKey);
+      if (existing?.isMainSession && !isMainSession) continue;
       currentByKey.set(messageKey, {
         totals,
         bucketStart,
@@ -6492,6 +7383,7 @@ async function parseQoderNewIncremental({
         projectKey,
         projectRef,
         filePath,
+        isMainSession,
       });
     }
     if (cb && (fileIdx % 50 === 0 || fileIdx === files.length - 1)) {
@@ -6519,7 +7411,7 @@ async function parseQoderNewIncremental({
       && (prev.projectKey || null) === (cur.projectKey || null)
       && (prev.totals?.total_cost_usd || 0) === (cur.totals.total_cost_usd || 0);
     if (unchanged) continue;
-    if (prev.totals && prev.bucketStart && prev.model) {
+    if (prev.totals && prev.bucketStart && prev.model && qoderRowCountsAsUsage(prev.totals)) {
       const oldBucket = getHourlyBucket(hourlyState, sourceKey, prev.model, prev.bucketStart);
       subtractTotals(oldBucket.totals, prev.totals);
       touchedBuckets.add(bucketKey(sourceKey, prev.model, prev.bucketStart));
@@ -6530,16 +7422,17 @@ async function parseQoderNewIncremental({
       }
     }
     if (cur) {
-      const bucket = getHourlyBucket(hourlyState, sourceKey, cur.model, cur.bucketStart);
-      addTotals(bucket.totals, cur.totals);
-      if (cur.totals.usage_precision) bucket.usage_precision = cur.totals.usage_precision;
-      // addTotals handles total_cost_usd via USD_TICKS, but credits cost is small; ensure it accumulates
-      touchedBuckets.add(bucketKey(sourceKey, cur.model, cur.bucketStart));
-      if (projectEnabled && cur.projectKey) {
-        const projectBucket = getProjectBucket(projectState, cur.projectKey, sourceKey, cur.bucketStart, cur.projectRef);
-        addTotals(projectBucket.totals, cur.totals);
-        if (cur.totals.usage_precision) projectBucket.usage_precision = cur.totals.usage_precision;
-        projectTouchedBuckets.add(projectBucketKey(cur.projectKey, sourceKey, cur.bucketStart));
+      if (qoderRowCountsAsUsage(cur.totals)) {
+        const bucket = getHourlyBucket(hourlyState, sourceKey, cur.model, cur.bucketStart);
+        addTotals(bucket.totals, cur.totals);
+        if (cur.totals.usage_precision) bucket.usage_precision = cur.totals.usage_precision;
+        touchedBuckets.add(bucketKey(sourceKey, cur.model, cur.bucketStart));
+        if (projectEnabled && cur.projectKey) {
+          const projectBucket = getProjectBucket(projectState, cur.projectKey, sourceKey, cur.bucketStart, cur.projectRef);
+          addTotals(projectBucket.totals, cur.totals);
+          if (cur.totals.usage_precision) projectBucket.usage_precision = cur.totals.usage_precision;
+          projectTouchedBuckets.add(projectBucketKey(cur.projectKey, sourceKey, cur.bucketStart));
+        }
       }
       qoderState.messages[key] = {
         totals: cur.totals,
@@ -6560,15 +7453,17 @@ async function parseQoderNewIncremental({
   // Add brand-new keys
   for (const [key, cur] of currentByKey.entries()) {
     if (qoderState.messages[key]) continue;
-    const bucket = getHourlyBucket(hourlyState, sourceKey, cur.model, cur.bucketStart);
-    addTotals(bucket.totals, cur.totals);
-    if (cur.totals.usage_precision) bucket.usage_precision = cur.totals.usage_precision;
-    touchedBuckets.add(bucketKey(sourceKey, cur.model, cur.bucketStart));
-    if (projectEnabled && cur.projectKey) {
-      const projectBucket = getProjectBucket(projectState, cur.projectKey, sourceKey, cur.bucketStart, cur.projectRef);
-      addTotals(projectBucket.totals, cur.totals);
-      if (cur.totals.usage_precision) projectBucket.usage_precision = cur.totals.usage_precision;
-      projectTouchedBuckets.add(projectBucketKey(cur.projectKey, sourceKey, cur.bucketStart));
+    if (qoderRowCountsAsUsage(cur.totals)) {
+      const bucket = getHourlyBucket(hourlyState, sourceKey, cur.model, cur.bucketStart);
+      addTotals(bucket.totals, cur.totals);
+      if (cur.totals.usage_precision) bucket.usage_precision = cur.totals.usage_precision;
+      touchedBuckets.add(bucketKey(sourceKey, cur.model, cur.bucketStart));
+      if (projectEnabled && cur.projectKey) {
+        const projectBucket = getProjectBucket(projectState, cur.projectKey, sourceKey, cur.bucketStart, cur.projectRef);
+        addTotals(projectBucket.totals, cur.totals);
+        if (cur.totals.usage_precision) projectBucket.usage_precision = cur.totals.usage_precision;
+        projectTouchedBuckets.add(projectBucketKey(cur.projectKey, sourceKey, cur.bucketStart));
+      }
     }
     qoderState.messages[key] = {
       totals: cur.totals,
@@ -7037,7 +7932,12 @@ async function parseCursorApiIncremental({
 
     const { normalizeCursorUsage } = require("./cursor-config");
     const delta = normalizeCursorUsage(record);
-    if (isAllZeroUsage(delta)) continue;
+    // isAllZeroUsage reads only the token fields, so a request-only row (0
+    // tokens across every column — e.g. bot/automation requests, issue #998)
+    // must not be dropped here: it is kept as a 1-request record pairing
+    // with the #997 cloud-side request retention. Rows that are all-zero
+    // AND carry no model identity are degenerate and stay skipped.
+    if (isAllZeroUsage(delta) && !String(record.model || "").trim()) continue;
 
     delta.conversation_count = 1;
 
@@ -9560,8 +10460,8 @@ async function parseKimiCodeIncremental({ wireFiles, cursors, queuePath, onProgr
     const prevIno = prevEntry.ino;
     const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
     const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
-    // Model is declared in a `config.update` near the file head; persist it on
-    // the cursor so incremental resumes (which start past that line) keep it.
+    // Persist the latest config/profile/request model so an incremental read
+    // starting after that declaration keeps the same attribution.
     let fileModel = (typeof prevEntry.model === "string" && prevEntry.model) || fallbackModel;
     if (stat.size <= startOffset) continue;
 
@@ -9576,8 +10476,10 @@ async function parseKimiCodeIncremental({ wireFiles, cursors, queuePath, onProgr
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
 
-      if (entry.type === "config.update") {
-        const alias = kimiCodeModelAlias(entry.modelAlias);
+      // Kimi Code 2.x can bind or reroute the model without config.update.
+      // These records precede step.end and carry the model actually requested.
+      if (["config.update", "profile.bind", "llm.request"].includes(entry.type)) {
+        const alias = kimiCodeModelAlias(entry.modelAlias || entry.model);
         if (alias) fileModel = alias;
         continue;
       }
@@ -10451,23 +11353,43 @@ async function parseCodebuddyIncremental({
 //      is accepted by workbuddySqliteUsageSnapshot.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function resolveWorkbuddyHome(env = process.env) {
-  const home = env.HOME || require("node:os").homedir();
-  if (env.WORKBUDDY_HOME) return env.WORKBUDDY_HOME;
+// WorkBuddy ships two regional builds that keep their data in sibling homes:
+//   ~/.workbuddy     — Tencent CN build (models: hy*/glm*/deepseek-*/auto)
+//   ~/.workbuddy-ai  — international build (models: gpt-5.6-*, gpt-6-*)
+// Both write byte-identical JSONL, so every reader below is shared and only
+// the home directory (and the bucket source key) differs. `variant` is also
+// the source key written into hourly buckets, so the two builds stay
+// separable in the dashboard and never share dedup state.
+const WORKBUDDY_VARIANTS = {
+  workbuddy: { dir: ".workbuddy", envVar: "WORKBUDDY_HOME" },
+  "workbuddy-ai": { dir: ".workbuddy-ai", envVar: "WORKBUDDY_AI_HOME" },
+};
+
+function resolveWorkbuddyVariant(variant) {
+  return Object.prototype.hasOwnProperty.call(WORKBUDDY_VARIANTS, variant)
+    ? variant
+    : "workbuddy";
+}
+
+function resolveWorkbuddyHome(env = process.env, variant = "workbuddy") {
+  const spec = WORKBUDDY_VARIANTS[resolveWorkbuddyVariant(variant)];
+  const home = env.HOME || env.USERPROFILE || require("node:os").homedir();
+  const configured = expandHome(env[spec.envVar], home);
+  if (configured) return configured;
   if (process.platform === "win32") {
     return pickWin32ProviderPath({
       env,
-      nativeValue: path.join(home, ".workbuddy"),
-      wslProviderDir: ".workbuddy",
+      nativeValue: path.join(home, spec.dir),
+      wslProviderDir: spec.dir,
     });
   }
-  return path.join(home, ".workbuddy");
+  return path.join(home, spec.dir);
 }
 
-function resolveWorkbuddyDefaultModel(env = process.env) {
+function resolveWorkbuddyDefaultModel(env = process.env, variant = "workbuddy") {
   const fallback = "auto";
   try {
-    const workbuddyHome = resolveWorkbuddyHome(env);
+    const workbuddyHome = resolveWorkbuddyHome(env, variant);
     if (!workbuddyHome) return fallback;
     const settingsPath = path.join(workbuddyHome, "settings.json");
     const raw = fssync.readFileSync(settingsPath, "utf8");
@@ -10487,8 +11409,8 @@ function resolveWorkbuddyDefaultModel(env = process.env) {
 // ~/.workbuddy/traces/<pid>/trace_*.json. Those summaries are useful only when
 // the detailed JSONL for a session is absent, so they are returned as typed
 // entries and parsed after JSONL (JSONL remains authoritative when both exist).
-function resolveWorkbuddyProjectFiles(env = process.env) {
-  const workbuddyHome = resolveWorkbuddyHome(env);
+function resolveWorkbuddyProjectFiles(env = process.env, variant = "workbuddy") {
+  const workbuddyHome = resolveWorkbuddyHome(env, variant);
   if (!workbuddyHome) return [];
   const projectsDir = path.join(workbuddyHome, "projects");
   const files = [];
@@ -10590,17 +11512,110 @@ function workbuddySqliteUsageSnapshot(row) {
   };
 }
 
+// WorkBuddy writes OpenAI/DeepSeek-shaped rawUsage on every LLM round-trip.
+// The totals pass and the project pass below need the same breakdown, so the
+// arithmetic lives here once. Callers treat total_tokens === 0 as "no billable
+// usage": every component is non-negative, so that is equivalent to testing
+// each field for zero.
+function workbuddyUsageDelta(rawUsage) {
+  const promptTokens = toNonNegativeInt(rawUsage.prompt_tokens);
+  const completionTokens = toNonNegativeInt(rawUsage.completion_tokens);
+  const promptDetails =
+    rawUsage.prompt_tokens_details && typeof rawUsage.prompt_tokens_details === "object"
+      ? rawUsage.prompt_tokens_details
+      : {};
+  const completionDetails =
+    rawUsage.completion_tokens_details && typeof rawUsage.completion_tokens_details === "object"
+      ? rawUsage.completion_tokens_details
+      : {};
+
+  // Cache reads are mirrored across up to three fields depending on which
+  // upstream the auto-router used; take the largest non-zero mirror.
+  const cacheRead = Math.max(
+    toNonNegativeInt(rawUsage.cache_read_input_tokens),
+    toNonNegativeInt(promptDetails.cached_tokens),
+    toNonNegativeInt(rawUsage.prompt_cache_hit_tokens),
+  );
+  const cacheCreation = toNonNegativeInt(rawUsage.cache_creation_input_tokens);
+  // prompt_tokens is the FULL prompt: subtract BOTH reads and writes so
+  // input_tokens is pure non-cached input (no double-counting cache writes).
+  const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
+  // completion_tokens INCLUDES reasoning (verified: total == prompt+completion).
+  const reasoningTokens = Math.min(
+    completionTokens,
+    toNonNegativeInt(completionDetails.reasoning_tokens),
+  );
+  const outputTokens = Math.max(0, completionTokens - reasoningTokens);
+
+  return {
+    input_tokens: inputTokens,
+    cached_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreation,
+    output_tokens: outputTokens,
+    reasoning_output_tokens: reasoningTokens,
+    total_tokens: inputTokens + outputTokens + cacheRead + cacheCreation + reasoningTokens,
+    conversation_count: 1,
+  };
+}
+
+// WorkBuddy stamps `cwd` on its records rather than in a session header, and a
+// session can open with a record that lacks it while later appends omit it
+// altogether. Resolve it from a bounded prefix of the file so every record in
+// the incremental window is attributed, not just the ones that happen to carry
+// their own cwd. A file with no recoverable cwd stays outside project
+// attribution — there is nothing to attribute it to.
+async function resolveWorkbuddyFileCwd(filePath, maxScanBytes = 8 * 1024 * 1024) {
+  let stream;
+  try {
+    const stat = fssync.statSync(filePath);
+    if (stat.size <= 0) return null;
+    stream = fssync.createReadStream(filePath, {
+      start: 0,
+      end: Math.min(stat.size, maxScanBytes) - 1,
+    });
+  } catch {
+    return null;
+  }
+  let cwd = null;
+  try {
+    for await (const record of physicalJsonlRecords(stream, {
+      invalidUtf8: "record",
+      maxRecordBytes: OMP_LIKE_MAX_RECORD_BYTES,
+    })) {
+      if (!record.line || !record.line.trim()) continue;
+      let entry;
+      try { entry = JSON.parse(record.line); } catch { continue; }
+      if (entry && typeof entry === "object" && typeof entry.cwd === "string" && entry.cwd) {
+        cwd = entry.cwd;
+        break;
+      }
+    }
+  } catch {
+    // No recoverable cwd — the file stays un-attributed.
+  } finally {
+    try { stream.destroy(); } catch {}
+  }
+  return cwd;
+}
+
 async function parseWorkbuddyIncremental({
   projectFiles,
   cursors,
   queuePath,
+  projectQueuePath,
   onProgress,
   env,
   defaultModel,
+  source = "workbuddy",
+  publicRepoResolver,
 } = {}) {
   await ensureDir(path.dirname(queuePath));
+  // `source` doubles as the variant selector and the bucket source key, so the
+  // CN install (~/.workbuddy) and the international install (~/.workbuddy-ai)
+  // get independent cursor namespaces and never share dedup state.
+  const variant = resolveWorkbuddyVariant(source);
   const workbuddyState =
-    cursors.workbuddy && typeof cursors.workbuddy === "object" ? cursors.workbuddy : {};
+    cursors[variant] && typeof cursors[variant] === "object" ? cursors[variant] : {};
   const seenIds = new Set(
     Array.isArray(workbuddyState.seenIds) ? workbuddyState.seenIds : [],
   );
@@ -10624,22 +11639,61 @@ async function parseWorkbuddyIncremental({
   );
   const detailedSessionsWithUsage = new Set();
 
+  // The shared normalizers copy the bucket maps but alias each bucket/totals
+  // object, and the enqueue helpers stamp queuedKey before appendFile runs.
+  // Give the buckets this parser can mutate private copies so a failed append
+  // leaves the caller's published state untouched — the same staging contract
+  // the Devin reader uses. Callers retry from unchanged offsets, so a polluted
+  // published state would add the same usage twice.
+  const ownsWorkbuddyBucket = (key) =>
+    (normalizeSourceInput(key.split(BUCKET_SEPARATOR)[0]) || DEFAULT_SOURCE) === variant;
+  const ownsWorkbuddyProjectBucket = (key) => {
+    // Project keys are `projectKey|source|hour`; a projectKey may itself
+    // contain the separator, so read the source segment from the right.
+    const last = key.lastIndexOf(BUCKET_SEPARATOR);
+    const prev = last > 0 ? key.lastIndexOf(BUCKET_SEPARATOR, last - 1) : -1;
+    const source = prev >= 0 ? key.slice(prev + 1, last) : "";
+    return (normalizeSourceInput(source) || DEFAULT_SOURCE) === variant;
+  };
+
+  // Project attribution runs as a second, independent pass over the same JSONL
+  // files (see "Project pass" below). It keeps its own offsets and seen-set, so
+  // an install that already has totals backfills project history on upgrade
+  // without re-counting a single token in the totals queue.
+  const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
+  const projectState = projectEnabled ? normalizeProjectState(cursors?.projectHourly) : null;
+  if (projectState) {
+    projectState.buckets = stageProviderBuckets(projectState.buckets, ownsWorkbuddyProjectBucket);
+  }
+  const projectTouchedBuckets = projectEnabled ? new Set() : null;
+  const projectMetaCache = projectEnabled ? new Map() : null;
+  const publicRepoCache = projectEnabled ? new Map() : null;
+  const projectSeenIds = new Set(
+    Array.isArray(workbuddyState.projectSeenIds) ? workbuddyState.projectSeenIds : [],
+  );
+  const projectFileOffsets =
+    workbuddyState.projectFileOffsets && typeof workbuddyState.projectFileOffsets === "object"
+      ? { ...workbuddyState.projectFileOffsets }
+      : {};
+  let projectBucketsQueued = 0;
+  let projectCursorUpdated = false;
+
   const allFiles = Array.isArray(projectFiles)
     ? projectFiles
-    : resolveWorkbuddyProjectFiles(env || process.env);
+    : resolveWorkbuddyProjectFiles(env || process.env, variant);
   const jsonlFiles = allFiles.filter((entry) => typeof entry === "string");
   const traceFiles = allFiles.filter(
     (entry) => entry && typeof entry === "object" && typeof entry.path === "string" && entry.kind === "trace",
   );
   const files = [...jsonlFiles, ...traceFiles];
-  const fallbackModel = defaultModel || resolveWorkbuddyDefaultModel(env || process.env);
+  const fallbackModel = defaultModel || resolveWorkbuddyDefaultModel(env || process.env, variant);
 
-  const workbuddyHome = resolveWorkbuddyHome(env || process.env);
+  const workbuddyHome = resolveWorkbuddyHome(env || process.env, variant);
   const dbPath = workbuddyHome ? path.join(workbuddyHome, "workbuddy.db") : null;
   const dbExists = Boolean(dbPath && fssync.existsSync(dbPath));
 
   if (files.length === 0 && !dbExists) {
-    cursors.workbuddy = {
+    cursors[variant] = {
       ...workbuddyState,
       seenIds: Array.from(seenIds),
       seenTraceIds: Array.from(seenTraceIds),
@@ -10649,10 +11703,15 @@ async function parseWorkbuddyIncremental({
       detailedSessions,
       updatedAt: new Date().toISOString(),
     };
-    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0, projectBucketsQueued: 0, projectCursorUpdated: false };
   }
 
   const hourlyState = normalizeHourlyState(cursors?.hourly);
+  hourlyState.buckets = stageProviderBuckets(hourlyState.buckets, ownsWorkbuddyBucket);
+  hourlyState.groupQueued =
+    hourlyState.groupQueued && typeof hourlyState.groupQueued === "object"
+      ? { ...hourlyState.groupQueued }
+      : {};
   const touchedBuckets = new Set();
   const cb = typeof onProgress === "function" ? onProgress : null;
   let recordsProcessed = 0;
@@ -10672,26 +11731,14 @@ async function parseWorkbuddyIncremental({
     const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
     if (stat.size <= startOffset) continue;
 
-    let stream;
-    try {
-      stream = fssync.createReadStream(filePath, {
-        encoding: "utf8",
-        start: startOffset,
-      });
-    } catch { continue; }
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-    for await (const line of rl) {
-      if (!line || !line.trim()) continue;
-      let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
-      if (!entry || typeof entry !== "object") continue;
+    const committedEndOffset = await scanOmpLikeTranscript(filePath, startOffset, OMP_LIKE_MAX_RECORD_BYTES, (entry) => {
+      if (!entry || typeof entry !== "object") return;
 
       // Usage is carried on ANY record with providerData.rawUsage — assistant
       // messages AND function_call records. Aggregate them all; dedup per id.
       const provider = entry.providerData;
       const rawUsage = provider && typeof provider === "object" ? provider.rawUsage : null;
-      if (!rawUsage || typeof rawUsage !== "object") continue;
+      if (!rawUsage || typeof rawUsage !== "object") return;
 
       const sessionId =
         typeof entry.sessionId === "string" && entry.sessionId
@@ -10699,10 +11746,10 @@ async function parseWorkbuddyIncremental({
           : path.basename(filePath, ".jsonl");
       const sqliteSession = sqliteSessions[sessionId];
       if (sqliteSession?.detailed || tracedSessionIds.has(sessionId)) {
-        continue;
+        return;
       }
       const tsMs =
-        Number.isFinite(Number(entry.timestamp)) && Number(entry.timestamp) > 0
+        Number.isFinite(new Date(Number(entry.timestamp)).getTime()) && Number(entry.timestamp) > 0
           ? Number(entry.timestamp)
           : null;
       // One usage record per LLM round-trip; providerData.messageId is the
@@ -10719,55 +11766,24 @@ async function parseWorkbuddyIncremental({
                 : tsMs != null
                   ? `${sessionId}:${tsMs}`
                   : null;
-      if (!messageId) continue;
-      if (seenIds.has(messageId)) continue;
+      if (!messageId) return;
+      if (seenIds.has(messageId)) return;
 
       recordsProcessed++;
 
-      const promptTokens = toNonNegativeInt(rawUsage.prompt_tokens);
-      const completionTokens = toNonNegativeInt(rawUsage.completion_tokens);
-      const promptDetails =
-        rawUsage.prompt_tokens_details && typeof rawUsage.prompt_tokens_details === "object"
-          ? rawUsage.prompt_tokens_details
-          : {};
-      const completionDetails =
-        rawUsage.completion_tokens_details && typeof rawUsage.completion_tokens_details === "object"
-          ? rawUsage.completion_tokens_details
-          : {};
-
-      // Cache reads are mirrored across up to three fields depending on which
-      // upstream the auto-router used; take the largest non-zero mirror.
-      const cacheRead = Math.max(
-        toNonNegativeInt(rawUsage.cache_read_input_tokens),
-        toNonNegativeInt(promptDetails.cached_tokens),
-        toNonNegativeInt(rawUsage.prompt_cache_hit_tokens),
-      );
-      const cacheCreation = toNonNegativeInt(rawUsage.cache_creation_input_tokens);
-      // prompt_tokens is the FULL prompt: subtract BOTH reads and writes so
-      // input_tokens is pure non-cached input (no double-counting cache writes).
-      const inputTokens = Math.max(0, promptTokens - cacheRead - cacheCreation);
-      // completion_tokens INCLUDES reasoning (verified: total == prompt+completion).
-      const reasoningTokens = Math.min(completionTokens, toNonNegativeInt(completionDetails.reasoning_tokens));
-      const outputTokens = Math.max(0, completionTokens - reasoningTokens);
-
-      if (
-        inputTokens === 0 &&
-        outputTokens === 0 &&
-        cacheRead === 0 &&
-        cacheCreation === 0 &&
-        reasoningTokens === 0
-      ) {
+      const delta = workbuddyUsageDelta(rawUsage);
+      if (delta.total_tokens === 0) {
         seenIds.add(messageId);
-        continue;
+        return;
       }
 
       if (tsMs == null) {
         seenIds.add(messageId);
-        continue;
+        return;
       }
       const tsIso = new Date(tsMs).toISOString();
       const bucketStart = toUtcHalfHourStart(tsIso);
-      if (!bucketStart) continue;
+      if (!bucketStart) return;
 
       const model =
         normalizeModelInput(provider.model) ||
@@ -10775,20 +11791,9 @@ async function parseWorkbuddyIncremental({
         normalizeModelInput(entry.model) ||
         fallbackModel;
 
-      const delta = {
-        input_tokens: inputTokens,
-        cached_input_tokens: cacheRead,
-        cache_creation_input_tokens: cacheCreation,
-        output_tokens: outputTokens,
-        reasoning_output_tokens: reasoningTokens,
-        total_tokens:
-          inputTokens + outputTokens + cacheRead + cacheCreation + reasoningTokens,
-        conversation_count: 1,
-      };
-
-      const bucket = getHourlyBucket(hourlyState, "workbuddy", model, bucketStart);
+      const bucket = getHourlyBucket(hourlyState, variant, model, bucketStart);
       addTotals(bucket.totals, delta);
-      touchedBuckets.add(bucketKey("workbuddy", model, bucketStart));
+      touchedBuckets.add(bucketKey(variant, model, bucketStart));
       seenIds.add(messageId);
       // Keep legacy entry-id keys alongside the response id so upgrading a
       // cursor cannot replay a row that an older build already counted.
@@ -10808,15 +11813,175 @@ async function parseWorkbuddyIncremental({
           bucketsQueued: touchedBuckets.size,
         });
       }
-    }
+    }, { recoverReadErrors: true });
 
-    let postStat = stat;
-    try { postStat = fssync.statSync(filePath); } catch {}
+    // As in the project pass, acknowledge only records consumed in full. An
+    // unfinished tail or an append after EOF must remain visible next sync.
     fileOffsets[filePath] = {
-      size: postStat.size,
-      mtimeMs: postStat.mtimeMs,
-      ino: postStat.ino,
+      size: committedEndOffset,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
     };
+  }
+
+  // ── Project pass ───────────────────────────────────────────────────────
+  // WorkBuddy stamps `cwd` on its records, so unlike the trace summaries below
+  // there is nothing to infer: attribute each round-trip to the git repository
+  // its cwd belongs to. This is a second loop over the same files with its own
+  // cursor, so an install that already has totals backfills project history on
+  // upgrade without touching (or double-counting) them.
+  if (projectEnabled) {
+    for (let fileIdx = 0; fileIdx < jsonlFiles.length; fileIdx++) {
+      const filePath = jsonlFiles[fileIdx];
+      let stat;
+      try { stat = fssync.statSync(filePath); } catch { continue; }
+
+      const prevEntry = projectFileOffsets[filePath] || {};
+      const prevSize = Number(prevEntry.size) || 0;
+      const prevIno = prevEntry.ino;
+      const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
+      const truncated = stat.size < prevSize;
+      const startOffset = truncated || inodeChanged ? 0 : prevSize;
+      if (stat.size <= startOffset) continue;
+
+      // cwd is fixed for a session file's lifetime. Reuse the resolved value
+      // while it is the same file, otherwise read it from the file head — not
+      // from the incremental window, which may hold only appends that omit it.
+      // Truncation (same inode, smaller size) must drop the cached cwd: the
+      // replacement transcript may belong to a different checkout.
+      let cwd =
+        !inodeChanged && !truncated && typeof prevEntry.cwd === "string"
+          ? prevEntry.cwd
+          : null;
+
+      // No recoverable cwd yet: do not advance past history. A later append
+      // may stamp cwd, and early records must still be attributable then.
+      // Check the unchanged-probe cache BEFORE the head scan so idle syncs do
+      // not re-read up to 8 MiB of JSONL on every pass.
+      if (
+        !cwd &&
+        Number(prevEntry.noCwdProbedSize) === stat.size &&
+        prevEntry.ino === stat.ino &&
+        Number(prevEntry.size) === startOffset
+      ) {
+        continue;
+      }
+      if (!cwd) cwd = await resolveWorkbuddyFileCwd(filePath);
+      if (!cwd) {
+        projectCursorUpdated = true;
+        projectFileOffsets[filePath] = {
+          size: startOffset,
+          mtimeMs: stat.mtimeMs,
+          ino: stat.ino,
+          noCwdProbedSize: stat.size,
+        };
+        continue;
+      }
+
+      let projectRef = null;
+      let projectKey = null;
+      const projectContext = await resolveProjectContextForPath({
+        startDir: wsl.mapWslCwdToUnc(cwd, filePath),
+        projectMetaCache,
+        publicRepoCache,
+        publicRepoResolver,
+        projectState,
+      });
+      projectRef = projectContext?.projectRef || null;
+      projectKey = projectContext?.projectKey || null;
+
+      // cwd resolved but the repo is not yet public_verified (or has no git
+      // checkout): keep the offset unadvanced so a later sync can retry, but
+      // do not JSON-parse the transcript on every pass — there is nothing to
+      // attribute until both identifiers exist.
+      if (!projectKey || !projectRef) {
+        projectCursorUpdated = true;
+        projectFileOffsets[filePath] = {
+          size: startOffset,
+          mtimeMs: stat.mtimeMs,
+          ino: stat.ino,
+          cwd,
+        };
+        continue;
+      }
+
+      const committedEndOffset = await scanOmpLikeTranscript(
+        filePath,
+        startOffset,
+        OMP_LIKE_MAX_RECORD_BYTES,
+        (entry) => {
+          // Mirror the totals pass: a JSON null / non-object line must not
+          // abort the whole WorkBuddy parse (and strand both cursors).
+          if (!entry || typeof entry !== "object") return;
+
+          const provider = entry.providerData;
+          const rawUsage = provider && typeof provider === "object" ? provider.rawUsage : null;
+          if (!rawUsage || typeof rawUsage !== "object") return;
+
+          // Mirror the totals pass's suppression rules so the project queue
+          // never reports a session the totals queue deliberately skipped.
+          const sessionId =
+            typeof entry.sessionId === "string" && entry.sessionId
+              ? entry.sessionId
+              : path.basename(filePath, ".jsonl");
+          const sqliteSession = sqliteSessions[sessionId];
+          if (sqliteSession?.detailed || tracedSessionIds.has(sessionId)) return;
+
+          const tsMs =
+            Number.isFinite(new Date(Number(entry.timestamp)).getTime()) && Number(entry.timestamp) > 0
+              ? Number(entry.timestamp)
+              : null;
+          if (tsMs == null) return;
+
+          // Same response-level id preference as the totals pass, so both
+          // queues dedup on identical keys.
+          const messageId =
+            typeof provider?.messageId === "string" && provider.messageId
+              ? provider.messageId
+              : typeof entry.uuid === "string" && entry.uuid
+                ? entry.uuid
+                : typeof entry.id === "string" && entry.id
+                  ? entry.id
+                  : `${sessionId}:${tsMs}`;
+          if (projectSeenIds.has(messageId)) return;
+          projectSeenIds.add(messageId);
+          // The totals pass also registers the raw entry id so an older or
+          // rewritten copy of the same record cannot be counted twice; the
+          // project pass has to keep the same alias.
+          if (typeof entry.id === "string" && entry.id && entry.id !== messageId) {
+            projectSeenIds.add(entry.id);
+          }
+
+          const delta = workbuddyUsageDelta(rawUsage);
+          if (delta.total_tokens === 0) return;
+
+          const bucketStart = toUtcHalfHourStart(new Date(tsMs).toISOString());
+          if (!bucketStart) return;
+
+          const projectBucket = getProjectBucket(
+            projectState,
+            projectKey,
+            source,
+            bucketStart,
+            projectRef,
+          );
+          addTotals(projectBucket.totals, delta);
+          projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
+        },
+        { recoverReadErrors: true },
+      );
+
+      // Commit only past records that were read in full: a record appended
+      // while this pass was running, or an unfinished tail line, has to stay
+      // visible to the next sync. Only advance after successful attribution.
+      projectCursorUpdated = true;
+      projectFileOffsets[filePath] = {
+        size: committedEndOffset,
+        mtimeMs: stat.mtimeMs,
+        ino: stat.ino,
+        cwd,
+      };
+    }
   }
 
   // Trace summaries are a fallback for sessions whose JSONL has no detailed
@@ -10829,19 +11994,23 @@ async function parseWorkbuddyIncremental({
     const entry = traceFiles[fileIdx];
     const filePath = entry.path;
     let stat;
-    try { stat = fssync.statSync(filePath); } catch { continue; }
-    const prevEntry = fileOffsets[filePath] || {};
-    const prevSize = Number(prevEntry.size) || 0;
-    const prevIno = prevEntry.ino;
-    const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
-    const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
-    if (stat.size <= startOffset) continue;
-
     let traceDoc;
+    let traceFd;
     try {
-      traceDoc = JSON.parse(fssync.readFileSync(filePath, "utf8"));
+      traceFd = fssync.openSync(filePath, "r");
+      stat = fssync.fstatSync(traceFd);
+      if (!stat.isFile()) continue;
+      const prevEntry = fileOffsets[filePath] || {};
+      const prevSize = Number(prevEntry.size) || 0;
+      const prevIno = prevEntry.ino;
+      const inodeChanged = typeof prevIno === "number" && prevIno !== stat.ino;
+      const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
+      if (stat.size <= startOffset) continue;
+      traceDoc = JSON.parse(fssync.readFileSync(traceFd, "utf8"));
     } catch {
       continue;
+    } finally {
+      if (traceFd !== undefined) fssync.closeSync(traceFd);
     }
     const trace = traceDoc && typeof traceDoc === "object" && traceDoc.trace && typeof traceDoc.trace === "object"
       ? traceDoc.trace
@@ -10893,9 +12062,9 @@ async function parseWorkbuddyIncremental({
       total_tokens: inputTokens + totalCached + totalOutput,
       conversation_count: 1,
     };
-    const bucket = getHourlyBucket(hourlyState, "workbuddy", model, bucketStart);
+    const bucket = getHourlyBucket(hourlyState, variant, model, bucketStart);
     addTotals(bucket.totals, delta);
-    touchedBuckets.add(bucketKey("workbuddy", model, bucketStart));
+    touchedBuckets.add(bucketKey(variant, model, bucketStart));
     seenTraceIds.add(traceId);
     tracedSessionIds.add(sessionId);
     recordsProcessed++;
@@ -11028,9 +12197,9 @@ async function parseWorkbuddyIncremental({
           conversation_count: Object.keys(previousTokens).every((key) => toNonNegativeInt(previousTokens[key]) === 0) || isReset ? 1 : 0,
         };
 
-        const bucket = getHourlyBucket(hourlyState, "workbuddy", model, bucketStart);
+        const bucket = getHourlyBucket(hourlyState, variant, model, bucketStart);
         addTotals(bucket.totals, delta);
-        touchedBuckets.add(bucketKey("workbuddy", model, bucketStart));
+        touchedBuckets.add(bucketKey(variant, model, bucketStart));
         sqliteSessions[sessionId] = {
           used: usedNow,
           updatedAt: updatedAtRaw,
@@ -11073,6 +12242,23 @@ async function parseWorkbuddyIncremental({
       ? tracedSessionArr.slice(tracedSessionArr.length - 10_000)
       : tracedSessionArr;
 
+  const projectSeenArr = Array.from(projectSeenIds);
+  const cappedProjectSeenIds =
+    projectSeenArr.length > 10_000
+      ? projectSeenArr.slice(projectSeenArr.length - 10_000)
+      : projectSeenArr;
+
+  // Publish only after both appends succeed: a throw here leaves `cursors`
+  // untouched, so a retry re-derives the same contribution from the same
+  // offsets instead of adding it on top of a half-applied state.
+  projectBucketsQueued = projectEnabled
+    ? await enqueueTouchedProjectBuckets({
+        projectQueuePath,
+        projectState,
+        projectTouchedBuckets,
+      })
+    : 0;
+
   const bucketsQueued = await enqueueTouchedBuckets({
     queuePath,
     hourlyState,
@@ -11081,7 +12267,11 @@ async function parseWorkbuddyIncremental({
   const updatedAt = new Date().toISOString();
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
-  cursors.workbuddy = {
+  if (projectState) {
+    projectState.updatedAt = updatedAt;
+    cursors.projectHourly = projectState;
+  }
+  cursors[variant] = {
     ...workbuddyState,
     seenIds: cappedSeen,
     seenTraceIds: cappedSeenTraceIds,
@@ -11089,10 +12279,22 @@ async function parseWorkbuddyIncremental({
     fileOffsets,
     sqliteSessions: cappedSqliteSessions,
     detailedSessions: cappedDetailedSessions,
+    ...(projectEnabled
+      ? {
+          projectSeenIds: cappedProjectSeenIds,
+          projectFileOffsets,
+        }
+      : {}),
     updatedAt,
   };
 
-  return { recordsProcessed, eventsAggregated, bucketsQueued };
+  return {
+    recordsProcessed,
+    eventsAggregated,
+    bucketsQueued,
+    projectBucketsQueued,
+    projectCursorUpdated: projectEnabled && projectCursorUpdated,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -11427,7 +12629,8 @@ async function resolveOmoFileCwd(filePath) {
 
 function resolveKilocodeRoots(env = process.env) {
   if (typeof env.TOKENTRACKER_KILOCODE_ROOTS === "string" && env.TOKENTRACKER_KILOCODE_ROOTS.trim()) {
-    return env.TOKENTRACKER_KILOCODE_ROOTS.split(":")
+    // Use the host's PATH delimiter so a Windows drive colon stays intact.
+    return env.TOKENTRACKER_KILOCODE_ROOTS.split(path.delimiter)
       .map((r) => r.trim())
       .filter(Boolean);
   }
@@ -13236,6 +14439,279 @@ async function parseLmstudioIncremental({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenSquilla
+//
+// Read only the finalized usage ledger's model rows. Transcript entries and
+// message content are not needed for token attribution and are never selected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OPENSQUILLA_SOURCE = "opensquilla";
+
+function resolveOpenSquillaPath(value, home) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return null;
+  if (raw === "~") return path.resolve(home);
+  if (raw.startsWith("~/") || raw.startsWith("~\\")) {
+    return path.resolve(home, raw.slice(2));
+  }
+  return path.resolve(raw);
+}
+
+function resolveOpenSquillaDbPaths(env = process.env, deps = {}) {
+  const home = deps.home || env.HOME || env.USERPROFILE || os.homedir();
+  const platform = deps.platform || process.platform;
+  const dbOverride = resolveOpenSquillaPath(env.TOKENTRACKER_OPENSQUILLA_DB, home);
+  if (dbOverride) return [dbOverride];
+
+  const gatewayStateDir = resolveOpenSquillaPath(env.OPENSQUILLA_GATEWAY_STATE_DIR, home);
+  if (gatewayStateDir) return [path.join(gatewayStateDir, "sessions.db")];
+
+  const stateHome = resolveOpenSquillaPath(env.OPENSQUILLA_STATE_DIR, home);
+  if (stateHome) return [path.join(stateHome, "state", "sessions.db")];
+
+  const profileHomeOverride = typeof env.OPENSQUILLA_HOME === "string"
+    ? env.OPENSQUILLA_HOME.trim()
+    : "";
+  const profileOverride = typeof env.OPENSQUILLA_PROFILE === "string"
+    ? env.OPENSQUILLA_PROFILE.trim()
+    : "";
+  if (profileHomeOverride || profileOverride) {
+    const profilesRoot = resolveOpenSquillaPath(
+      profileHomeOverride || path.join(home, ".opensquilla", "profiles"),
+      home,
+    );
+    const profile = profileOverride || "default";
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(profile)) return [];
+    return [path.join(profilesRoot, profile, "state", "sessions.db")];
+  }
+
+  const paths = [path.join(home, ".opensquilla", "state", "sessions.db")];
+  let userDataRoot;
+  if (platform === "win32") {
+    userDataRoot = env.APPDATA || path.join(home, "AppData", "Roaming");
+  } else if (platform === "darwin") {
+    userDataRoot = path.join(home, "Library", "Application Support");
+  } else {
+    userDataRoot = env.XDG_CONFIG_HOME || path.join(home, ".config");
+  }
+  paths.unshift(path.join(
+    userDataRoot,
+    "@opensquilla",
+    "desktop-electron",
+    "opensquilla",
+    "state",
+    "sessions.db",
+  ));
+
+  const seen = new Set();
+  return paths.filter((dbPath) => {
+    const resolved = path.resolve(dbPath);
+    const key = platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function readOpenSquillaUsageRows(dbPath, sqliteOptions = {}) {
+  if (!dbPath || !fssync.existsSync(dbPath)) return [];
+  const options = {
+    label: "OpenSquilla",
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: 30_000,
+    ...sqliteOptions,
+    readOnly: true,
+    throwOnReadFailure: true,
+  };
+  const tables = new Set(
+    (await readSqliteJsonRowsAsync(
+      dbPath,
+      "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('usage_events','usage_event_items')",
+      options,
+    )).map((row) => row?.name).filter(Boolean),
+  );
+  if (!tables.has("usage_events") || !tables.has("usage_event_items")) return [];
+  const sql = [
+    "SELECT e.event_id, e.completed_at_ms, i.ordinal,",
+    "COALESCE(i.model, e.model) AS model, i.input_tokens, i.output_tokens,",
+    "i.reasoning_tokens, i.cache_read_tokens, i.cache_write_tokens, i.total_tokens",
+    "FROM usage_events AS e",
+    "JOIN usage_event_items AS i ON i.event_id = e.event_id",
+    "WHERE e.status = 'finalized' AND e.completed_at_ms IS NOT NULL",
+    "ORDER BY e.completed_at_ms, e.event_id, i.ordinal",
+  ].join(" ");
+  return readSqliteJsonRowsAsync(dbPath, sql, options);
+}
+
+function normalizeOpenSquillaUsageRow(row) {
+  const eventId = typeof row?.event_id === "string" ? row.event_id.trim() : "";
+  if (!eventId || row?.ordinal == null) return null;
+
+  // OpenSquilla stores input as a cache-inclusive total and reasoning as an
+  // output subset; normalize both before writing TokenTracker queue rows.
+  const totals = normalizeLocalStudioTokens({
+    input_tokens: row.input_tokens,
+    output_tokens: row.output_tokens,
+    reasoning_tokens: row.reasoning_tokens,
+    cached_tokens: row.cache_read_tokens,
+    cache_creation_input_tokens: row.cache_write_tokens,
+    total_tokens: row.total_tokens,
+  });
+  const timestampMs = coerceEpochMs(row.completed_at_ms);
+  const bucketStart = timestampMs
+    ? toUtcHalfHourStart(new Date(timestampMs).toISOString())
+    : null;
+  if (!totals || !bucketStart) return null;
+
+  return {
+    key: "opensquilla:" + eventId + ":" + String(toNonNegativeInt(row.ordinal)),
+    model: normalizeModelInput(row.model) || DEFAULT_MODEL,
+    bucketStart,
+    totals,
+  };
+}
+
+async function parseOpenSquillaIncremental({
+  dbPaths,
+  cursors,
+  queuePath,
+  onProgress,
+  env,
+  sqliteOptions,
+} = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const priorState = cursors.opensquilla && typeof cursors.opensquilla === "object"
+    ? cursors.opensquilla
+    : {};
+  // Copy before mutate so a failed queue append leaves committed cursors intact.
+  const messages = priorState.messages && typeof priorState.messages === "object"
+    ? { ...priorState.messages }
+    : {};
+  const fingerprints = priorState.fingerprints && typeof priorState.fingerprints === "object"
+    ? { ...priorState.fingerprints }
+    : {};
+  const requestedPaths = Array.isArray(dbPaths) && dbPaths.length
+    ? dbPaths
+    : resolveOpenSquillaDbPaths(env || process.env);
+  const seenPaths = new Set();
+  const availablePaths = requestedPaths.filter((dbPath) => {
+    if (typeof dbPath !== "string" || !dbPath.trim() || !fssync.existsSync(dbPath)) return false;
+    const resolved = path.resolve(dbPath);
+    const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    if (seenPaths.has(key)) return false;
+    seenPaths.add(key);
+    return true;
+  });
+  // No currently readable DB is treated as temporary unavailability — keep
+  // prior observations rather than wiping totals.
+  if (availablePaths.length === 0) {
+    cursors.opensquilla = { ...priorState, messages, fingerprints, updatedAt: new Date().toISOString() };
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  const pathFingerprints = new Map();
+  let databaseChanged = false;
+  const currentPathKeys = new Set();
+  for (const dbPath of availablePaths) {
+    const key = path.resolve(dbPath);
+    currentPathKeys.add(key);
+    const fingerprint = sqliteSidecarFingerprint(dbPath);
+    pathFingerprints.set(key, fingerprint);
+    if (!fingerprints[key] || !sameSqliteFingerprint(fingerprint, fingerprints[key])) {
+      databaseChanged = true;
+    }
+  }
+  // A removed Desktop/CLI DB must also trigger reconciliation so orphaned
+  // observations can be retracted (fingerprint-only checks would miss this).
+  for (const key of Object.keys(fingerprints)) {
+    if (!currentPathKeys.has(key)) {
+      databaseChanged = true;
+      break;
+    }
+  }
+  if (!databaseChanged) {
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  // The Desktop profile is first in the default path list. If a migrated CLI
+  // profile retains the same event IDs, prefer the active Desktop copy and
+  // count each model row only once.
+  const rowsByEventItem = new Map();
+  for (const dbPath of availablePaths) {
+    const dbRows = await readOpenSquillaUsageRows(dbPath, sqliteOptions);
+    for (const row of dbRows) {
+      const eventId = typeof row?.event_id === "string" ? row.event_id.trim() : "";
+      if (!eventId || row?.ordinal == null) continue;
+      const key = eventId + ":" + String(toNonNegativeInt(row.ordinal));
+      if (!rowsByEventItem.has(key)) rowsByEventItem.set(key, row);
+    }
+  }
+  const rows = Array.from(rowsByEventItem.values());
+  // structuredClone so a failed enqueueTouchedBuckets cannot leave mutated
+  // totals committed while opensquilla.messages stays unchanged (retry would
+  // subtract again). Same pattern as TRAE / session reconcilers.
+  const hourlyState = structuredClone(normalizeHourlyState(cursors?.hourly));
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  let eventsAggregated = 0;
+  const currentKeys = new Set();
+  for (let index = 0; index < rows.length; index++) {
+    const event = normalizeOpenSquillaUsageRow(rows[index]);
+    if (event) currentKeys.add(event.key);
+    if (event && reconcilePassiveUsageEvent({
+      event,
+      source: OPENSQUILLA_SOURCE,
+      messages,
+      hourlyState,
+      touchedBuckets,
+    })) eventsAggregated += 1;
+    if (cb) {
+      cb({
+        index: index + 1,
+        total: rows.length,
+        recordsProcessed: index + 1,
+        eventsAggregated,
+        bucketsQueued: touchedBuckets.size,
+      });
+    }
+  }
+
+  // Retract observations that disappeared with a removed database (or were
+  // deleted from the remaining DB). Overlapping event IDs keep Desktop-first
+  // totals via reconcilePassiveUsageEvent above.
+  for (const key of Object.keys(messages)) {
+    if (!key.startsWith("opensquilla:") || currentKeys.has(key)) continue;
+    const previous = messages[key];
+    if (previous?.model && previous?.bucketStart && previous?.totals) {
+      const oldBucket = getHourlyBucket(
+        hourlyState,
+        OPENSQUILLA_SOURCE,
+        previous.model,
+        previous.bucketStart,
+      );
+      subtractTotals(oldBucket.totals, previous.totals);
+      touchedBuckets.add(bucketKey(OPENSQUILLA_SOURCE, previous.model, previous.bucketStart));
+    }
+    delete messages[key];
+    eventsAggregated += 1;
+  }
+
+  const nextFingerprints = {};
+  for (const dbPath of availablePaths) {
+    const key = path.resolve(dbPath);
+    const before = pathFingerprints.get(key);
+    const after = sqliteSidecarFingerprint(dbPath);
+    nextFingerprints[key] = sameSqliteFingerprint(before, after) ? after : before;
+  }
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  cursors.hourly = hourlyState;
+  cursors.opensquilla = { messages, fingerprints: nextFingerprints, updatedAt };
+  return { recordsProcessed: rows.length, eventsAggregated, bucketsQueued };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unsloth Studio
 //
 // Durable inference usage lives in `studio.db`. The SQL projections below
@@ -13929,14 +15405,14 @@ function devinStringMap(value) {
 // Stage only the bucket objects this parser can mutate. The shared
 // normalizers copy the bucket maps but alias each bucket/totals object, and
 // the enqueue helpers stamp queuedKey before appendFile runs — so a failed
-// append used to leave the caller's published state polluted. Only
-// devin-owned entries get private copies; every other provider's buckets
+// append used to leave the caller's published state polluted. Only entries
+// the calling parser owns get private copies; every other provider's buckets
 // stay shared read-only references.
-function stageDevinBuckets(buckets, isDevinBucket) {
+function stageProviderBuckets(buckets, isOwnedBucket) {
   const staged = {};
   for (const [key, bucket] of Object.entries(buckets || {})) {
     staged[key] =
-      bucket && typeof bucket === "object" && isDevinBucket(key, bucket)
+      bucket && typeof bucket === "object" && isOwnedBucket(key, bucket)
         ? {
             ...bucket,
             totals:
@@ -14025,7 +15501,7 @@ async function parseDevinIncremental({
   // rows recover either queue. Unrelated providers' buckets stay shared
   // read-only references (this parser never writes their keys).
   const hourlyState = normalizeHourlyState(cursors?.hourly);
-  hourlyState.buckets = stageDevinBuckets(
+  hourlyState.buckets = stageProviderBuckets(
     hourlyState.buckets,
     (key) =>
       (normalizeSourceInput(parseBucketKey(key).source) || DEFAULT_SOURCE) ===
@@ -14044,7 +15520,7 @@ async function parseDevinIncremental({
   if (projectState) {
     // Project bucket keys are `projectKey|source|hourStart`; this parser only
     // ever looks up keys whose middle segment is the devin source.
-    projectState.buckets = stageDevinBuckets(projectState.buckets, (key) => {
+    projectState.buckets = stageProviderBuckets(projectState.buckets, (key) => {
       const last = key.lastIndexOf(BUCKET_SEPARATOR);
       const prev = last > 0 ? key.lastIndexOf(BUCKET_SEPARATOR, last - 1) : -1;
       const source = prev >= 0 ? key.slice(prev + 1, last) : "";
@@ -15489,6 +16965,51 @@ function ompEntryTimestampMs(msg, entry) {
   return null;
 }
 
+// Tool results can be hundreds of MB, exceeding V8's ~2^29-character string
+// limit without carrying usage. Skip them without decoding; assistant usage
+// records are orders of magnitude smaller.
+const OMP_LIKE_MAX_RECORD_BYTES = 64 * 1024 * 1024;
+
+async function scanOmpLikeTranscript(filePath, startOffset, maxRecordBytes, onEntry, { recoverReadErrors = false } = {}) {
+  let stream;
+  try {
+    stream = fssync.createReadStream(filePath, { start: startOffset });
+  } catch {
+    return startOffset;
+  }
+  let scannedEndOffset = startOffset;
+  let committedEndOffset = startOffset;
+  try {
+    for await (const record of physicalJsonlRecords(stream, {
+      invalidUtf8: "record",
+      maxRecordBytes,
+    })) {
+      scannedEndOffset += record.physicalBytes;
+      if (record.terminated) {
+        committedEndOffset = scannedEndOffset;
+        if (record.oversized || !record.utf8Valid || !record.line || !record.line.trim()) continue;
+        let entry;
+        try { entry = JSON.parse(record.line); } catch { continue; }
+        onEntry(entry);
+        continue;
+      }
+      // A final incomplete record may still be in the process of being written.
+      if (record.oversized || !record.utf8Valid || !record.line || !record.line.trim()) break;
+      let entry;
+      try { entry = JSON.parse(record.line); } catch { break; }
+      onEntry(entry);
+      committedEndOffset = scannedEndOffset;
+      break;
+    }
+  } catch (error) {
+    // WorkBuddy can publish complete records and continue with other files or
+    // fallbacks after a read failure. Unfinished bytes are never acknowledged.
+    // Do not swallow callback/parser errors, or change other readers' policy.
+    if (!recoverReadErrors || stream.errored !== error) throw error;
+  }
+  return committedEndOffset;
+}
+
 // Shared implementation for the oh-my-pi session format. omp and omo both
 // persist it verbatim, so they differ only in where the sessions live, which
 // cursor namespace they own, and how reasoning tokens are spelled.
@@ -15510,6 +17031,7 @@ async function parseOmpLikeIncremental({
   resolveFileCwd,
   reasoningFields,
   reasoningIncludedInOutput = false,
+  maxRecordBytes = OMP_LIKE_MAX_RECORD_BYTES,
 } = {}) {
   await ensureDir(path.dirname(queuePath));
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
@@ -15587,35 +17109,22 @@ async function parseOmpLikeIncremental({
     const startOffset = stat.size < prevSize || inodeChanged ? 0 : prevSize;
     if (stat.size <= startOffset) continue;
 
-    let stream;
-    try {
-      stream = fssync.createReadStream(filePath, {
-        encoding: "utf8",
-        start: startOffset,
-      });
-    } catch { continue; }
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-    for await (const line of rl) {
-      if (!line || !line.trim()) continue;
-      let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
-
+    const committedEndOffset = await scanOmpLikeTranscript(filePath, startOffset, maxRecordBytes, (entry) => {
       // First line of each file is type:"session" (header) — skip all
       // non-message records.
-      if (!entry || entry.type !== "message") continue;
+      if (!entry || entry.type !== "message") return;
 
       // Only assistant messages carry token usage.
       const msg = entry.message;
-      if (!msg || msg.role !== "assistant") continue;
+      if (!msg || msg.role !== "assistant") return;
 
       const usage = msg.usage;
-      if (!usage || typeof usage !== "object") continue;
+      if (!usage || typeof usage !== "object") return;
 
       // Dedup by top-level entry id (8-char string assigned by oh-my-pi).
       const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
-      if (!entryId) continue;
-      if (seenIds.has(entryId)) continue;
+      if (!entryId) return;
+      if (seenIds.has(entryId)) return;
 
       recordsProcessed++;
 
@@ -15633,7 +17142,7 @@ async function parseOmpLikeIncremental({
         reasoningTokens === 0
       ) {
         seenIds.add(entryId);
-        continue;
+        return;
       }
 
       // Entries with no resolvable timestamp are skipped — they cannot be
@@ -15641,12 +17150,12 @@ async function parseOmpLikeIncremental({
       const tsMs = ompEntryTimestampMs(msg, entry);
       if (tsMs == null) {
         seenIds.add(entryId);
-        continue;
+        return;
       }
 
       const tsIso = new Date(tsMs).toISOString();
       const bucketStart = toUtcHalfHourStart(tsIso);
-      if (!bucketStart) continue;
+      if (!bucketStart) return;
 
       // Use provided totalTokens when available; otherwise sum all components.
       // OmO folds reasoning into output, so the fallback must not add it again.
@@ -15683,14 +17192,12 @@ async function parseOmpLikeIncremental({
           bucketsQueued: touchedBuckets.size,
         });
       }
-    }
+    });
 
-    let postStat = stat;
-    try { postStat = fssync.statSync(filePath); } catch {}
     fileOffsets[filePath] = {
-      size: postStat.size,
-      mtimeMs: postStat.mtimeMs,
-      ino: postStat.ino,
+      size: committedEndOffset,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
     };
   }
 
@@ -15723,28 +17230,16 @@ async function parseOmpLikeIncremental({
         : null;
       const projectRef = projectContext?.projectRef || null;
       const projectKey = projectContext?.projectKey || null;
+      let committedEndOffset = stat.size;
 
       if (projectKey && projectRef) {
-        let stream;
-        try {
-          stream = fssync.createReadStream(filePath, {
-            encoding: "utf8",
-            start: startOffset,
-          });
-        } catch {
-          continue;
-        }
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        for await (const line of rl) {
-          if (!line || !line.trim()) continue;
-          let entry;
-          try { entry = JSON.parse(line); } catch { continue; }
+        committedEndOffset = await scanOmpLikeTranscript(filePath, startOffset, maxRecordBytes, (entry) => {
           const msg = entry?.type === "message" ? entry.message : null;
           const usage = msg?.role === "assistant" ? msg.usage : null;
-          if (!usage || typeof usage !== "object") continue;
+          if (!usage || typeof usage !== "object") return;
 
           const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
-          if (!entryId || projectSeenIds.has(entryId)) continue;
+          if (!entryId || projectSeenIds.has(entryId)) return;
 
           const input = toNonNegativeInt(usage.input);
           const output = toNonNegativeInt(usage.output);
@@ -15759,7 +17254,7 @@ async function parseOmpLikeIncremental({
             reasoningTokens === 0
           ) {
             projectSeenIds.add(entryId);
-            continue;
+            return;
           }
 
           const tsMs = ompEntryTimestampMs(msg, entry);
@@ -15768,7 +17263,7 @@ async function parseOmpLikeIncremental({
             : toUtcHalfHourStart(new Date(tsMs).toISOString());
           if (!bucketStart) {
             projectSeenIds.add(entryId);
-            continue;
+            return;
           }
 
           const totalTokens =
@@ -15795,15 +17290,13 @@ async function parseOmpLikeIncremental({
           addTotals(projectBucket.totals, delta);
           projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
           projectSeenIds.add(entryId);
-        }
+        });
       }
 
-      let postStat = stat;
-      try { postStat = fssync.statSync(filePath); } catch {}
       projectFileOffsets[filePath] = {
-        size: postStat.size,
-        mtimeMs: postStat.mtimeMs,
-        ino: postStat.ino,
+        size: committedEndOffset,
+        mtimeMs: stat.mtimeMs,
+        ino: stat.ino,
       };
     }
   }
@@ -15966,6 +17459,27 @@ function resolvePiSessionFiles(env = process.env) {
     }
   } catch {
     // ignore — return what we have
+  }
+  // Multica launches pi headless with a dedicated flat session dir:
+  //   ~/.multica/pi-sessions/<session-id>.jsonl
+  // Scan it too so orchestrated runs are counted alongside TUI sessions.
+  try {
+    const seen = new Set(files);
+    const multicaSessionsDir = path.join(
+      env.HOME || require("node:os").homedir(),
+      ".multica",
+      "pi-sessions",
+    );
+    for (const entry of fssync.readdirSync(multicaSessionsDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const full = path.join(multicaSessionsDir, entry.name);
+      if (!seen.has(full)) {
+        seen.add(full);
+        files.push(full);
+      }
+    }
+  } catch {
+    // ignore — no Multica install
   }
   files.sort((a, b) => a.localeCompare(b));
   return files;
@@ -16823,6 +18337,405 @@ async function parseReasonixIncremental({ telemetryFiles, cursors, queuePath, on
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
   cursors.reasonix = { ...state, sessionTotals, updatedAt };
+  return { recordsProcessed, eventsAggregated, bucketsQueued };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Muse Code (Meta) — passive session.jsonl reader.
+//
+//   ~/.local/share/muse/sessions/YYYY/MM/DD/<session>/session.jsonl
+//   ~/.local/share/muse/sessions/YYYY/MM/DD/<session>/subagent/<id>/session.jsonl
+//
+// Every record is `{id, stream, sequence, recorded_at (epoch µs), payload_type,
+// payload}`. Per-model-step usage rides on a `runtime.session` record whose
+// `payload.event.kind` is `goal_usage_attribution`:
+//
+//   quantity: {unit:"tokens", reported:true, input_tokens, output_tokens,
+//              cached_tokens, reasoning_tokens, main_llm_steps}
+//
+// Only `usage_family:"provider"` + `reported:true` rows are model usage (tool and
+// reminder rows are zero placeholders). The usage row names no model: the model
+// comes from the `run.model.configured` record of the same `run_id`.
+//
+// Token semantics (verified against the session snapshot `cost_ledger`, where
+// `input_tokens` equals the sum of these rows and `cache_read_tokens` equals
+// `cached_tokens`): `input_tokens` INCLUDES cache reads, and `reasoning_tokens`
+// is a subset of `output_tokens`. Subagent logs are separate streams whose usage
+// is not repeated in the parent log, so each file is counted once. No prompt,
+// response or path text is read or stored; only counts, timestamps and the
+// model id.
+function resolveMuseHome(env = process.env) {
+  if (env.TOKENTRACKER_MUSE_HOME) return expandHomePath(env.TOKENTRACKER_MUSE_HOME, env);
+  return path.join(env.HOME || require("node:os").homedir(), ".local", "share", "muse");
+}
+
+const MUSE_SCAN_MAX_DEPTH = 8;
+const MUSE_READ_CHUNK_BYTES = 8 * 1024 * 1024;
+const MUSE_WATERMARK_IDS_MAX = 100;
+
+function collectMuseSessionFiles(dir, files, depth = 0) {
+  if (depth > MUSE_SCAN_MAX_DEPTH) return;
+  let entries;
+  try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    // Dot directories (.msp-view-v1) hold derived views, not the session log.
+    if (entry.name.startsWith(".")) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) collectMuseSessionFiles(full, files, depth + 1);
+    else if (entry.isFile() && entry.name === "session.jsonl") files.push(full);
+  }
+}
+
+function resolveMuseSessionFiles(env = process.env) {
+  const sessionsDir = path.join(resolveMuseHome(env), "sessions");
+  const files = [];
+  collectMuseSessionFiles(sessionsDir, files);
+  return files;
+}
+
+// The model Muse is configured to use, for rows whose run has no model record
+// in the portion of the log we read. Reads only the `model` string.
+function resolveMuseDefaultModel(env = process.env) {
+  const fallback = "muse";
+  try {
+    const configHome = env.XDG_CONFIG_HOME || path.join(env.HOME || require("node:os").homedir(), ".config");
+    const settings = JSON.parse(fssync.readFileSync(path.join(configHome, "muse", "settings.json"), "utf8"));
+    return typeof settings?.model === "string" && settings.model.trim() ? settings.model.trim() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// A permission transaction wraps its records as JSON strings under `children`;
+// unwrap them so a model or usage record is never missed inside a frame.
+function* museRecords(entry) {
+  if (entry && Array.isArray(entry.children) && entry.retained_frame) {
+    for (const child of entry.children) {
+      if (!child || typeof child.record_json !== "string") continue;
+      try { yield JSON.parse(child.record_json); } catch { /* skip */ }
+    }
+    return;
+  }
+  yield entry;
+}
+
+
+const MUSE_HEAD_FINGERPRINT_BYTES = 256;
+const MUSE_PREFIX_FINGERPRINT_MAX_BYTES = 8 * 1024 * 1024;
+
+// Fingerprints for Muse session logs so an in-place rewrite is not mistaken
+// for an append. Prefer a hash of the entire consumed prefix (capped); fall
+// back to head+tail samples only when the prefix exceeds the cap.
+function museRangeFingerprint(fd, offset, length) {
+  const n = Math.max(0, Number(length) || 0);
+  if (n <= 0) return null;
+  const buf = Buffer.alloc(n);
+  const read = fssync.readSync(fd, buf, 0, n, Math.max(0, Number(offset) || 0));
+  if (read <= 0) return null;
+  return crypto.createHash("sha256").update(buf.subarray(0, read)).digest("hex");
+}
+
+function museHeadFingerprint(fd, size) {
+  return museRangeFingerprint(fd, 0, Math.min(MUSE_HEAD_FINGERPRINT_BYTES, Math.max(0, Number(size) || 0)));
+}
+
+function musePrefixFingerprint(fd, size) {
+  const total = Math.max(0, Number(size) || 0);
+  if (total <= 0) return null;
+  if (total <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+    const hash = crypto.createHash("sha256");
+    let offset = 0;
+    const chunk = Buffer.alloc(Math.min(64 * 1024, total));
+    while (offset < total) {
+      const want = Math.min(chunk.length, total - offset);
+      const read = fssync.readSync(fd, chunk, 0, want, offset);
+      if (read <= 0) break;
+      hash.update(chunk.subarray(0, read));
+      offset += read;
+    }
+    return offset === total ? hash.digest("hex") : null;
+  }
+  // Large logs: sample head and tail of the consumed prefix.
+  const head = museHeadFingerprint(fd, total);
+  const tailLen = Math.min(MUSE_HEAD_FINGERPRINT_BYTES, total);
+  const tail = museRangeFingerprint(fd, total - tailLen, tailLen);
+  return head && tail ? `${head}:${tail}` : null;
+}
+
+function museResumeLooksAppendOnly(fd, prevSize, prev, currentPrefixFp, currentMtimeMs, currentSize) {
+  if (prev?.forceRewind === true) return false;
+  if (!(prevSize > 0)) return true;
+  if (typeof prev?.prefixFp === "string" && prev.prefixFp && prev.prefixFp !== currentPrefixFp) return false;
+  // Legacy cursors without prefixFp: reject when the head sample diverges.
+  if (!prev?.prefixFp && typeof prev?.headFp === "string" && prev.headFp) {
+    const head = museHeadFingerprint(fd, prevSize);
+    if (head && head !== prev.headFp) return false;
+  }
+  // Equal-size rewrite above the full-prefix cap (or any equal-size rewrite that
+  // preserves sampled bytes) still bumps mtime on real filesystems. Only apply
+  // when the size is unchanged — growth from an append also changes mtime.
+  if (
+    Number(currentSize) === Number(prevSize) &&
+    Number.isFinite(Number(prev?.mtimeMs)) &&
+    Number.isFinite(Number(currentMtimeMs)) &&
+    Number(prev.mtimeMs) !== Number(currentMtimeMs)
+  ) {
+    return false;
+  }
+  // Resume offset must be a JSONL record boundary.
+  const buf = Buffer.alloc(1);
+  const read = fssync.readSync(fd, buf, 0, 1, prevSize - 1);
+  return read === 1 && buf[0] === 0x0a;
+}
+
+
+// Subagent logs live under .../sessions/<session>/subagent/... . Matching any
+// ancestor named "subagent" would misclassify roots when the Muse home path
+// itself contains that segment (e.g. TOKENTRACKER_MUSE_HOME=/data/subagent/muse).
+function isMuseSubagentSessionFile(filePath, env = process.env) {
+  const sessionsRoot = path.join(resolveMuseHome(env), "sessions");
+  const relative = path.relative(sessionsRoot, filePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    // Outside the configured sessions root — fall back to a local segment check
+    // that still requires the subagent directory to be a parent of session.jsonl.
+    const parts = filePath.split(path.sep);
+    const sessionIdx = parts.lastIndexOf("session.jsonl");
+    return sessionIdx > 0 && parts.slice(0, sessionIdx).includes("subagent");
+  }
+  return relative.split(path.sep).includes("subagent");
+}
+
+async function parseMuseIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const state = cursors.muse && typeof cursors.muse === "object" ? cursors.muse : {};
+  const seenIds = new Set(Array.isArray(state.seenIds) ? state.seenIds : []);
+  const fileOffsets =
+    state.fileOffsets && typeof state.fileOffsets === "object" ? { ...state.fileOffsets } : {};
+  const files = Array.isArray(sessionFiles) ? sessionFiles : resolveMuseSessionFiles(env || process.env);
+  const defaultModel = resolveMuseDefaultModel(env || process.env);
+
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  let recordsProcessed = 0;
+  let eventsAggregated = 0;
+
+  const handleRecord = (rec, fileState) => {
+    if (!rec || typeof rec !== "object") return;
+    const payload = rec.payload;
+    if (!payload || typeof payload !== "object") return;
+    if (rec.payload_type === "run.model.configured") {
+      const modelRec = payload.record;
+      const runId = modelRec?.run_stream?.id;
+      if (typeof modelRec?.model_id === "string" && modelRec.model_id) {
+        if (runId) fileState.runModels[runId] = modelRec.model_id;
+        fileState.model = modelRec.model_id;
+      }
+      return;
+    }
+    if (rec.payload_type !== "runtime.session") return;
+    const event = payload.event;
+    if (!event || event.kind !== "goal_usage_attribution") return;
+    const usage = event.record;
+    const quantity = usage?.quantity;
+    if (!quantity || usage.usage_family !== "provider" || quantity.reported !== true) return;
+    const usageId = typeof usage.usage_id === "string" ? usage.usage_id : null;
+    if (!usageId || seenIds.has(usageId)) return;
+    // A rewritten log is re-read from the start, and `seenIds` keeps only the
+    // newest 10k ids. Rows older than the last one counted from this file are
+    // already in the queue, so skip them even if their id was evicted. Rows at
+    // exactly that timestamp are skipped only when their id was counted, so a
+    // new row that shares the timestamp is kept.
+    const micros = Number(rec.recorded_at);
+    if (fileState.skipThrough && Number.isFinite(micros)) {
+      if (micros < fileState.skipThrough) return;
+      if (micros === fileState.skipThrough && fileState.skipIds.has(usageId)) return;
+    }
+
+    recordsProcessed++;
+    const inputTotal = toNonNegativeInt(quantity.input_tokens);
+    const output = toNonNegativeInt(quantity.output_tokens);
+    const cached = Math.min(toNonNegativeInt(quantity.cached_tokens), inputTotal);
+    const reasoning = Math.min(toNonNegativeInt(quantity.reasoning_tokens), output);
+    seenIds.add(usageId);
+    if (inputTotal === 0 && output === 0) return;
+
+    if (!Number.isFinite(micros) || micros <= 0) return;
+    const bucketStart = toUtcHalfHourStart(new Date(Math.floor(micros / 1000)).toISOString());
+    if (!bucketStart) return;
+
+    const input = inputTotal - cached;
+    const model = fileState.runModels[payload.run_id] || fileState.model || defaultModel;
+    // One conversation per root session, charged to its first usage record.
+    // Subagent logs are part of their parent's conversation.
+    const conversations = fileState.counted || fileState.isSubagent ? 0 : 1;
+    fileState.counted = true;
+    const bucket = getHourlyBucket(hourlyState, "muse", model, bucketStart);
+    addTotals(bucket.totals, {
+      input_tokens: input,
+      cached_input_tokens: cached,
+      cache_creation_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: reasoning,
+      total_tokens: input + cached + output,
+      conversation_count: conversations,
+    });
+    touchedBuckets.add(bucketKey("muse", model, bucketStart));
+    eventsAggregated++;
+    // Advance only for rows that reached a bucket, remembering the ids that
+    // share the newest timestamp.
+    if (micros > fileState.watermark) {
+      fileState.watermark = micros;
+      fileState.watermarkIds = [usageId];
+    } else if (micros === fileState.watermark && fileState.watermarkIds.length < MUSE_WATERMARK_IDS_MAX) {
+      fileState.watermarkIds.push(usageId);
+    }
+  };
+
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const filePath = files[fileIdx];
+    // Open first and stat the descriptor, so the size and inode describe the
+    // file that is actually read (no check-then-open race).
+    let fd;
+    try { fd = fssync.openSync(filePath, "r"); } catch { continue; }
+    let stat;
+    try { stat = fssync.fstatSync(fd); } catch {
+      try { fssync.closeSync(fd); } catch { /* ignore */ }
+      continue;
+    }
+
+    const prev = fileOffsets[filePath] || {};
+    const prevSize = Number(prev.size) || 0;
+    const inodeChanged = typeof prev.ino === "number" && prev.ino !== stat.ino;
+    const prefixFp = musePrefixFingerprint(fd, Math.min(prevSize, stat.size));
+    const headFp = museHeadFingerprint(fd, stat.size);
+    // Same-inode compaction can shrink then grow past prevSize, rewrite the
+    // middle at equal size, or be observed while empty mid-rewrite. Validate
+    // the consumed-prefix fingerprint (and forceRewind) before append-only.
+    const appendOnly = !inodeChanged && stat.size >= prevSize &&
+      museResumeLooksAppendOnly(fd, prevSize, prev, prefixFp, stat.mtimeMs, stat.size);
+    const rewound = !appendOnly;
+    const startOffset = rewound ? 0 : prevSize;
+    if (stat.size <= startOffset) {
+      const emptyObserved = stat.size <= 0 && prevSize > 0;
+      fileOffsets[filePath] = {
+        ...prev,
+        size: Math.min(prevSize, stat.size),
+        mtimeMs: stat.mtimeMs,
+        ino: stat.ino,
+        headFp,
+        prefixFp: stat.size > 0 ? musePrefixFingerprint(fd, stat.size) : null,
+        // An empty observation between truncate and rewrite must not clear
+        // watermark-based replay protection on the next population.
+        forceRewind: emptyObserved || prev.forceRewind === true || rewound,
+      };
+      try { fssync.closeSync(fd); } catch { /* ignore */ }
+      continue;
+    }
+
+    const fileState = {
+      // Keep known model attribution across rewinds: compaction may drop the
+      // original run.model.configured rows while later usage for those runs
+      // remains. Replayed configuration records still overwrite these maps.
+      model: prev.model || null,
+      runModels: { ...(prev.runModels || {}) },
+      // A rewritten log keeps its flag: its usage ids were already counted.
+      counted: prev.counted === true,
+      // Latest usage timestamp (epoch µs) counted from this file; on a rewrite
+      // it becomes the point below which rows are not counted again.
+      watermark: Number(prev.watermark) || 0,
+      watermarkIds: Array.isArray(prev.watermarkIds) ? prev.watermarkIds.slice(0, MUSE_WATERMARK_IDS_MAX) : [],
+      skipThrough: rewound ? Number(prev.watermark) || 0 : 0,
+      skipIds: new Set(rewound && Array.isArray(prev.watermarkIds) ? prev.watermarkIds : []),
+      isSubagent: isMuseSubagentSessionFile(filePath, env || process.env),
+    };
+
+    let consumed = 0;
+    // Hash the bytes we actually parse so a rewrite between read and cursor
+    // save cannot invent a matching fingerprint for unread content.
+    const consumedHash = crypto.createHash("sha256");
+    let hashedPrefix = startOffset === 0;
+    if (startOffset > 0 && startOffset <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      // Include the already-trusted prefix so the saved fingerprint covers
+      // the full consumed region, not only this sync's delta.
+      let off = 0;
+      const pre = Buffer.alloc(Math.min(64 * 1024, startOffset));
+      while (off < startOffset) {
+        const want = Math.min(pre.length, startOffset - off);
+        const read = fssync.readSync(fd, pre, 0, want, off);
+        if (read <= 0) break;
+        consumedHash.update(pre.subarray(0, read));
+        off += read;
+      }
+      hashedPrefix = off === startOffset;
+    } else if (startOffset > MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      hashedPrefix = false;
+    }
+    {
+      let position = startOffset;
+      let carry = Buffer.alloc(0);
+      while (position < stat.size) {
+        const length = Math.min(MUSE_READ_CHUNK_BYTES, stat.size - position);
+        const chunk = Buffer.alloc(length);
+        const read = fssync.readSync(fd, chunk, 0, length, position);
+        if (read <= 0) break;
+        position += read;
+        const data = carry.length ? Buffer.concat([carry, chunk.subarray(0, read)]) : chunk.subarray(0, read);
+        // Only complete lines are consumed, so a record still being written is
+        // read whole on the next sync instead of being skipped.
+        const lastNewline = data.lastIndexOf(0x0a);
+        if (lastNewline < 0) { carry = data; continue; }
+        const complete = data.subarray(0, lastNewline + 1);
+        carry = Buffer.from(data.subarray(lastNewline + 1));
+        if (hashedPrefix) consumedHash.update(complete);
+        consumed += complete.length;
+        for (const line of complete.toString("utf8").split("\n")) {
+          if (!line.trim()) continue;
+          let entry;
+          try { entry = JSON.parse(line); } catch { continue; }
+          for (const rec of museRecords(entry)) handleRecord(rec, fileState);
+        }
+      }
+    }
+    const runModelKeys = Object.keys(fileState.runModels);
+    const keptRunModels = {};
+    // Bound the cursor: later records reference recent runs.
+    for (const key of runModelKeys.slice(-50)) keptRunModels[key] = fileState.runModels[key];
+    const consumedSize = startOffset + consumed;
+    // Fingerprint from the same descriptor we read — never reopen (CodeQL
+    // file-system-race) and never trust a post-read rewrite.
+    let savedPrefixFp = null;
+    if (hashedPrefix && consumedSize <= MUSE_PREFIX_FINGERPRINT_MAX_BYTES) {
+      savedPrefixFp = consumedHash.digest("hex");
+    } else {
+      try { savedPrefixFp = musePrefixFingerprint(fd, consumedSize); } catch { /* best-effort */ }
+    }
+    fileOffsets[filePath] = {
+      size: consumedSize,
+      mtimeMs: stat.mtimeMs,
+      ino: stat.ino,
+      headFp,
+      prefixFp: savedPrefixFp,
+      forceRewind: false,
+      model: fileState.model,
+      runModels: keptRunModels,
+      counted: fileState.counted,
+      watermark: fileState.watermark,
+      watermarkIds: fileState.watermarkIds,
+    };
+    try { fssync.closeSync(fd); } catch { /* ignore */ }
+    if (cb) {
+      cb({ index: fileIdx + 1, total: files.length, recordsProcessed, eventsAggregated, bucketsQueued: touchedBuckets.size });
+    }
+  }
+
+  const seenArr = Array.from(seenIds);
+  const cappedSeen = seenArr.length > 10_000 ? seenArr.slice(seenArr.length - 10_000) : seenArr;
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  cursors.hourly = hourlyState;
+  cursors.muse = { ...state, seenIds: cappedSeen, fileOffsets, updatedAt };
   return { recordsProcessed, eventsAggregated, bucketsQueued };
 }
 
@@ -20310,6 +22223,7 @@ function resolveAntigravityBrainDirs(geminiHome) {
   return [
     path.join(geminiHome, "antigravity", "brain"),
     path.join(geminiHome, "antigravity-ide", "brain"),
+    path.join(geminiHome, "antigravity-insiders", "brain"),
     path.join(geminiHome, "antigravity-cli", "brain"),
   ];
 }
@@ -20372,8 +22286,29 @@ async function listAntigravitySessionFiles(brainDir) {
   return (await listAntigravitySessionFilesWithStatus(brainDir)).files;
 }
 
-async function listAntigravityTranscriptsWithStatus(geminiHome, knownFiles = null) {
-  const dirs = resolveAntigravityBrainDirs(geminiHome);
+function dedupeAntigravityBrainDirs(dirs) {
+  const seen = new Set();
+  const out = [];
+  for (const dir of dirs || []) {
+    if (!dir || typeof dir !== "string") continue;
+    let key;
+    try {
+      key = fssync.realpathSync(dir);
+    } catch (_err) {
+      key = path.resolve(dir);
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(dir);
+  }
+  return out;
+}
+
+async function listAntigravityTranscriptsWithStatus(geminiHome, knownFiles = null, extraBrainDirs = []) {
+  const dirs = dedupeAntigravityBrainDirs([
+    ...resolveAntigravityBrainDirs(geminiHome),
+    ...(Array.isArray(extraBrainDirs) ? extraBrainDirs : []),
+  ]);
   const results = await Promise.all(
     dirs.map((dir) => listAntigravitySessionFilesWithStatus(dir, knownFiles)),
   );
@@ -22567,6 +24502,9 @@ async function parseTraeCnApiIncremental({
 const DSH_SESSION_LOG_MAX_BYTES = 64 * 1024 * 1024;
 const DSH_SESSION_TEXT_MAX_BYTES = 128 * 1024 * 1024;
 const DSH_SOURCE = "dsh";
+// v2 excludes fork seeds and replayed assistant identities. Old ledgers need
+// a verified replacement, not a reset of the provider-wide hourly totals.
+const DSH_ACCOUNTING_VERSION = 2;
 
 // Precedence mirrors the harness's own resolveDshHome: an explicit
 // TokenTracker override, then the harness's $DSH_HOME, then `~/.dsh`. Tests
@@ -22933,18 +24871,46 @@ function legacyDshContributionsFromSnapshot(snapshot, previousState) {
     previousState.lastSeq < -1 ||
     previousState.inode !== snapshot.inode ||
     !Number.isFinite(previousState.size) ||
-    snapshot.size < previousState.size
+    snapshot.size < previousState.size ||
+    (snapshot.size === previousState.size && snapshot.mtimeMs !== previousState.mtimeMs)
   ) {
     return null;
   }
   const parsed = extractDshSessionUsage(snapshot.text, -1);
-  if (!parsed.complete || parsed.sessionId !== previousState.sessionId) return null;
+  if (!parsed.complete || parsed.sessionId !== previousState.sessionId ||
+    parsed.maxSeq < previousState.lastSeq) return null;
   // The pre-ledger parser replayed unknown-sequence usage on every pass, so
   // there is no safe prefix boundary for such a record. Defer instead.
-  if (parsed.deltas.some((delta) => !Number.isSafeInteger(delta.seq))) return null;
+  const priorDeltas = previousState.accountingVersion === DSH_ACCOUNTING_VERSION
+    ? parsed.deltas : parsed.rawDeltas;
+  if (priorDeltas.some((delta) => !Number.isSafeInteger(delta.seq))) return null;
   return dshContributionsFromDeltas(
-    parsed.deltas.filter((delta) => delta.seq <= previousState.lastSeq),
+    priorDeltas.filter((delta) => delta.seq <= previousState.lastSeq),
   );
+}
+
+// When the old and new artifacts differ, aggregate equality alone does not
+// establish that the replacement contains the historical events. Match the
+// count-only metadata as a multiset, allowing seq rewrites but no lost events.
+function dshRawUsageCoversPrefix(candidate, snapshot, previousState) {
+  if (!snapshot?.text || !previousState) return false;
+  const prefix = extractDshSessionUsage(snapshot.text).rawDeltas
+    .filter((delta) => delta.seq != null && delta.seq <= previousState.lastSeq);
+  const key = (delta) => JSON.stringify([
+    delta.messageId, delta.model, delta.timeMs, delta.totals,
+  ]);
+  const available = new Map();
+  for (const delta of candidate || []) {
+    const identity = key(delta);
+    available.set(identity, (available.get(identity) || 0) + 1);
+  }
+  for (const delta of prefix) {
+    const identity = key(delta);
+    const count = available.get(identity) || 0;
+    if (!count) return false;
+    available.set(identity, count - 1);
+  }
+  return true;
 }
 
 function dshContributionsCoverPrior(prior, candidate) {
@@ -23340,17 +25306,20 @@ function isCompleteDshJsonLine(raw) {
   return index === text.length;
 }
 
-// Parse one session log's plaintext into usage deltas, skipping events whose
-// seq is at or below the watermark. Returns the deltas (each carrying the
-// sequence, model and epoch-ms timestamp), the highest complete seq seen, the
-// session id, and whether every non-empty JSONL line was complete.
-function extractDshSessionUsage(text, lastSeq = -1) {
-  const deltas = [];
+// Read routing metadata and counts only; never materialize message content.
+// rawDeltas preserves the former seq-only interpretation for migration proof.
+// deltas excludes the inherited prefix and repeated assistant message ids.
+function extractDshSessionUsage(text, lastSeq = -1, lastLine = -1) {
+  const rawDeltas = [];
   const watermark = Number.isFinite(lastSeq) ? lastSeq : -1;
   let maxSeq = watermark;
+  let maxLine = -1;
   let sessionId = null;
   let headerModel = null;
   let complete = true;
+  let isSeeded = false;
+  let seedLength = null;
+  let inheritedThrough = -1;
 
   const lines = String(text || "").split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -23358,29 +25327,37 @@ function extractDshSessionUsage(text, lastSeq = -1) {
     if (!line || !line.trim()) continue;
     if (!isCompleteDshJsonLine(line)) {
       complete = false;
-      // A later event cannot make this gap safe to acknowledge. Stop at the
-      // complete prefix so a repaired record is retried before seq advances.
+      // Do not acknowledge records after a corrupt/torn interior line.
       break;
     }
+    maxLine = i;
     const eventType = parseDshJsonString(findDshJsonProperty(line, "type"));
     if (!eventType) continue;
-
+    const data = findDshJsonProperty(line, "data");
     if (eventType === "session" || eventType === "session/start") {
-      const id =
-        parseDshJsonString(findDshJsonProperty(line, "id")) ||
-        parseDshJsonString(findDshJsonProperty(findDshJsonProperty(line, "data"), "id")) ||
-        parseDshJsonString(findDshJsonProperty(findDshJsonProperty(line, "data"), "sessionId"));
+      const id = parseDshJsonString(findDshJsonProperty(line, "id")) ||
+        parseDshJsonString(findDshJsonProperty(data, "id")) ||
+        parseDshJsonString(findDshJsonProperty(data, "sessionId"));
       if (id) sessionId = id;
+      isSeeded = findDshJsonProperty(line, "isSeeded") === "true" ||
+        findDshJsonProperty(data, "isSeeded") === "true";
+      const topLength = parseDshJsonNumber(findDshJsonProperty(line, "seedLength"));
+      const length = Number.isFinite(topLength) ? topLength :
+        parseDshJsonNumber(findDshJsonProperty(data, "seedLength"));
+      if (Number.isSafeInteger(length) && length >= 0) seedLength = length;
       continue;
     }
 
     const seq = parseDshJsonNumber(findDshJsonProperty(line, "seq"));
     const seqKnown = Number.isFinite(seq) && seq >= 0;
     if (seqKnown && seq > maxSeq) maxSeq = seq;
-
-    const data = findDshJsonProperty(line, "data");
     if (!data) continue;
-
+    if (eventType === "session/end-seed") {
+      // Nested forks contain earlier markers. The LAST explicitly inherited
+      // marker is the boundary; ordinary resume markers (data:{}) are not.
+      if (findDshJsonProperty(data, "inherited") === "true") inheritedThrough = i;
+      continue;
+    }
     if (eventType === "request/header") {
       const header = findDshJsonProperty(data, "header");
       const config = findDshJsonProperty(header, "config");
@@ -23389,39 +25366,46 @@ function extractDshSessionUsage(text, lastSeq = -1) {
       if (normalized) headerModel = normalized;
       continue;
     }
-
     if (eventType !== "assistant/message" && eventType !== "message/assistant") continue;
-    if (seqKnown && seq <= watermark) continue;
-
     const message = findDshJsonProperty(data, "message");
     const source = message ? findDshJsonProperty(message, "source") : null;
     const model = normalizeDshModelName(
       (source && parseDshJsonString(findDshJsonProperty(source, "model"))) ||
       parseDshJsonString(findDshJsonProperty(data, "model")),
     ) || headerModel;
-    const totals = dshUsageToTotals(
-      parseDshUsageSlice(
-        findDshJsonProperty(data, "usage") || findDshJsonProperty(line, "usage"),
-      ),
-    );
+    const totals = dshUsageToTotals(parseDshUsageSlice(
+      findDshJsonProperty(data, "usage") || findDshJsonProperty(line, "usage"),
+    ));
     if (!model || !totals) continue;
-
-    const timeMs =
-      parseDshJsonNumber(findDshJsonProperty(line, "time")) ||
+    const timeMs = parseDshJsonNumber(findDshJsonProperty(line, "time")) ||
       parseDshJsonNumber(findDshJsonProperty(line, "timestamp")) ||
       parseDshJsonNumber(findDshJsonProperty(data, "time")) ||
       parseDshJsonNumber(findDshJsonProperty(data, "timestamp"));
     if (!Number.isFinite(timeMs) || timeMs <= 0) continue;
-
-    deltas.push({ seq: seqKnown ? seq : null, model, timeMs, totals });
+    const id = parseDshJsonString(findDshJsonProperty(message, "id"));
+    rawDeltas.push({ seq: seqKnown ? seq : null, line: i,
+      messageId: id?.trim() || null, model, timeMs, totals });
   }
 
-  return { deltas, maxSeq, sessionId, complete };
+  const seedComplete = !isSeeded || inheritedThrough >= 0 || seedLength != null;
+  const seen = new Set();
+  const deltas = rawDeltas.filter((delta) => {
+    if (delta.messageId) {
+      if (seen.has(delta.messageId)) return false;
+      // Claim before applying the watermark: a replay at a newer seq is not new.
+      seen.add(delta.messageId);
+    }
+    if (!seedComplete || delta.line <= inheritedThrough) return false;
+    // Legacy seedLength is an exclusive seq boundary, not a line count.
+    if (seedLength != null && (delta.seq == null || delta.seq < seedLength)) return false;
+    return delta.seq != null ? delta.seq > watermark : delta.line > lastLine;
+  });
+  return { deltas, rawDeltas, maxSeq, maxLine, sessionId, complete, seedComplete };
 }
 
 // Incremental parser entrypoint. Mirrors the other passive JSONL readers:
 // identity-check each file (inode/size/mtime), re-read + re-parse only when it
-// changed, dedup via the per-file seq watermark, accumulate into hourly
+// changed, dedup via message ownership plus seq/line watermarks, accumulate into hourly
 // buckets, then flush touched buckets to the queue. Session contribution ledgers
 // make artifact-path migrations replace one session instead of resetting DSH.
 async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgress }) {
@@ -23435,6 +25419,9 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
   const storedSessionState =
     dshState.sessions && typeof dshState.sessions === "object" ? dshState.sessions : {};
   const sessionState = { ...storedSessionState };
+  // Never prune ownership when an origin transcript disappears. Only opaque
+  // message ids and session identities are persisted, not conversation text.
+  const messageOwners = { ...(dshState.messageOwners || {}) };
 
   const hourlyState = normalizeHourlyState(cursors?.hourly);
   // normalizeHourlyState preserves bucket objects for the other incremental
@@ -23460,6 +25447,22 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
   const presentFiles = new Set(files);
   const total = files.length;
   const deferredFilePaths = new Set();
+  const legacyAliases = new Map();
+  for (const [filePath, state] of Object.entries(fileState)) {
+    if (!state?.sessionId || state.accountingVersion === DSH_ACCOUNTING_VERSION) continue;
+    const aliases = legacyAliases.get(state.sessionId) || [];
+    aliases.push(filePath);
+    legacyAliases.set(state.sessionId, aliases);
+  }
+  for (const aliases of legacyAliases.values()) {
+    if (aliases.length < 2) continue;
+    // Older cursors cannot prove whether these alias paths were counted once
+    // or independently. Keep both baselines instead of guessing a subtraction.
+    for (const filePath of aliases) {
+      deferredFilePaths.add(filePath);
+      deferredMigrationPaths.set(filePath, "ambiguous-legacy-session-aliases");
+    }
+  }
   let recordsProcessed = 0;
   let eventsAggregated = 0;
 
@@ -23517,6 +25520,9 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
     const needsLedgerBackfill = Boolean(
       previousSessionId && !previousSessionContributions && !previousFileContributions,
     );
+    const needsAccountingUpgrade = Boolean(
+      prev && prev.accountingVersion !== DSH_ACCOUNTING_VERSION,
+    );
     let snapshot;
     let parsed;
     let fullParsed = null;
@@ -23525,7 +25531,7 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 
     try {
       snapshot = await readDshSessionSnapshot(filePath, {
-        previous: needsLedgerBackfill ? null : prev,
+        previous: needsLedgerBackfill || needsAccountingUpgrade ? null : prev,
       });
       if (!snapshot) {
         // A resolver-selected replacement can disappear between discovery and
@@ -23533,10 +25539,11 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
         // contribution. This is deliberately separate from a thrown read
         // error because a missing path returns null from the snapshot helper.
         deferStaleMigrationPaths(filePath, "replacement-missing");
+        if (needsAccountingUpgrade) deferredMigrationPaths.set(filePath, "history-missing");
         reportProgress(idx, recordsProcessed, eventsAggregated, total);
         continue;
       }
-      if (snapshot.unchanged && !needsLedgerBackfill) {
+      if (snapshot.unchanged && !needsLedgerBackfill && !needsAccountingUpgrade) {
         reportProgress(idx, recordsProcessed, eventsAggregated, total);
         continue;
       }
@@ -23558,18 +25565,18 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
         ),
       );
       const lastSeq = fileReset || !Number.isFinite(prev?.lastSeq) ? -1 : prev.lastSeq;
-      parsed = extractDshSessionUsage(snapshot.text, lastSeq);
+      parsed = extractDshSessionUsage(snapshot.text, lastSeq, fileReset ? -1 : prev?.lastLine);
       sessionChanged = Boolean(
         prev &&
         parsed.sessionId &&
         parsed.sessionId !== previousSessionId,
       );
       if (sessionChanged) parsed = extractDshSessionUsage(snapshot.text, -1);
-      if (!prev || needsLedgerBackfill || sessionChanged || fileReset) {
+      if (!prev || needsLedgerBackfill || needsAccountingUpgrade || sessionChanged || fileReset) {
         fullParsed = extractDshSessionUsage(snapshot.text, -1);
-        if (!prev || sessionChanged || fileReset) parsed = fullParsed;
+        if (!prev || needsAccountingUpgrade || sessionChanged || fileReset) parsed = fullParsed;
       }
-      if (!parsed.complete) snapshot.mtimeMs = -1;
+      if (!parsed.complete || !parsed.seedComplete) snapshot.mtimeMs = -1;
     } catch (error) {
       if (process.env.TOKENTRACKER_DEBUG) {
         process.stderr.write(`[dsh] skipped ${filePath}: ${error?.message || error}\n`);
@@ -23578,11 +25585,22 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
       // selected file list. Keep that cursor until the replacement is readable
       // so a failed migration cannot turn into an untracked double-count.
       deferStaleMigrationPaths(filePath, "replacement-read-failed");
+      if (needsAccountingUpgrade) deferredMigrationPaths.set(filePath, "history-read-failed");
       reportProgress(idx, recordsProcessed, eventsAggregated, total);
       continue;
     }
 
     const sessionId = typeof parsed.sessionId === "string" ? parsed.sessionId : null;
+    if ((legacyAliases.get(sessionId)?.length || 0) > 1) {
+      reportProgress(idx, recordsProcessed, eventsAggregated, total);
+      continue;
+    }
+    if (prev && !sessionId && (previousSessionId || needsAccountingUpgrade)) {
+      deferredFilePaths.add(filePath);
+      deferredMigrationPaths.set(filePath, "replacement-session-id-missing");
+      reportProgress(idx, recordsProcessed, eventsAggregated, total);
+      continue;
+    }
     const stalePathWithoutId = sessionId
       ? null
       : Object.keys(fileState).find(
@@ -23600,8 +25618,15 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
     const stalePath = staleFileForSession(sessionId, filePath);
     const previousPath =
       session?.lastPath && session.lastPath !== filePath ? session.lastPath : stalePath;
+    if (previousPath && previousPath !== filePath) {
+      // Another artifact currently owns this session ledger. Replacing that
+      // ledger needs the full candidate, even if this alias has its own cursor.
+      fullParsed = extractDshSessionUsage(snapshot.text);
+      parsed = fullParsed;
+    }
     const resetCurrentFile = Boolean(fileReset && !sessionChanged);
-    const replacementPath = previousPath || (resetCurrentFile ? filePath : null);
+    const upgradeCurrentFile = needsAccountingUpgrade && !sessionChanged;
+    const replacementPath = previousPath || (resetCurrentFile || upgradeCurrentFile ? filePath : null);
     const sessionContributions = storedDshContributions(session);
     const staleContributions = storedDshContributions(stalePath && fileState[stalePath]);
     const fileContributions = storedDshContributions(prev);
@@ -23624,7 +25649,9 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
       // A pure rename preserves the same bytes. Reusing the parsed full
       // contribution is safe here because replacement below subtracts and
       // re-adds it; no sequence watermark is transferred.
-      oldContributions = dshContributionsFromDeltas(parsed.deltas);
+      oldContributions = dshContributionsFromDeltas(
+        previousState.accountingVersion === DSH_ACCOUNTING_VERSION ? parsed.deltas : parsed.rawDeltas,
+      );
     }
 
     // Cursors written before the contribution ledger existed can still be
@@ -23637,10 +25664,13 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
       const oldSnapshot = await readDshSessionSnapshot(previousPath).catch(() => null);
       oldContributions = legacyDshContributionsFromSnapshot(oldSnapshot, oldState);
     }
+    if (sessionId && upgradeCurrentFile && !oldContributions) {
+      oldContributions = legacyDshContributionsFromSnapshot(snapshot, prev);
+    }
     const replaceSession = Boolean(
       sessionId &&
       oldContributions &&
-      (!prev || resetCurrentFile || (previousPath && previousPath !== filePath)),
+      (!prev || resetCurrentFile || upgradeCurrentFile || (previousPath && previousPath !== filePath)),
     );
     const oldContributionCount = Object.keys(oldContributions || {}).length;
     if (sessionId && replacementPath && !oldContributions) {
@@ -23652,20 +25682,25 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
     }
     if (
       replaceSession &&
-      (!parsed.complete || (oldContributionCount > 0 && parsed.deltas.length === 0))
+      (!parsed.complete || !parsed.seedComplete || (oldContributionCount > 0 && parsed.rawDeltas.length === 0))
     ) {
       // A readable header-only or torn replacement is not authoritative. Keep
       // the old contribution until a complete replacement with usage arrives.
       deferredFilePaths.add(replacementPath);
       deferredMigrationPaths.set(
         replacementPath,
-        parsed.complete ? "replacement-has-no-usage" : "replacement-incomplete",
+        !parsed.complete ? "replacement-incomplete" :
+          !parsed.seedComplete ? "seed-boundary-unavailable" : "replacement-has-no-usage",
       );
       if (resetCurrentFile) fileState[filePath] = { ...prev, mtimeMs: -1 };
       reportProgress(idx, recordsProcessed, eventsAggregated, total);
       continue;
     }
-    const candidateContributions = dshContributionsFromDeltas(parsed.deltas);
+    // A correction may legitimately be lower or zero. Verify that the FULL
+    // raw log still accounts for the old ledger before subtracting anything.
+    // Comparing corrected usage to the old totals would reject the very repair
+    // this migration must make; accepting a cropped log would erase history.
+    const candidateContributions = dshContributionsFromDeltas(parsed.rawDeltas);
     if (
       replaceSession &&
       oldContributionCount > 0 &&
@@ -23691,6 +25726,46 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
       continue;
     }
 
+    const owner = sessionId || dshSessionDirectoryKey(filePath);
+    const acceptedDeltas = parsed.deltas.filter((delta) => {
+      if (!delta.messageId) return true;
+      const priorOwner = messageOwners[`a:${delta.messageId}`];
+      return !priorOwner || (replaceSession && priorOwner === owner);
+    });
+    // Known ownership is stronger evidence than bucket totals. An equal or
+    // larger divergent alias can still omit a previously counted message.
+    const ownedIds = new Set(parsed.deltas.map((delta) => delta.messageId).filter(Boolean));
+    const dropsOwnedId = replaceSession && Object.entries(messageOwners).some(([key, value]) =>
+      value === owner && !ownedIds.has(key.slice(2)),
+    );
+    if (dropsOwnedId) {
+      deferredFilePaths.add(replacementPath);
+      deferredMigrationPaths.set(replacementPath, "replacement-drops-owned-message");
+      reportProgress(idx, recordsProcessed, eventsAggregated, total);
+      continue;
+    }
+    const correctedContributions = dshContributionsFromDeltas(acceptedDeltas);
+    if (replaceSession && !dshContributionsCoverPrior(oldContributions, correctedContributions)) {
+      // Aggregate >= is not proof: a cropped transcript can substitute larger
+      // unrelated/replayed usage for a lost event. Reconstruct EXACTLY the
+      // acknowledged prefix before allowing a downward/zero correction.
+      const baselineState = previousState || prev;
+      let baselineSnapshot = snapshot;
+      if (previousPath && !sameDshSessionMetadata(baselineState, snapshot)) {
+        baselineSnapshot = await readDshSessionSnapshot(previousPath).catch(() => null);
+      }
+      const proven = legacyDshContributionsFromSnapshot(baselineSnapshot, baselineState);
+      if (baselineState?.accountingVersion === DSH_ACCOUNTING_VERSION ||
+        !proven || !dshContributionsCoverPrior(oldContributions, proven) ||
+        !dshContributionsCoverPrior(proven, oldContributions) ||
+        !dshRawUsageCoversPrefix(parsed.rawDeltas, baselineSnapshot, baselineState)) {
+        deferredFilePaths.add(replacementPath);
+        deferredMigrationPaths.set(replacementPath, "historical-prefix-unverified");
+        reportProgress(idx, recordsProcessed, eventsAggregated, total);
+        continue;
+      }
+    }
+
     if (replaceSession) {
       applyDshContributions({
         hourlyState,
@@ -23703,18 +25778,24 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 
     let nextContributions = replaceSession
       ? {}
-      : sessionContributions || fileContributions || {};
-    if (fullParsed) {
-      nextContributions = dshContributionsFromDeltas(fullParsed.deltas);
+      : sessionChanged ? {} : sessionContributions || fileContributions || {};
+    // Backfill missing ledgers without re-adding the acknowledged prefix.
+    if (fullParsed && !replaceSession && prev && !sessionChanged && !fileReset) {
+      nextContributions = dshContributionsFromDeltas(fullParsed.deltas.filter((delta) =>
+        (!delta.messageId || !messageOwners[`a:${delta.messageId}`] ||
+          messageOwners[`a:${delta.messageId}`] === owner) &&
+        (delta.seq != null ? delta.seq <= prev.lastSeq : delta.line <= prev.lastLine),
+      ));
     }
 
-    for (const delta of parsed.deltas) {
+    for (const delta of acceptedDeltas) {
+      if (delta.messageId) messageOwners[`a:${delta.messageId}`] = owner;
       const bucketStart = toUtcHalfHourStart(delta.timeMs);
       if (!bucketStart) continue;
       const bucket = getHourlyBucket(hourlyState, DSH_SOURCE, delta.model, bucketStart);
       addTotals(bucket.totals, delta.totals);
       touchedBuckets.add(bucketKey(DSH_SOURCE, delta.model, bucketStart));
-      if (!fullParsed) addDshContribution(nextContributions, delta.model, bucketStart, delta.totals);
+      addDshContribution(nextContributions, delta.model, bucketStart, delta.totals);
       eventsAggregated += 1;
     }
 
@@ -23725,12 +25806,15 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
       mtimeMs: snapshot.mtimeMs,
       sessionId,
       lastSeq: parsed.maxSeq,
+      lastLine: parsed.maxLine,
+      accountingVersion: DSH_ACCOUNTING_VERSION,
       contributions: nextContributions,
       updatedAt,
     };
     if (sessionId) {
       sessionState[sessionId] = {
         lastPath: filePath,
+        accountingVersion: DSH_ACCOUNTING_VERSION,
         contributions: nextContributions,
         updatedAt,
       };
@@ -23748,7 +25832,11 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
     // Retain pre-ledger identity until a replacement is verified. Its counted
     // usage survives file deletion, so elapsed time cannot authorize replay.
     // Current ledgers retain the same identity in sessionState instead.
-    if (legacySessionId && !storedDshContributions(state) && !sessionState[legacySessionId]) {
+    if ((legacySessionId && !storedDshContributions(state) && !sessionState[legacySessionId]) ||
+      (!legacySessionId && state.accountingVersion !== DSH_ACCOUNTING_VERSION)) {
+      if (state.accountingVersion !== DSH_ACCOUNTING_VERSION) {
+        deferredMigrationPaths.set(filePath, "history-unverified");
+      }
       if (!Number.isFinite(Number(state?.missingSince))) {
         fileState[filePath] = { ...state, missingSince: nowMs };
       }
@@ -23757,10 +25845,20 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
     delete fileState[filePath];
   }
 
+  // Missing/corrupt historical transcripts retain their ledger and are made
+  // visible as deferrals, never treated as a provider-wide reset opportunity.
+  for (const [id, session] of Object.entries(sessionState)) {
+    if (session?.accountingVersion !== DSH_ACCOUNTING_VERSION) {
+      const key = session?.lastPath || `session:${id}`;
+      if (!deferredMigrationPaths.has(key)) deferredMigrationPaths.set(key, "history-unverified");
+    }
+  }
   const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
   const updatedAt = new Date().toISOString();
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
+  dshState.accountingVersion = DSH_ACCOUNTING_VERSION;
+  dshState.messageOwners = messageOwners;
   dshState.files = fileState;
   dshState.sessions = sessionState;
   if (deferredMigrationPaths.size > 0) {
@@ -24426,6 +26524,10 @@ module.exports = {
   listRolloutFiles,
   listRolloutFilesDeep,
   codexSessionIdFromPath,
+  isRolloutFileName,
+  isCompressedRolloutFileName,
+  isCompressedRolloutPath,
+  readCodexRolloutSnapshot,
   filterColdCodexRolloutFiles,
   listClaudeProjectFiles,
   listGeminiSessionFiles,
@@ -24434,7 +26536,12 @@ module.exports = {
   readOpencodeDbMessagesIncremental,
   readMimoDbMessages,
   readZcodeDbMessages,
+  coerceEpochMs,
+  normalizeOpencodeModelFields,
   hasZcodeNativeUsageSchema,
+  zcodeDbHasContent,
+  hasZcodeCursorState,
+  resolveZcodeInstallPaths,
   resolveQoderDbPath,
   resolveQoderDbPaths,
   resolveQoderCnDbPaths,
@@ -24468,6 +26575,7 @@ module.exports = {
   parseGeminiIncremental,
   parseOpencodeIncremental,
   parseOpencodeDbIncremental,
+  deriveOpencodeMessageFingerprint,
   parseQoderDbIncremental,
   openclawCursorKey,
   parseOpenclawIncremental,
@@ -24509,6 +26617,8 @@ module.exports = {
   resolveWorkbuddyProjectFiles,
   resolveWorkbuddyDefaultModel,
   parseWorkbuddyIncremental,
+  WORKBUDDY_VARIANTS,
+  resolveWorkbuddyVariant,
   resolveKiroCliSessionFiles,
   resolveKiroCliDbPath,
   parseKiroCliIncremental,
@@ -24551,6 +26661,10 @@ module.exports = {
   normalizeLocalStudioTokens,
   readLmstudioFileRecords,
   parseLmstudioIncremental,
+  resolveOpenSquillaDbPaths,
+  readOpenSquillaUsageRows,
+  normalizeOpenSquillaUsageRow,
+  parseOpenSquillaIncremental,
   resolveUnslothDbPath,
   readUnslothUsageRows,
   normalizeUnslothUsageRow,
@@ -24604,6 +26718,9 @@ module.exports = {
   resolveReasonixTelemetryFiles,
   normalizeReasonixModel,
   parseReasonixIncremental,
+  resolveMuseHome,
+  resolveMuseSessionFiles,
+  parseMuseIncremental,
   // Exposed for regression tests covering cache-token accounting.
   normalizeGeminiTokens,
   normalizeOpencodeTokens,
@@ -24617,6 +26734,7 @@ module.exports = {
   toUtcHalfHourStart,
   totalsKey,
   claudeMessageDedupKey,
+  normalizeClaudeUsage,
   groupBucketKey,
   // Exposed for regression tests covering nested-group remote URLs.
   canonicalizeProjectRef,

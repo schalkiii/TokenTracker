@@ -114,6 +114,32 @@ describe("useLimitsDisplayPrefs", () => {
     expect(Object.values(LIMIT_DISPLAY_MODES)).toEqual(["used", "remaining"]);
   });
 
+  it("keeps an explicit WorkBuddy AI switch and order after the edition split", () => {
+    setStoredSnapshot({ providerOrder: ["workbuddyAi", "claude", "workbuddy"],
+      providerVisibility: { workbuddy: false, workbuddyAi: true } });
+    const { result } = renderHook(() => useLimitsDisplayPrefs());
+    expect(result.current.order.slice(0, 3)).toEqual(["workbuddyAi", "claude", "workbuddy"]);
+    expect(result.current.visibility.workbuddy).toBe(false);
+    expect(result.current.visibility.workbuddyAi).toBe(true);
+    act(() => result.current.toggle("workbuddyAi"));
+    expect(result.current.visibility.workbuddyAi).toBe(false);
+    expect(readStoredSnapshot().providerVisibility.workbuddyAi).toBe(false);
+  });
+
+  it("inherits the unified WorkBuddy switch when no AI value is stored", () => {
+    setStoredSnapshot({ providerVisibility: { workbuddy: false } });
+    const { result } = renderHook(() => useLimitsDisplayPrefs());
+    expect(result.current.visibility.workbuddy).toBe(false);
+    expect(result.current.visibility.workbuddyAi).toBe(false);
+  });
+
+  it("keeps WorkBuddy hidden when both former edition switches were off", () => {
+    setStoredSnapshot({ providerVisibility: { workbuddy: false, workbuddyAi: false } });
+    const { result } = renderHook(() => useLimitsDisplayPrefs());
+    expect(result.current.visibility.workbuddy).toBe(false);
+    expect(result.current.visibility.workbuddyAi).toBe(false);
+  });
+
   it("matches the provider list used for visibility/order keys", () => {
     expect([...LIMIT_PROVIDER_IDS].sort()).toEqual(
       [
@@ -125,8 +151,11 @@ describe("useLimitsDisplayPrefs", () => {
         "commandCode",
         "copilot",
         "cursor",
+        "deepseek",
         "devin",
         "gemini",
+        "workbuddy",
+        "workbuddyAi",
         "grok",
         "kimi",
         "kiro",
@@ -182,6 +211,35 @@ describe("useLimitsDisplayPrefs", () => {
       ...defaultSnapshot("1000"),
       displayMode: LIMIT_DISPLAY_MODES.REMAINING,
     });
+  });
+
+  it("enables or disables all providers in one snapshot without changing other preferences", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1000);
+    const messages = installNativeBridge();
+    const initial = {
+      ...defaultSnapshot(100),
+      displayMode: LIMIT_DISPLAY_MODES.REMAINING,
+      providerOrder: [...LIMIT_PROVIDER_IDS].reverse(),
+      showSubscriptions: false,
+    };
+    setStoredSnapshot(initial);
+    const { result } = renderHook(() => useLimitsDisplayPrefs());
+    messages.length = 0;
+
+    for (const visible of [false, true]) {
+      act(() => result.current.setAllVisible(visible));
+      const expectedVisibility = Object.fromEntries(LIMIT_PROVIDER_IDS.map((id) => [id, visible]));
+      expect(result.current.visibility).toEqual(expectedVisibility);
+      expect(readStoredSnapshot().providerVisibility).toEqual(expectedVisibility);
+      expect(result.current.order).toEqual(initial.providerOrder);
+      expect(result.current.displayMode).toBe(initial.displayMode);
+      expect(result.current.showSubscriptions).toBe(false);
+      expect(bridgeWrites(messages)).toHaveLength(1);
+      expect(bridgeWrites(messages)[0].value.providerVisibility).toEqual(expectedVisibility);
+      messages.length = 0;
+      act(() => result.current.setAllVisible(visible));
+      expect(bridgeWrites(messages)).toHaveLength(0);
+    }
   });
 
   it("warns when localStorage cannot persist a Dashboard change", () => {

@@ -11,8 +11,12 @@ const {
   readJson,
   writeJson,
   chmod600IfPossible,
+  openLock,
 } = require("../lib/fs");
+const { copyRuntimeTree, ensureRuntimeDirectory } = require("../lib/runtime-copy");
 const { resolveMimoNativeDbPath } = require("../lib/install-resolver");
+const { resolveDumateDbPaths } = require("../lib/dumate");
+const { expandHome } = require("../lib/scan-roots");
 const { prompt, promptHidden } = require("../lib/prompt");
 const {
   upsertCodexNotify,
@@ -77,9 +81,11 @@ const {
   resolveAnythingllmDbPath,
   resolveDevinDbPath,
   resolveReasonixHome,
+  resolveMuseHome,
   resolveTraeStoragePath,
 } = require("../lib/rollout");
-const { resolveRuntimeConfig, DEFAULT_BASE_URL } = require("../lib/runtime-config");
+const { resolveRuntimeConfig, DEFAULT_BASE_URL, normalizeInstanceBaseUrl, assertInsforgeRuntime,
+  clearDeviceIdentity, resetInstanceState } = require("../lib/runtime-config");
 const {
   BOLD,
   DIM,
@@ -122,6 +128,7 @@ const SUPPORTED_PROVIDERS = [
   "Antigravity",
   "Kiro",
   "OpenCode",
+  "OpenSquilla",
   "OpenClaw",
   "Every Code",
   "Hermes Agent",
@@ -129,6 +136,7 @@ const SUPPORTED_PROVIDERS = [
   "Kimi Code",
   "CodeBuddy",
   "WorkBuddy",
+  "WorkBuddy AI",
   "Grok Build",
   "oh-my-pi",
   "OmO",
@@ -137,6 +145,7 @@ const SUPPORTED_PROVIDERS = [
   "Prime Agent",
   "Craft Agents",
   "Reasonix",
+  "Muse Code",
   "Kilo CLI",
   "Kilo Code",
   "Roo Code",
@@ -144,6 +153,7 @@ const SUPPORTED_PROVIDERS = [
   "Goose",
   "Droid",
   "Mimo",
+  "DuMate",
   "ZCode",
   "Qoder",
   "AnythingLLM Desktop",
@@ -159,9 +169,10 @@ const SUPPORTED_PROVIDERS = [
   "Command Code",
 ];
 
-async function cmdInit(argv) {
+async function cmdInit(argv, options = {}) {
   const opts = parseArgs(argv);
-  const home = os.homedir();
+  const home = options.home || os.homedir();
+  if (opts.anonKeyFile) opts.anonKey = (await fs.readFile(opts.anonKeyFile, "utf8")).trim();
 
   const { rootDir, trackerDir, binDir } = await resolveTrackerPaths({ home });
 
@@ -171,10 +182,11 @@ async function cmdInit(argv) {
 
   const existingConfig = await readJson(configPath);
   const runtime = resolveRuntimeConfig({
-    cli: { baseUrl: opts.baseUrl, dashboardUrl: opts.dashboardUrl },
+    cli: { baseUrl: opts.baseUrl, dashboardUrl: opts.dashboardUrl, anonKey: opts.anonKey },
     config: existingConfig || {},
     env: process.env,
   });
+  assertInsforgeRuntime(runtime);
   const notifyPath = path.join(binDir, "notify.cjs");
   const appDir = path.join(trackerDir, "app");
   const trackerBinPath = path.join(appDir, "bin", "tracker.js");
@@ -369,16 +381,28 @@ async function runSetup({
     existingConfig && typeof existingConfig === "object" && !Array.isArray(existingConfig)
       ? existingConfig
       : {};
+  const previousRuntime = resolveRuntimeConfig({ config: existingPlainConfig, env: {} });
+  const changedInstance = normalizeInstanceBaseUrl(previousRuntime.baseUrl) !== runtime.baseUrl ||
+    previousRuntime.anonKey !== runtime.anonKey;
+  if (changedInstance) {
+    resetInstanceState(trackerDir);
+    deviceToken = null; deviceId = null;
+  }
   const config = {
-    ...existingPlainConfig,
+    ...(changedInstance ? clearDeviceIdentity(existingPlainConfig) : existingPlainConfig),
     installedAt,
     // Keep a persisted legacy URL until the first sync. sync owns the migration
     // lock and must reset the upload offset/backoff before removing this marker;
     // rewriting it here would skip the historical replay permanently.
     baseUrl: opts.baseUrl || existingPlainConfig.baseUrl || DEFAULT_BASE_URL,
   };
-  if (opts.dashboardUrl) {
-    config.dashboardUrl = opts.dashboardUrl;
+  if (changedInstance || opts.dashboardUrl) {
+    config.dashboardUrl = runtime.dashboardUrl;
+  }
+  if (changedInstance || opts.anonKey || runtime.sources.anonKey === "env") config.anonKey = runtime.anonKey;
+  if (runtime.baseUrl !== DEFAULT_BASE_URL) {
+    config.baseUrl = runtime.baseUrl;
+    config.dashboardUrl = runtime.dashboardUrl;
   }
 
   await writeJson(configPath, config);
@@ -563,6 +587,10 @@ async function repairRuntimeIntegrations({
       settingsPath: context.workbuddySettingsPath,
       hookCommand: context.workbuddyHookCommand,
     })],
+    ["workbuddy-ai", context.workbuddyAiDir, () => upsertClaudeHook({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
+    })],
   ];
   for (const [key, configDir, repair] of hookRepairs) {
     if (await isDir(configDir)) await attempt(key, repair);
@@ -607,6 +635,12 @@ function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
   const workbuddyDir = process.env.WORKBUDDY_HOME || path.join(home, ".workbuddy");
   const workbuddySettingsPath = path.join(workbuddyDir, "settings.json");
   const workbuddyHookCommand = buildHookCommand(notifyPath, "workbuddy");
+  // WorkBuddy AI is the international build of the very same CLI. It keeps its
+  // data in a sibling home (~/.workbuddy-ai), so it needs its own hook install
+  // and its own --source token to be attributed separately from the CN build.
+  const workbuddyAiDir = expandHome(process.env.WORKBUDDY_AI_HOME, home) || path.join(home, ".workbuddy-ai");
+  const workbuddyAiSettingsPath = path.join(workbuddyAiDir, "settings.json");
+  const workbuddyAiHookCommand = buildHookCommand(notifyPath, "workbuddy-ai");
   const geminiConfigDir = resolveGeminiConfigDir({ home, env: process.env });
   const geminiSettingsPath = resolveGeminiSettingsPath({ configDir: geminiConfigDir });
   const geminiHookCommand = buildGeminiHookCommand(notifyPath);
@@ -632,6 +666,9 @@ function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
     workbuddyDir,
     workbuddySettingsPath,
     workbuddyHookCommand,
+    workbuddyAiDir,
+    workbuddyAiSettingsPath,
+    workbuddyAiHookCommand,
     geminiConfigDir,
     geminiSettingsPath,
     geminiHookCommand,
@@ -850,6 +887,13 @@ async function applyIntegrationSetup({
     }
   }
 
+  // Muse Code: passive reader of ~/.local/share/muse/sessions/**/session.jsonl.
+  {
+    if (fssync.existsSync(path.join(resolveMuseHome(process.env), "sessions"))) {
+      summary.push({ label: "Muse Code", status: "detected", detail: "Passive session reader (no hook needed)" });
+    }
+  }
+
   // International TRAE usage is read locally; no hook or vendor login is needed.
   {
     const { resolveTraeDbPaths } = require("../lib/trae-db");
@@ -892,6 +936,13 @@ async function applyIntegrationSetup({
     const kiloDbPath = path.join(kiloHome, "kilo.db");
     if (fssync.existsSync(kiloDbPath)) {
       summary.push({ label: "Kilo CLI", status: "detected", detail: "Passive reader (no hook needed)" });
+    }
+  }
+
+  {
+    const dumateDbPaths = resolveDumateDbPaths({ home });
+    if (dumateDbPaths.length > 0) {
+      summary.push({ label: "DuMate", status: "detected", detail: "Passive reader (no hook needed)" });
     }
   }
 
@@ -1017,6 +1068,18 @@ async function applyIntegrationSetup({
     summary.push({ label: "WorkBuddy", status: "installed", detail: "Hooks installed" });
   } else {
     summary.push({ label: "WorkBuddy", status: "skipped", detail: "Config not found" });
+  }
+
+  // WorkBuddy AI: international build, same hook schema, sibling home.
+  const workbuddyAiDirExists = await isDir(context.workbuddyAiDir);
+  if (workbuddyAiDirExists) {
+    await upsertClaudeHook({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
+    });
+    summary.push({ label: "WorkBuddy AI", status: "installed", detail: "Hooks installed" });
+  } else {
+    summary.push({ label: "WorkBuddy AI", status: "skipped", detail: "Config not found" });
   }
 
   const openclawBefore = await probeOpenclawSessionPluginState({
@@ -1170,6 +1233,21 @@ async function previewIntegrations({ context }) {
     });
   } else {
     summary.push({ label: "WorkBuddy", status: "skipped", detail: "Config not found" });
+  }
+
+  const workbuddyAiDirExists = await isDir(context.workbuddyAiDir);
+  if (workbuddyAiDirExists) {
+    const configured = await isClaudeHookConfigured({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
+    });
+    summary.push({
+      label: "WorkBuddy AI",
+      status: "installed",
+      detail: configured ? "Hooks already installed" : "Will install hooks",
+    });
+  } else {
+    summary.push({ label: "WorkBuddy AI", status: "skipped", detail: "Config not found" });
   }
 
   const geminiConfigExists = await isDir(context.geminiConfigDir);
@@ -1333,6 +1411,8 @@ function parseArgs(argv) {
   const out = {
     baseUrl: null,
     dashboardUrl: null,
+    anonKey: null,
+    anonKeyFile: null,
     email: null,
     password: null,
     deviceName: null,
@@ -1347,6 +1427,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--base-url") out.baseUrl = argv[++i] || null;
     else if (a === "--dashboard-url") out.dashboardUrl = argv[++i] || null;
+    else if (a === "--anon-key") out.anonKey = argv[++i] || null;
+    else if (a === "--anon-key-file") out.anonKeyFile = argv[++i] || null;
     else if (a === "--email") out.email = argv[++i] || null;
     else if (a === "--password") out.password = argv[++i] || null;
     else if (a === "--device-name") out.deviceName = argv[++i] || null;
@@ -1373,6 +1455,7 @@ function normalizePlatform(value) {
 }
 
 function buildNotifyHandler({ trackerDir, packageName }) {
+  const { backendFromUrl, captureClaudeBackend, hashClaudeRange } = require("../lib/claude-backend");
   // Keep this file dependency-free: Node built-ins only.
   // It must never block Codex; it spawns sync in the background and exits 0.
   const queueSignalPath = path.join(trackerDir, "notify.signal");
@@ -1446,6 +1529,14 @@ if (debugEnabled) {
   } catch (_) {}
 }
 
+// Capture before the throttle and before spawning sync. Never persist stdin.
+if (source === 'claude') {
+  try { captureClaudeBackend(trackerDir, JSON.parse(fs.readFileSync(0, 'utf8'))); } catch (_) {}
+}
+${backendFromUrl.toString()}
+${hashClaudeRange.toString()}
+${captureClaudeBackend.toString()}
+
 // Throttle spawn: at most once per 20 seconds.
 try {
     const throttlePath = path.join(trackerDir, 'sync.throttle');
@@ -1472,7 +1563,7 @@ try {
       ? codeOriginalPath
       : source === 'acode'
         ? acodeOriginalPath
-        : source === 'claude' || source === 'opencode' || source === 'gemini' || source === 'codebuddy' || source === 'workbuddy'
+        : source === 'claude' || source === 'opencode' || source === 'gemini' || source === 'codebuddy' || source === 'workbuddy' || source === 'workbuddy-ai'
           ? null
           : codexOriginalPath;
   if (originalPath) {
@@ -2202,7 +2293,7 @@ async function installLocalTrackerApp({ appDir }) {
   // Copy the current package's runtime (bin + src) into ~/.tokentracker so notify can run sync without npx.
   const packageRoot = path.resolve(__dirname, "../..");
   const srcFrom = path.join(packageRoot, "src");
-  const binFrom = path.join(packageRoot, "bin", "tracker.js");
+  const binFrom = path.join(packageRoot, "bin");
   const packageJsonFrom = path.join(packageRoot, "package.json");
   const nodeModulesFrom = path.join(packageRoot, "node_modules");
   const dashboardDistFrom = path.join(packageRoot, "dashboard", "dist");
@@ -2219,17 +2310,31 @@ async function installLocalTrackerApp({ appDir }) {
   const nodeModulesTo = path.join(appDir, "node_modules");
   const dashboardDistTo = path.join(appDir, "dashboard", "dist");
 
-  await fs.rm(appDir, { recursive: true, force: true }).catch(() => {});
-  await ensureDir(appDir);
-  await fs.cp(srcFrom, srcTo, { recursive: true });
-  await ensureDir(binToDir);
-  await fs.copyFile(binFrom, binTo);
-  await fs.chmod(binTo, 0o755).catch(() => {});
-  await fs.copyFile(packageJsonFrom, path.join(appDir, "package.json")).catch(() => {});
-  if (await isDir(dashboardDistFrom)) {
-    await fs.cp(dashboardDistFrom, dashboardDistTo, { recursive: true });
+  // Serialize installers: init and desktop startup can overlap. In particular,
+  // one refresh must not prune another writer's atomic temporary files.
+  await ensureDir(path.dirname(appDir));
+  const deadline = Date.now() + 120_000;
+  let lock;
+  while (!(lock = await openLock(`${appDir}.install.lock`, { quietIfLocked: true }))) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for local runtime installation");
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  await copyRuntimeDependencies({ from: nodeModulesFrom, to: nodeModulesTo });
+  try {
+    await ensureRuntimeDirectory(appDir);
+    await copyRuntimeTree(srcFrom, srcTo);
+    await copyRuntimeTree(binFrom, binToDir);
+    await fs.chmod(binTo, 0o755).catch(() => {});
+    if (await isDir(dashboardDistFrom)) {
+      await ensureRuntimeDirectory(path.dirname(dashboardDistTo));
+      await copyRuntimeTree(dashboardDistFrom, dashboardDistTo);
+    } else {
+      await fs.rm(path.dirname(dashboardDistTo), { recursive: true, force: true });
+    }
+    await copyRuntimeDependencies({ from: nodeModulesFrom, to: nodeModulesTo });
+    await copyRuntimeTree(packageJsonFrom, path.join(appDir, "package.json"));
+  } finally {
+    await lock.release();
+  }
 }
 
 async function pathsPointToSameLocation(a, b) {
@@ -2338,15 +2443,13 @@ function readFirstSyncTotals(trackerDir) {
 }
 
 async function copyRuntimeDependencies({ from, to }) {
-  try {
-    const st = await fs.stat(from);
-    if (!st.isDirectory()) return;
-  } catch (_e) {
+  if (!(await isDir(from))) {
+    await fs.rm(to, { recursive: true, force: true });
     return;
   }
 
   try {
-    await fs.cp(from, to, { recursive: true });
+    await copyRuntimeTree(from, to);
   } catch (_e) {
     // Best-effort: missing dependencies will fall back to npx at notify time.
   }

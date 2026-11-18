@@ -13,10 +13,11 @@ import {
   isMockEnabled,
 } from "./mock-data";
 import { getInsforgeRemoteUrl, getInsforgeAnonKey } from "./insforge-config";
-import { isValidJwtShape } from "./auth-token";
+import { isValidJwtShape, resolveAuthAccessToken, type AuthTokenProvider } from "./auth-token";
 import { getLocalApiAuthHeaders } from "./local-api-auth";
 import { expandHeatmapCompact } from "./heatmap-compact";
 import { functionUrlFor, fetchFunctionResponse } from "./function-url";
+import { clearCloudPromptFailure, recordCloudPromptFailure } from "./cloud-prompt-policy.js";
 
 type AnyRecord = Record<string, any>;
 
@@ -33,6 +34,10 @@ const SESSION_INSIGHTS_RESPONSE_TTL_MS = 5 * 60_000;
 const SESSION_INSIGHTS_RESPONSE_STALE_IF_ERROR_MS = 15 * 60_000;
 const verifiedAccountTokens = new Set<string>();
 let accountCacheGeneration = 0;
+function assertBackendInstance(baseUrl: string, anonKey: string) {
+  if (baseUrl === getInsforgeRemoteUrl() && anonKey === getInsforgeAnonKey()) return;
+  throw Object.assign(new Error("instance_changed"), { code: "instance_changed", status: 409 });
+}
 
 function accountIdentity(accessToken: string) {
   try {
@@ -70,22 +75,28 @@ function coalesceJsonGet(key: string, request: () => Promise<any>) {
 function cachedAccountJsonGet(url: URL, accessToken: string, request: () => Promise<any>) {
   const params = new URLSearchParams(url.searchParams);
   params.sort();
-  const key = `${url.origin}${url.pathname}?${params}\0${accountIdentity(accessToken)}`;
+  const anonEpoch = getInsforgeAnonKey();
+  const instanceBase = getInsforgeRemoteUrl();
+  const key = `${url.origin}${url.pathname}?${params}\0${accountIdentity(accessToken)}\0${anonEpoch}`;
   const generation = accountCacheGeneration;
   const now = Date.now();
   const cached = accountResponseCache.get(key);
   const ttl = url.pathname.endsWith("tokentracker-account-summary")
     ? ACCOUNT_SUMMARY_RESPONSE_TTL_MS : ACCOUNT_RESPONSE_TTL_MS;
-  const tokenKey = `${url.origin}\0${accessToken}`;
+  const tokenKey = `${url.origin}\0${accessToken}\0${anonEpoch}`;
   const authenticated = verifiedAccountTokens.has(tokenKey);
   if (authenticated && cached && now - cached.fetchedAt < ttl) {
-    return Promise.resolve(structuredClone(cached.value));
+    return Promise.resolve(structuredClone(cached.value)).then((value) => {
+      assertBackendInstance(instanceBase, anonEpoch);
+      return value;
+    });
   }
 
   // An unseen JWT must reach the server before it can reuse data for its sub.
   return coalesceJsonGet(`${key}\0${generation}\0${authenticated ? "verified" : accessToken}`, async () => {
     try {
       const value = await request();
+      assertBackendInstance(instanceBase, anonEpoch);
       if (generation !== accountCacheGeneration) return value;
       verifiedAccountTokens.add(tokenKey);
       if (verifiedAccountTokens.size > 128) verifiedAccountTokens.delete(verifiedAccountTokens.values().next().value!);
@@ -98,6 +109,7 @@ function cachedAccountJsonGet(url: URL, accessToken: string, request: () => Prom
       }
       return value;
     } catch (error) {
+      assertBackendInstance(instanceBase, anonEpoch);
       const status = Number((error as any)?.status) || 0;
       if (status === 401 || status === 403) {
         invalidateAccountResponseCache();
@@ -140,6 +152,7 @@ const PATHS = {
   userStatus: "tokentracker-user-status",
   localSync: "tokentracker-local-sync",
   usageLimits: "tokentracker-usage-limits",
+  providerKey: "tokentracker-provider-key",
   outcomes: "tokentracker-outcomes",
   sessionInsights: "tokentracker-session-insights",
   contextHealth: "tokentracker-context-health",
@@ -357,12 +370,15 @@ async function fetchInsforgeFunction(slug: string, options: {
     cache: options.cache,
     ...(options.body != null ? { body: JSON.stringify(options.body) } : {}),
   });
+  assertBackendInstance(baseUrl, anonKey);
   if (!res.ok) {
     const err: any = new Error(`Request failed with HTTP ${res.status}`);
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  const data = await res.json();
+  assertBackendInstance(baseUrl, anonKey);
+  return data;
 }
 
 export async function getLeaderboard({
@@ -703,6 +719,7 @@ export async function getUsageCategoryBreakdown({
   from,
   to,
   source = "claude",
+  device,
   timeZone,
   tzOffsetMinutes,
 }: AnyRecord = {}) {
@@ -710,7 +727,7 @@ export async function getUsageCategoryBreakdown({
     return getMockUsageCategoryBreakdown({ from, to, source });
   }
   const tzParams = buildTimeZoneParams({ timeZone, tzOffsetMinutes });
-  return fetchLocalJson(PATHS.usageCategoryBreakdown, { from, to, source, ...tzParams });
+  return fetchLocalJson(PATHS.usageCategoryBreakdown, { from, to, source, ...buildFilterParams({ device }), ...tzParams });
 }
 
 export async function getUsageDaily({
@@ -772,7 +789,9 @@ export async function getUsageMonthly({
   }, { accessToken });
 }
 
-export async function getUsageLimits(opts: { refresh?: boolean; devinEnabled?: boolean } = {}) {
+export async function getUsageLimits(
+  opts: { refresh?: boolean; devinEnabled?: boolean; hiddenProviders?: readonly string[] } = {},
+) {
   const params: AnyRecord = opts?.refresh ? { refresh: "1" } : {};
   const options: AnyRecord = {};
   // Devin quota is opt-in: devin=1 is honored by the local API only together
@@ -781,12 +800,72 @@ export async function getUsageLimits(opts: { refresh?: boolean; devinEnabled?: b
   // is nothing to opt in to, so the flag is not sent at all.
   if (opts?.devinEnabled === true && isLocalhostHost()) {
     params.devin = "1";
+  }
+  // Provider visibility (issue 956): hidden providers are not fetched at all — no
+  // upstream call, no credential read. Same loopback-auth requirement as the
+  // devin opt-in, same off-host silence; an empty list sends nothing, which
+  // keeps legacy clients (and the hosted site) on the fetch-everything path.
+  const hiddenProviders = (opts?.hiddenProviders ?? []).filter(
+    (id) => typeof id === "string" && id !== "",
+  );
+  if (hiddenProviders.length > 0 && isLocalhostHost()) {
+    params.hidden = hiddenProviders.join(",");
+  }
+  if ((params.devin || params.hidden) && isLocalhostHost()) {
     options.headers = {
       Accept: "application/json",
       ...(await getLocalApiAuthHeaders()),
     };
   }
   return fetchLocalJson(PATHS.usageLimits, params, options);
+}
+
+export type CursorConnection = {
+  status: "disconnected" | "pending" | "connected" | "expired" | "failed" | "cancelled";
+  attemptId?: string;
+  authUrl?: string;
+  expiresAt?: number | string;
+};
+
+export async function updateCursorConnection(
+  action?: "start" | "poll" | "cancel" | "disconnect",
+  attemptId?: string,
+): Promise<CursorConnection> {
+  if (!isLocalhostHost()) throw new Error("Cursor connections require the local dashboard");
+  const response = await fetch("/functions/tokentracker-cursor-connection", {
+    method: action ? "POST" : "GET",
+    headers: { Accept: "application/json", "Content-Type": "application/json", ...(await getLocalApiAuthHeaders()) },
+    ...(action ? { body: JSON.stringify({ action, attemptId }) } : {}),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}`);
+  return response.json();
+}
+
+/**
+ * Saves a provider API key in TokenTracker's own 0600 store (never the launch
+ * environment). Only the local backend implements this endpoint; the key is
+ * sent to the loopback server and is never logged or echoed back.
+ */
+export async function saveProviderApiKey(
+  provider: "opencode-go" | "command-code" | "deepseek",
+  apiKey: string,
+): Promise<{ ok: boolean; configured: boolean; source: string }> {
+  const authHeaders = await getLocalApiAuthHeaders();
+  const response = await fetch(`/functions/${PATHS.providerKey}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify({ provider, apiKey }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Request failed with HTTP ${response.status}`);
+  }
+  return response.json();
 }
 
 export async function getUsageHeatmap({
@@ -838,14 +917,20 @@ const ACCOUNT_PATHS = {
 async function fetchAccountFunction(
   slug: string,
   params: AnyRecord | undefined,
-  accessToken: string,
+  auth: AuthTokenProvider,
 ) {
+  const baseUrl = getInsforgeRemoteUrl();
+  const anonKey = getInsforgeAnonKey();
+  const assertInstance = () => {
+    assertBackendInstance(baseUrl, anonKey);
+  };
+  const accessToken = typeof auth === "string" ? auth.trim() : await resolveAuthAccessToken(auth);
+  assertInstance();
   if (!accessToken || !isValidJwtShape(accessToken)) {
     const err: any = new Error("Account view requires a signed-in user");
     err.status = 401;
     throw err;
   }
-  const baseUrl = getInsforgeRemoteUrl();
   if (!baseUrl) {
     const err: any = new Error("InsForge base URL not configured");
     err.status = 0;
@@ -863,22 +948,36 @@ async function fetchAccountFunction(
     Accept: "application/json",
     Authorization: `Bearer ${accessToken}`,
   };
-  const anonKey = getInsforgeAnonKey();
   if (anonKey) headers.apikey = anonKey;
-  return cachedAccountJsonGet(url, accessToken, async () => {
+  const result = await cachedAccountJsonGet(url, accessToken, async () => {
+    assertInstance();
     const response = await fetchFunctionResponse(url.toString(), {
       method: "GET",
       headers,
       cache: "no-store",
     });
+    assertInstance();
     if (!response.ok) {
       const err: any = new Error(`Request failed with HTTP ${response.status}`);
       err.status = response.status;
+      const denied = await response.json().catch(() => null);
+      assertInstance();
+      if (typeof denied?.code === "string") {
+        err.code = denied.code;
+        if (baseUrl === getInsforgeRemoteUrl())
+          recordCloudPromptFailure(accountIdentity(accessToken), denied.code, denied.membership, slug, {
+            machineCount: Number.isFinite(denied.machine_count) ? denied.machine_count : undefined,
+          });
+      }
       throw err;
     }
     const data = await response.json();
+    assertInstance();
+    if (baseUrl === getInsforgeRemoteUrl()) clearCloudPromptFailure(accountIdentity(accessToken), slug);
     return slug === ACCOUNT_PATHS.heatmap ? expandHeatmapCompact(data) : data;
   });
+  assertInstance();
+  return result;
 }
 
 export async function fetchCloudUsageSummary({

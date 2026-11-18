@@ -8,6 +8,44 @@ final class LimitsSettingsStoreTests: XCTestCase {
     }
     private var cancellables: Set<AnyCancellable> = []
 
+    func testWorkbuddyEditionsStaySplitWithExplicitSwitches() {
+        let (store, _) = makeStore()
+        XCTAssertTrue(store.applyBridgeSnapshot([
+            "providerOrder": ["workbuddyAi", "claude", "workbuddy"],
+            "providerVisibility": ["workbuddy": false, "workbuddyAi": true],
+            "updatedAt": 100,
+        ]))
+        XCTAssertEqual(Array(store.providerOrder.prefix(3)), ["workbuddyAi", "claude", "workbuddy"])
+        XCTAssertFalse(store.isVisible("workbuddy"))
+        XCTAssertTrue(store.isVisible("workbuddyAi"))
+        store.setProviderVisibilityFromMenu("workbuddyAi", isVisible: false)
+        XCTAssertFalse(store.isVisible("workbuddyAi"))
+        XCTAssertFalse(store.isVisible("workbuddy"))
+    }
+
+    func testUnifiedWorkbuddySwitchInheritsIntoAiRow() {
+        let (store, _) = makeStore()
+        XCTAssertTrue(store.applyBridgeSnapshot([
+            "providerOrder": ["workbuddy"],
+            "providerVisibility": ["workbuddy": false],
+            "updatedAt": 100,
+        ]))
+        XCTAssertFalse(store.isVisible("workbuddy"))
+        XCTAssertFalse(store.isVisible("workbuddyAi"))
+    }
+
+    func testWorkbuddyCreditAmountsDecodeWithoutAffectingOlderWindows() throws {
+        let data = Data(#"{"used_percent":50.586,"limit_credits":500,"used_credits":252.93,"remaining_credits":247.07}"#.utf8)
+        let window = try JSONDecoder().decode(GenericLimitWindow.self, from: data)
+        XCTAssertEqual(window.limitCredits, 500)
+        XCTAssertEqual(window.usedCredits, 252.93)
+        XCTAssertEqual(window.remainingCredits, 247.07)
+        XCTAssertTrue(window.creditsDetail?.contains("252.93") == true)
+        XCTAssertTrue(window.creditsDetail?.contains("247.07") == true)
+        let old = try JSONDecoder().decode(GenericLimitWindow.self, from: Data(#"{"used_percent":20}"#.utf8))
+        XCTAssertNil(old.creditsDetail)
+    }
+
     override func tearDown() {
         cancellables.removeAll()
         super.tearDown()

@@ -36,7 +36,7 @@ final class LimitsSettingsStore: ObservableObject {
     static let shared = LimitsSettingsStore(userDefaults: .standard)
 
     /// All known provider identifiers, in default display order.
-    static let allProviders: [String] = ["claude", "codex", "cursor", "gemini", "kimi", "kiro", "grok", "copilot", "antigravity", "zcode", "opencodeGo", "commandCode", "qoder", "qoderCn", "codingPlan", "agentPlan", "devin"]
+    static let allProviders: [String] = ["claude", "codex", "cursor", "gemini", "kimi", "kiro", "grok", "copilot", "antigravity", "zcode", "opencodeGo", "commandCode", "qoder", "qoderCn", "codingPlan", "agentPlan", "devin", "workbuddy", "workbuddyAi", "deepseek"]
 
     static let displayNames: [String: String] = [
         "claude": "Claude",
@@ -56,6 +56,9 @@ final class LimitsSettingsStore: ObservableObject {
         "codingPlan": "Ark Coding Plan",
         "agentPlan": "Ark Agent Plan",
         "devin": "Devin",
+        "workbuddy": "WorkBuddy",
+        "workbuddyAi": "WorkBuddy AI",
+        "deepseek": "DeepSeek",
     ]
 
     /// Providers whose visibility switch is also the consent to fetch them.
@@ -345,9 +348,10 @@ final class LimitsSettingsStore: ObservableObject {
     private static func normalizeProviderOrder(_ raw: [String]?) -> [String] {
         var seen = Set<String>()
         var ordered: [String] = []
-        for id in raw ?? [] where allProviders.contains(id) && !seen.contains(id) {
-            ordered.append(id)
-            seen.insert(id)
+        for rawId in raw ?? [] {
+            guard allProviders.contains(rawId), !seen.contains(rawId) else { continue }
+            ordered.append(rawId)
+            seen.insert(rawId)
         }
         for id in allProviders where !seen.contains(id) {
             ordered.append(id)
@@ -356,15 +360,24 @@ final class LimitsSettingsStore: ObservableObject {
     }
 
     private static func normalizeProviderVisibility(_ raw: [String: Any]?) -> [String: Bool] {
-        Dictionary(uniqueKeysWithValues: allProviders.map { id in
+        var visibility = Dictionary(uniqueKeysWithValues: allProviders.map { id in
             (id, rawBool(raw?[id]) ?? defaultVisibility(forProvider: id))
         })
+        // The unified-row era folded both editions into one `workbuddy`
+        // switch. The split rows keep an explicitly stored AI value; without
+        // one the AI row inherits the unified switch so a user who had
+        // WorkBuddy visible keeps seeing both editions, and a user who had
+        // it hidden keeps both hidden.
+        if let explicitAi = rawBool(raw?["workbuddyAi"]) {
+            visibility["workbuddyAi"] = explicitAi
+        } else if let unified = rawBool(raw?["workbuddy"]) {
+            visibility["workbuddyAi"] = unified
+        }
+        return visibility
     }
 
     private static func normalizeProviderVisibility(_ raw: [String: Bool]) -> [String: Bool] {
-        Dictionary(uniqueKeysWithValues: allProviders.map { id in
-            (id, raw[id] ?? defaultVisibility(forProvider: id))
-        })
+        normalizeProviderVisibility(raw.mapValues { $0 as Any })
     }
 
     private static func normalizeDisplayMode(_ raw: Any?) -> LimitDisplayMode {

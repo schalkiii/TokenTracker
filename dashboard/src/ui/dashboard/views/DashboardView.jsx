@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback } from "react";
 import { motion } from "motion/react";
 import {
   DndContext,
@@ -20,11 +20,6 @@ import { UsageOverview } from "../components/UsageOverview.jsx";
 import { TrendMonitor } from "../components/TrendMonitor.jsx";
 import { SortableCard } from "../components/SortableCard.jsx";
 import { FadeIn } from "../../foundation/FadeIn.jsx";
-import { MacAppBanner } from "../components/MacAppBanner.jsx";
-import { WidgetOnboardingCard } from "../components/WidgetOnboardingCard.jsx";
-import { LinuxTopBarCard } from "../components/LinuxTopBarCard.jsx";
-import { IslandOnboardingCard } from "../components/IslandOnboardingCard.jsx";
-import { LinuxPetCard } from "../components/LinuxPetCard.jsx";
 import { QualityPerDollarCard } from "../components/QualityPerDollarCard.jsx";
 import { SessionInsightsCard } from "../components/SessionInsightsCard.jsx";
 import { LoginCard } from "../../../components/LoginCard.jsx";
@@ -41,10 +36,6 @@ const GATE_LOGOS = AGENT_LOGOS.slice(0, 10);
 const STEP = 0.06;
 const D_LEFT_BASE = 0.11;
 const D_RIGHT_BASE = 0.05;
-// islandOnboarding must NOT be prunable: it renders null until the native
-// bridge pushes settings (async), and a pruned card is unmounted for good —
-// it would never get the chance to appear once settings arrive.
-const EMPTY_PRUNABLE_CARD_IDS = new Set(["macAppBanner", "widgetOnboarding", "linuxTopBarCard"]);
 
 function FullPageGateLayout({ title, subtitle, desc, loginCard, copy }) {
   return (
@@ -114,6 +105,7 @@ export function DashboardView(props) {
 
   const {
     copy,
+    cloudNotice,
     onOpenShare,
     screenshotMode,
     showExpiredGate,
@@ -131,6 +123,9 @@ export function DashboardView(props) {
     signedIn,
     publicMode,
     isLocalMode,
+    accountView,
+    accountScopeSwitchable,
+
     shouldShowInstall,
     installPrompt,
     handleCopyInstall,
@@ -199,6 +194,8 @@ export function DashboardView(props) {
     selectedDevice,
     onDeviceChange,
     deviceUsageBlock,
+    localHistoryOnly,
+    localHistoryRevision,
     leftCardOrder,
     onLeftReorder,
     rightCardOrder,
@@ -209,28 +206,9 @@ export function DashboardView(props) {
   const header = null;
   const footer = null;
 
-  // Cards that are permanently hidden after mount (dismissed native banners,
-  // widget onboarding) get dropped from sortable `items` entirely. Async cards
-  // such as QualityPerDollarCard must stay mounted while their data loads.
-  const [emptyCardIds, setEmptyCardIds] = useState(() => new Set());
-  const handleCardEmptyChange = useCallback((id, isEmpty) => {
-    if (!EMPTY_PRUNABLE_CARD_IDS.has(id)) return;
-    setEmptyCardIds((prev) => {
-      if (prev.has(id) === isEmpty) return prev;
-      const next = new Set(prev);
-      if (isEmpty) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  }, []);
-
+  // Ignore removed promotional cards in older saved layouts before registering sortable items.
   const leftVisible = {
-    macAppBanner: isLocalMode,
     statsPanel: true,
-    islandOnboarding: isLocalMode,
-    linuxPetCard: isLocalMode,
-    widgetOnboarding: isLocalMode,
-    linuxTopBarCard: isLocalMode,
     installCopy: shouldShowInstall,
     activityHeatmap: Boolean(activityHeatmapBlock),
     deviceUsage: Boolean(deviceUsageBlock),
@@ -239,7 +217,7 @@ export function DashboardView(props) {
     sessionInsights: isLocalMode && !screenshotMode,
   };
   const visibleLeftOrder = (leftCardOrder || []).filter(
-    (id) => leftVisible[id] && !emptyCardIds.has(id),
+    (id) => leftVisible[id],
   );
 
   const rightVisible = {
@@ -247,20 +225,11 @@ export function DashboardView(props) {
     dataDetails: !screenshotMode,
   };
   const visibleRightOrder = (rightCardOrder || []).filter(
-    (id) => rightVisible[id] && !emptyCardIds.has(id),
+    (id) => rightVisible[id],
   );
 
   function renderLeftCard(id, delay) {
     switch (id) {
-      case "macAppBanner": {
-        return (
-          <MacAppBanner
-            todayTokens={summaryTotalTokensRaw}
-            isSyncing={usageLoadingState}
-            enterDelay={delay}
-          />
-        );
-      }
       case "statsPanel": {
         return (
           <FadeIn delay={delay}>
@@ -277,18 +246,6 @@ export function DashboardView(props) {
             />
           </FadeIn>
         );
-      }
-      case "islandOnboarding": {
-        return <IslandOnboardingCard enterDelay={delay} />;
-      }
-      case "linuxPetCard": {
-        return <LinuxPetCard enterDelay={delay} />;
-      }
-      case "widgetOnboarding": {
-        return <WidgetOnboardingCard enterDelay={delay} />;
-      }
-      case "linuxTopBarCard": {
-        return <LinuxTopBarCard enterDelay={delay} />;
       }
       case "installCopy": {
         return (
@@ -360,6 +317,9 @@ export function DashboardView(props) {
         return (
           <FadeIn delay={delay}>
             <UsageOverview
+              cloudNotice={screenshotMode ? null : cloudNotice}
+              accountView={accountView}
+              accountScopeSwitchable={accountScopeSwitchable}
               period={period}
               periods={periodsForDisplay}
               onPeriodChange={setSelectedPeriod}
@@ -386,6 +346,7 @@ export function DashboardView(props) {
               to={usageTo}
               deviceOptions={deviceOptions}
               selectedDevice={selectedDevice}
+              dataRevision={localHistoryRevision}
               onDeviceChange={onDeviceChange}
             />
           </FadeIn>
@@ -470,7 +431,7 @@ export function DashboardView(props) {
       <DndContext sensors={sensors} onDragEnd={onDragEnd}>
         <SortableContext items={order} strategy={verticalListSortingStrategy}>
           {order.map((id, i) => (
-            <SortableCard key={id} id={id} onEmptyChange={handleCardEmptyChange}>
+            <SortableCard key={id} id={id}>
               {renderCard(id, baseDelay + STEP * i)}
             </SortableCard>
           ))}
@@ -536,6 +497,7 @@ export function DashboardView(props) {
         )}
         {!showAuthGate && !showExpiredGate && !initialDashboardLoading && (
           <>
+            {localHistoryOnly && <p className="mb-3 text-xs text-oai-gray-500 dark:text-oai-gray-400">{copy("settings.local_data.local_history_only")}</p>}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
               <div className="lg:col-span-4 flex flex-col gap-4 min-w-0 order-2 lg:order-1">
                 {leftColumnContent}

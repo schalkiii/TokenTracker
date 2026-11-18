@@ -80,6 +80,8 @@ test("Claude session analytics retains metadata but never content", async () => 
   assert.equal(session.one_shot, true);
   assert.equal(session.subagent_calls, 1);
   assert.equal(session.total_tokens, 185);
+  assert.equal(session.usage_buckets.length, 2);
+  assert.equal(session.usage_buckets.reduce((sum, bucket) => sum + bucket.total_tokens, 0), 185);
   assert.equal(JSON.stringify(session).includes(secret), false);
 
   const summary = summarizeSessions([session]);
@@ -269,6 +271,9 @@ test("Codex session analytics preserves the exact GPT-5.6 Sol long-context reque
   assert.equal(modelUsage.long_context_output_tokens, 10_000);
   assert.equal(modelUsage.long_context_usage_events, 1);
   assert.ok(Math.abs(session.cost_usd - 0.9) < 1e-12);
+  const scoped = listSessionsForBrowser([session], { from: "2026-07-18", to: "2026-07-18" }).sessions[0];
+  assert.equal(scoped.model_usage[0].long_context_input_tokens, 50_000);
+  assert.equal(scoped.cost_usd, session.cost_usd);
 });
 
 test("efficiency denominators only use sessions that contain edits", () => {
@@ -360,7 +365,7 @@ test("session analytics reuses unchanged file records during an incremental rebu
   await buildSessionAnalytics({ home, force: true });
   const sidecarPath = path.join(home, ".tokentracker", "tracker", "session.queue.jsonl");
   const cachedRows = fs.readFileSync(sidecarPath, "utf8").trim().split("\n").map(JSON.parse);
-  cachedRows.find((row) => row.project_key === "project-a").model = "cached-proof";
+  cachedRows.find((row) => row.project_key === "project-a").title = "cached-proof";
   fs.writeFileSync(sidecarPath, `${cachedRows.map(JSON.stringify).join("\n")}\n`);
   fs.appendFileSync(changedFile, `${JSON.stringify({
     type: "user",
@@ -371,8 +376,84 @@ test("session analytics reuses unchanged file records during an incremental rebu
   })}\n`);
 
   const rebuilt = await buildSessionAnalytics({ home, cacheTtlMs: 0 });
-  assert.equal(rebuilt.find((row) => row.project_key === "project-a").model, "cached-proof");
+  assert.equal(rebuilt.find((row) => row.project_key === "project-a").title, "cached-proof");
   assert.equal(rebuilt.find((row) => row.project_key === "project-b").turns, 2);
+});
+
+test("recheck skips the TTL but still reuses unchanged files", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tt-session-recheck-"));
+  const writeSession = (project, sessionId) => {
+    const projectDir = path.join(home, ".claude", "projects", project);
+    fs.mkdirSync(projectDir, { recursive: true });
+    const filePath = path.join(projectDir, `${sessionId}.jsonl`);
+    const rows = [
+      { type: "user", sessionId, cwd: projectDir, timestamp: "2026-07-18T06:00:00Z", message: { content: "build" } },
+      { type: "assistant", sessionId, cwd: projectDir, timestamp: "2026-07-18T06:00:01Z", message: { id: `${sessionId}-message`, model: "claude-recheck", usage: { input_tokens: 10, output_tokens: 2 }, content: [] } },
+    ];
+    fs.writeFileSync(filePath, `${rows.map(JSON.stringify).join("\n")}\n`);
+    return filePath;
+  };
+  writeSession("project-a", "session-a");
+
+  await buildSessionAnalytics({ home, force: true });
+  const sidecarPath = path.join(home, ".tokentracker", "tracker", "session.queue.jsonl");
+  const cachedRows = fs.readFileSync(sidecarPath, "utf8").trim().split("\n").map(JSON.parse);
+  cachedRows[0].title = "cached-proof";
+  fs.writeFileSync(sidecarPath, `${cachedRows.map(JSON.stringify).join("\n")}\n`);
+  writeSession("project-b", "session-b");
+
+  // Inside the TTL a plain build answers from the cached snapshot, so the new
+  // session stays invisible. That is exactly the behaviour refresh must not
+  // inherit: it used to force a full re-parse to see the new file.
+  const ttlHit = await buildSessionAnalytics({ home });
+  assert.equal(ttlHit.length, 1);
+  assert.equal(ttlHit[0].title, "cached-proof");
+
+  // recheck ignores the TTL, walks the tree, picks up the new file and still
+  // reuses the untouched one instead of re-parsing it.
+  const rechecked = await buildSessionAnalytics({ home, recheck: true });
+  assert.equal(rechecked.length, 2);
+  assert.equal(rechecked.find((row) => row.project_key === "project-a").title, "cached-proof");
+  assert.equal(rechecked.find((row) => row.project_key === "project-b").turns, 1);
+});
+
+test("recheck retries a previous run that skipped transcripts", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tt-session-recheck-skipped-"));
+  const projectDir = path.join(home, ".claude", "projects", "project-a");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, "session-a.jsonl"), `${JSON.stringify({ type: "user", sessionId: "session-a", cwd: projectDir, timestamp: "2026-07-18T06:00:00Z", message: { content: "build" } })}\n`);
+
+  await buildSessionAnalytics({ home, force: true });
+  const metaPath = path.join(home, ".tokentracker", "tracker", "session.queue.jsonl.meta.json");
+  // Simulate a run that had to skip a transcript (transient read/parse error).
+  // Nothing on disk changes, so only an explicit refresh may retry it.
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  meta.skipped_files = 1;
+  fs.writeFileSync(metaPath, `${JSON.stringify(meta)}\n`);
+
+  const refreshed = await buildSessionAnalytics({ home, recheck: true });
+  assert.equal(refreshed.length, 1);
+  // The rebuild recomputed the real skip count (0) instead of trusting the
+  // cached "1"; a plain TTL/signature hit would have preserved it.
+  assert.equal(JSON.parse(fs.readFileSync(metaPath, "utf8")).skipped_files, 0);
+});
+
+test("recheck rebuilds a corrupt sidecar instead of serving the empty cache", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tt-session-recheck-sidecar-"));
+  const projectDir = path.join(home, ".claude", "projects", "project-a");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(path.join(projectDir, "session-a.jsonl"), `${JSON.stringify({ type: "user", sessionId: "session-a", cwd: projectDir, timestamp: "2026-07-18T06:00:00Z", message: { content: "build" } })}\n`);
+
+  await buildSessionAnalytics({ home, force: true });
+  const sidecarPath = path.join(home, ".tokentracker", "tracker", "session.queue.jsonl");
+  // Keep the meta signature valid but destroy the sidecar: the signature still
+  // matches, so only the sidecarReadFailed guard forces a rebuild.
+  fs.writeFileSync(sidecarPath, "{not valid json\n");
+
+  const rebuilt = await buildSessionAnalytics({ home, recheck: true });
+  assert.equal(rebuilt.length, 1);
+  const persisted = fs.readFileSync(sidecarPath, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  assert.equal(persisted.length, 1);
 });
 
 test("Claude session title uses the ai-title record, never the prompt body", async () => {
@@ -537,9 +618,9 @@ for (const largeFirst of [false, true]) {
     assert.equal(summarizeSessions(fragments).summary.cost_usd, expectedCost);
     const merged = listSessionsForBrowser(fragments).sessions[0];
     assert.equal(merged.cost_usd, expectedCost);
-    assert.equal(merged.model, "claude-sonnet-4-5");
+    assert.equal(merged.model, "mixed");
     assert.equal(merged.total_tokens, 1_100_000);
-    assert.equal(merged.model_usage[0].cost_usd, expectedCost);
+    assert.equal(merged.model_usage.reduce((sum, row) => sum + row.cost_usd, 0), expectedCost);
   });
 }
 
@@ -762,6 +843,8 @@ test("Grok session analytics bills from turn_completed.usage and keeps titles lo
   // Grok inputTokens is cache-inclusive, and outputTokens includes reasoning.
   // All stored columns are mutually exclusive and still sum to totalTokens.
   assert.equal(session.total_tokens, 120);
+  assert.equal(session.usage_buckets.length, 1);
+  assert.equal(session.usage_buckets[0].total_tokens, 120);
   assert.equal(session.tokens.input_tokens, 80);
   assert.equal(session.tokens.cached_input_tokens, 10);
   assert.equal(session.tokens.cache_creation_input_tokens, 10);
@@ -1077,8 +1160,8 @@ test("model_usage reaches the browser dense whatever the sidecar stored", async 
     { timestamp: "2026-07-23T08:00:02Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: usage(100, 20), total_token_usage: usage(120, 0) } } },
   ].map(JSON.stringify).join("\n")}\n`);
 
-  // Claude records never carry model_usage at all, so they exercise the
-  // fallback branch that used to emit a six-field row.
+  // Both providers now persist per-model usage; legacy rows still exercise
+  // the fallback branch that used to emit a six-field row.
   const claudePath = path.join(dir, "claude.jsonl");
   fs.writeFileSync(claudePath, `${[
     { type: "user", sessionId: "dense-1", cwd: dir, timestamp: "2026-07-23T09:00:00Z", message: { content: "do the thing" } },
@@ -1087,10 +1170,11 @@ test("model_usage reaches the browser dense whatever the sidecar stored", async 
 
   const codex = await scanCodexSession(codexPath);
   const claude = await scanClaudeSession(claudePath);
-  assert.equal(Array.isArray(claude.model_usage), false);
+  assert.equal(Array.isArray(claude.model_usage), true);
 
-  const listed = listSessionsForBrowser([codex, claude]).sessions;
-  assert.equal(listed.length, 2);
+  const legacy = { ...claude, session_hash: "legacy", model_usage: undefined };
+  const listed = listSessionsForBrowser([codex, claude, legacy]).sessions;
+  assert.equal(listed.length, 3);
   const keySets = listed.map((row) => {
     assert.ok(Array.isArray(row.model_usage) && row.model_usage.length > 0);
     return Object.keys(row.model_usage[0]).sort();
@@ -1099,6 +1183,7 @@ test("model_usage reaches the browser dense whatever the sidecar stored", async 
   // Both producer paths must emit the identical key set, or dashboard/src/lib/
   // sessions-api.ts is describing a row shape that only one of them sends.
   assert.deepEqual(keySets[0], keySets[1]);
+  assert.deepEqual(keySets[0], keySets[2]);
   for (const field of [
     "model",
     "input_tokens",

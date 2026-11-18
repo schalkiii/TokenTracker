@@ -11,6 +11,16 @@ const { cmdSessions } = require("./commands/sessions");
 const { cmdWebdav } = require("./commands/webdav");
 
 async function run(argv) {
+  // Best-effort Sentry init (no-op without DSN / when telemetry opted out).
+  try {
+    const { initSentry } = require("./lib/sentry");
+    const { resolveTrackerPaths } = require("./lib/tracker-paths");
+    const { trackerDir } = await resolveTrackerPaths().catch(() => ({ trackerDir: null }));
+    await initSentry({ trackerDir });
+  } catch {
+    /* never block CLI startup on telemetry */
+  }
+
   const [command, ...rest] = argv;
 
   // No args → launch dashboard
@@ -103,7 +113,7 @@ function printHelp() {
       "  - --from-openclaw marks sync runs triggered by the OpenClaw session plugin.",
       "  - --debug shows original backend errors.",
       "  - device-login pairs a headless CLI / SSH session with a browser sign-in (15-min code).",
-      "  - sessions exports metadata-only Claude/Codex efficiency analytics; no prompt or response text is retained.",
+      "  - sessions exports metadata-only Claude/Codex/Grok/ZCode efficiency analytics; no prompt or response text is retained.",
       "",
     ].join("\n"),
   );

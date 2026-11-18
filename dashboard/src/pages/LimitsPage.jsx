@@ -1,11 +1,11 @@
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { motion, useReducedMotion } from "motion/react";
-import { Bell, BellOff, CalendarClock, Settings as SettingsIcon } from "lucide-react";
+import { Bell, BellOff, CalendarClock, RefreshCw, Settings as SettingsIcon } from "lucide-react";
 import { Popover } from "@base-ui/react/popover";
 import { useUsageLimits } from "../hooks/use-usage-limits";
-import { useLimitsDisplayPrefs } from "../hooks/use-limits-display-prefs.js";
-import { copy } from "../lib/copy";
+import { hiddenProviderIds, useLimitsDisplayPrefs } from "../hooks/use-limits-display-prefs.js";
+import { copy, getCopyLocale } from "../lib/copy";
 import { LimitsPageSkeleton } from "../components/LimitsPageSkeleton.jsx";
 import { UsageLimitsPanel } from "../ui/dashboard/components/UsageLimitsPanel.jsx";
 import { SubscriptionSettingsCard } from "../ui/dashboard/components/SubscriptionSettingsCard.jsx";
@@ -22,6 +22,54 @@ const IS_LOCAL_HOST =
   (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
 const MACOS_NOTIFICATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
+
+// Compact absolute stamp for the manual-refresh feedback line, in the copy
+// locale — same shape as the panel's exact reset-time formatting.
+function formatRefreshedAt(iso) {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return String(iso);
+  return new Intl.DateTimeFormat(getCopyLocale(), {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(ms));
+}
+
+/**
+ * A forced refresh always comes back stamped with a fresh fetched_at, even
+ * when the backend served cached rows or a provider errored, so the notice
+ * grades the payload instead of trusting the timestamp: "updated" only when
+ * every provider row is fresh and error-free, "partial" when any row still
+ * reports an error, a stale cache, a disk-cache source, or a failed ZCode
+ * extras endpoint (reset cards / Start Plan).
+ */
+function describeRefreshOutcome(data) {
+  const providers = Object.entries(data || {}).filter(
+    ([key, value]) => key !== "fetched_at" && value && typeof value === "object"
+      && value.configured !== false,
+  );
+  const errored = providers.filter(([, provider]) => Boolean(provider.error));
+  // ZCode folds reset cards and Start Plan grants into its row from separate
+  // endpoints; their failures don't set the row-level error but the refresh
+  // still didn't bring every quota up to date.
+  const extrasErrored = providers.some(([, provider]) =>
+    Boolean(provider.start_plan?.error) || Boolean(provider.reset_credits?.error));
+  const cached = providers.filter(([, provider]) =>
+    provider.provenance?.stale === true
+    || provider.provenance?.source === "disk-cache",
+  );
+  // Every row served from cache with no provider errors means the refresh
+  // never reached live data at all; any error row is a partial outcome.
+  if (providers.length && errored.length === 0 && !extrasErrored && cached.length === providers.length) {
+    return { kind: "stale" };
+  }
+  if (errored.length || cached.length || extrasErrored) {
+    return { kind: "partial", at: data.fetched_at };
+  }
+  return { kind: "updated", at: data.fetched_at };
+}
 
 /**
  * Speech-bubble nudge anchored to the bell: alerts are on, but the system
@@ -65,18 +113,55 @@ function NotificationBlockedBubble() {
 
 export function LimitsPage() {
   const preloadedUsageLimits = readUsageLimitsPreloadState();
-  const { data: usageLimits, error, isLoading } = useUsageLimits(
-    preloadedUsageLimits
-      ? { initialRefresh: true, initialState: preloadedUsageLimits, publishToPreloadCache: true }
-      : { initialRefresh: true, publishToPreloadCache: true },
-  );
   const prefs = useLimitsDisplayPrefs();
+  // Effective fetch gate (issue 956): providers hidden in prefs, minus the ones a
+  // hand-entered subscription keeps on screen — the panel renders those rows
+  // regardless of visibility, so their data must keep flowing. The exception
+  // only holds while subscription display is on: with it off the panel omits
+  // those rows entirely, so their providers must stay gated. Null ref =
+  // initial subscription load still pending, so gate on prefs alone.
+  const subscriptionProviderIdsRef = React.useRef(null);
+  const getHiddenProviders = React.useCallback(() => {
+    const hidden = hiddenProviderIds();
+    if (!prefs.showSubscriptions) return hidden;
+    const backed = subscriptionProviderIdsRef.current;
+    if (!backed || backed.size === 0) return hidden;
+    return hidden.filter((id) => !backed.has(id));
+  }, [prefs.showSubscriptions]);
+  const { data: usageLimits, error, isLoading, refresh } = useUsageLimits(
+    preloadedUsageLimits
+      ? { initialRefresh: true, initialState: preloadedUsageLimits, publishToPreloadCache: true, getHiddenProviders }
+      : { initialRefresh: true, publishToPreloadCache: true, getHiddenProviders },
+  );
   const alerts = useLimitAlertPrefs();
   const [subscriptions, setSubscriptions] = React.useState([]);
   const [subscriptionsError, setSubscriptionsError] = React.useState(false);
   const [subscriptionsOpen, setSubscriptionsOpen] = React.useState(false);
   const [searchParams] = useSearchParams();
   const subscriptionRefreshRef = React.useRef(0);
+  // Manual refresh bookkeeping: a ref guard (not state) blocks a fast second
+  // click before the re-render commits, mirroring SkillsPage's
+  // operationInFlight pattern; `isRefreshing` only drives the disabled/spin UI.
+  const refreshInFlightRef = React.useRef(false);
+  const [isRefreshing, setIsRefreshing] = React.useState(false);
+  const [refreshNotice, setRefreshNotice] = React.useState(null);
+
+  const handleManualRefresh = React.useCallback(async () => {
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    setIsRefreshing(true);
+    setRefreshNotice(null);
+    try {
+      // The hook's forced refresh keeps stale rows on screen while it runs and
+      // resolves with the payload it applied (null when it could not refresh),
+      // so the notice never fakes "up to date".
+      const next = await refresh();
+      setRefreshNotice(next ? describeRefreshOutcome(next) : { kind: "failed" });
+    } finally {
+      refreshInFlightRef.current = false;
+      setIsRefreshing(false);
+    }
+  }, [refresh]);
 
   const refreshSubscriptions = React.useCallback(async () => {
     // The subscription store only exists on the local CLI; skip the fetch on
@@ -90,13 +175,40 @@ export function LimitsPage() {
       if (requestId !== subscriptionRefreshRef.current) return;
       setSubscriptions(rows);
       setSubscriptionsError(false);
+      // Track which providers a subscription keeps on screen (the fetch-gate
+      // exception set above). When the set changes the effective gate —
+      // including on the first load, where the mount fetch ran without
+      // subscription knowledge — re-read limits so a newly backed hidden row
+      // gets data instead of "not connected". With subscription display off
+      // the gate ignores subscriptions entirely, so no re-read is owed.
+      const providerIds = new Set(rows.map((row) => row?.provider).filter(Boolean));
+      const previous = subscriptionProviderIdsRef.current;
+      const prefsHidden = hiddenProviderIds();
+      const changed = previous === null
+        ? prefs.showSubscriptions && [...providerIds].some((id) => prefsHidden.includes(id))
+        : prefs.showSubscriptions
+          && (previous.size !== providerIds.size
+            || [...providerIds].some((id) => !previous.has(id)));
+      subscriptionProviderIdsRef.current = providerIds;
+      if (changed) void refresh();
     } catch (_e) {
       if (requestId !== subscriptionRefreshRef.current) return;
       // Keep the rows already on screen: wiping them would make a transient
       // fetch failure look like the subscriptions were deleted.
       setSubscriptionsError(true);
     }
-  }, []);
+  }, [prefs.showSubscriptions, refresh]);
+
+  // Toggling subscription display flips whether hidden providers with a
+  // hand-entered subscription stay in the fetch gate — re-read under the new
+  // effective gate.
+  const previousShowSubscriptions = React.useRef(prefs.showSubscriptions);
+  React.useEffect(() => {
+    if (previousShowSubscriptions.current === prefs.showSubscriptions) return;
+    previousShowSubscriptions.current = prefs.showSubscriptions;
+    if (!IS_LOCAL_HOST && !isMockEnabled()) return;
+    void refresh();
+  }, [prefs.showSubscriptions, refresh]);
 
   React.useEffect(() => {
     void refreshSubscriptions();
@@ -127,22 +239,27 @@ export function LimitsPage() {
     <div className="flex flex-col flex-1 text-oai-black dark:text-oai-white font-oai antialiased">
       <main className="flex-1 pt-8 sm:pt-10 pb-12 sm:pb-16">
         <div className="mx-auto max-w-6xl px-4 sm:px-6">
-          <div className="flex flex-row items-start justify-between gap-4 mb-8">
-            <div className="min-w-0">
-              <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-oai-black dark:text-white mb-3">
-                {copy("nav.limits")}
-              </h1>
-              <p className="text-oai-gray-500 dark:text-oai-gray-400 text-sm sm:text-base">
-                {copy("limits.page.subtitle")}
-              </p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
+          <div className="mb-6 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-2 sm:mb-8 sm:gap-x-4 sm:gap-y-3">
+            <h1 className="min-w-0 text-2xl sm:text-4xl font-semibold tracking-tight text-oai-black dark:text-white">
+              {copy("nav.limits")}
+            </h1>
+            <div className="flex items-center gap-1 sm:gap-2">
               {alerts.enabled && alerts.permissionBlocked ? <NotificationBlockedBubble /> : null}
+              <button
+                type="button"
+                onClick={() => void handleManualRefresh()}
+                disabled={isRefreshing}
+                aria-label={copy("limits.page.refresh")}
+                title={copy("limits.page.refresh")}
+                className="shrink-0 inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 text-oai-gray-600 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 disabled:opacity-50"
+              >
+                <RefreshCw className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} aria-hidden />
+              </button>
               <Popover.Root open={subscriptionsOpen} onOpenChange={setSubscriptionsOpen}>
                 <Popover.Trigger
                   aria-label={copy("limits.page.openSubscriptions")}
                   title={copy("limits.page.openSubscriptions")}
-                  className="shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 text-oai-gray-600 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
+                  className="shrink-0 inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 text-oai-gray-600 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
                 >
                   <CalendarClock className="h-4 w-4" aria-hidden />
                 </Popover.Trigger>
@@ -162,7 +279,7 @@ export function LimitsPage() {
                 onClick={() => void alerts.setEnabled(!alerts.enabled)}
                 aria-label={alerts.enabled ? copy("limits.alert.disable") : copy("limits.alert.enable")}
                 title={alerts.enabled ? copy("limits.alert.disable") : copy("limits.alert.enable")}
-                className={`inline-flex h-9 w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 ${
+                className={`inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 ${
                   alerts.enabled && alerts.permissionBlocked
                     ? "text-amber-600 dark:text-amber-400"
                     : "text-oai-gray-600 dark:text-oai-gray-400 hover:text-oai-black dark:hover:text-white"
@@ -174,12 +291,39 @@ export function LimitsPage() {
                 to="/settings?section=limits"
                 aria-label={copy("limits.page.openSettings")}
                 title={copy("limits.page.openSettings")}
-                className="shrink-0 inline-flex h-9 w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 text-oai-gray-600 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
+                className="shrink-0 inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg border border-oai-gray-200 dark:border-oai-gray-800 text-oai-gray-600 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
               >
                 <SettingsIcon className="h-4 w-4" aria-hidden />
               </Link>
             </div>
+            <p className="col-span-2 hidden sm:block sm:text-base text-oai-gray-500 dark:text-oai-gray-400">
+              {copy("limits.page.subtitle")}
+            </p>
           </div>
+
+          <span role="status" className="sr-only">
+            {isRefreshing ? copy("limits.page.refresh_loading") : ""}
+          </span>
+          {refreshNotice?.kind === "updated" ? (
+            <p role="status" className="mb-4 text-sm text-emerald-700 dark:text-emerald-300">
+              {copy("limits.page.refreshed_at", { time: formatRefreshedAt(refreshNotice.at) })}
+            </p>
+          ) : null}
+          {refreshNotice?.kind === "partial" ? (
+            <p role="status" className="mb-4 text-sm text-amber-600 dark:text-amber-400">
+              {copy("limits.page.refresh_partial", { time: formatRefreshedAt(refreshNotice.at) })}
+            </p>
+          ) : null}
+          {refreshNotice?.kind === "stale" ? (
+            <p role="status" className="mb-4 text-sm text-amber-600 dark:text-amber-400">
+              {copy("limits.page.refresh_stale")}
+            </p>
+          ) : null}
+          {refreshNotice?.kind === "failed" ? (
+            <p role="status" className="mb-4 text-sm text-amber-600 dark:text-amber-400">
+              {copy("limits.page.refresh_failed")}
+            </p>
+          ) : null}
 
           {isLoading ? (
             <LimitsPageSkeleton />
@@ -187,7 +331,7 @@ export function LimitsPage() {
             <>
               {error ? (
                 <p className="mb-4 text-sm text-red-500 dark:text-red-400">
-                  {copy("shared.error.prefix", { error })}
+                  {error}
                 </p>
               ) : null}
               {subscriptionsError ? (
@@ -213,11 +357,19 @@ export function LimitsPage() {
                 codingPlan={usageLimits?.codingPlan}
                 agentPlan={usageLimits?.agentPlan}
                 devin={usageLimits?.devin}
+                workbuddy={usageLimits?.workbuddy}
+                workbuddyAi={usageLimits?.workbuddyAi}
+                deepseek={usageLimits?.deepseek}
                 order={prefs.order}
                 visibility={prefs.visibility}
                 displayMode={prefs.displayMode}
                 subscriptions={subscriptions}
                 showSubscriptions={prefs.showSubscriptions !== false}
+                onProviderKeySaved={() => {
+                  // A freshly saved key must be used immediately; the hook's
+                  // forced refresh replaces the cached "not connected" row.
+                  void refresh();
+                }}
               />
             </>
           )}

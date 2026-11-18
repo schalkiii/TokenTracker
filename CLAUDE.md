@@ -18,7 +18,7 @@ For the canonical list of supported providers, grep `parse*Incremental` in `src/
 ## Frequently used commands
 
 ```bash
-npm test                                  # node --test test/*.test.js  (209 files)
+npm test                                  # node --test test/*.test.js
 node --test test/<name>.test.js           # single test file
 npm run ci:local                          # tests + validations + builds
 npm run dashboard:dev                     # Vite dev server with local API mock (port 5173)
@@ -39,7 +39,7 @@ node bin/tracker.js serve --no-sync       # local dashboard server on :7680
 | Install / uninstall a provider hook | `src/lib/<provider>-hook.js` + register in `src/commands/init.js` + `uninstall.js` |
 | Add a local API endpoint | `src/lib/local-api.js` — search `/functions/tokentracker-` |
 | Wire a provider into sync | `src/commands/sync.js` (call site + totals aggregation) + `src/commands/status.js` (status reporting) |
-| Add pricing for a model | `src/lib/pricing/curated-overrides.json` **+ the canonical edge block in `dashboard/edge-patches/tokentracker-leaderboard-refresh.ts`, copied verbatim into the other 4 edge files** (account-daily / account-summary / account-model-breakdown / leaderboard-profile). `test/edge-pricing-parity.test.js` fails on any drift. Deploy the touched edge functions after editing. |
+| Add pricing for a model | `src/lib/pricing/curated-overrides.json` **+ the canonical edge block in `dashboard/edge-patches/tokentracker-leaderboard-refresh.ts`, copied verbatim into the other 4 edge files** (account-daily / account-summary / account-model-breakdown / leaderboard-profile). `test/edge-pricing-parity.test.js` fails on any drift. Deploy the touched edge functions after editing. When a model is only priced via LiteLLM the cloud edge tables cannot see it — check the production model breakdown for LiteLLM-only hits and promote them into curated + edge the same way (issue #929, `docs/cloud-edge-pricing-coverage.md`). |
 | Add an OpenCode Go usage-limits row | `src/lib/opencode-go-limits.js` + provider entry in `src/lib/usage-limits.js` + `PROVIDER_LIMIT_SPECS.opencodeGo` in `dashboard/src/ui/dashboard/components/usage-limits-provider-specs.js`. **Authoritative source = the official Go usage API** (`source:'api'`) using `OPENCODE_GO_API_KEY`; the signed-in dashboard scrape (`source:'web'`) remains a legacy compatibility fallback. Local `opencode.db` cost ÷ Go's dollar caps ($12/5h, $30/wk, $60/mo) is only an explicit `TOKENTRACKER_OPENCODE_GO_LOCAL_ESTIMATE=1` estimate because history cannot prove an active subscription. Reads via `readSqliteJsonRowsAsync` so the limits poll never blocks the event loop. |
 | Add a Devin usage-limits row | `src/lib/devin-limits.js` + provider entry in `src/lib/usage-limits.js` + `PROVIDER_LIMIT_SPECS.devin`. Source = official `GetPlanStatus` RPC on `server.codeium.com` via `x-auth-token` from the Devin CLI's `credentials.toml`; proto3 implicit-zero decode rules in `docs/devin-limits.md`. **Opt-in**: the provider switch defaults off; only an authenticated `?devin=1` request reaches credentials/network. |
 | Add a dashboard page | `dashboard/src/pages/` (lazy-loaded via `React.lazy()` in `App.jsx` — **except `NativeAuthCallbackPage`, which must stay eager-imported**, see Lessons learned) |
@@ -57,8 +57,8 @@ node bin/tracker.js serve --no-sync       # local dashboard server on :7680
 input_tokens                  = non-cached input only (no cache reads/writes)
 cached_input_tokens           = cache reads
 cache_creation_input_tokens   = cache writes
-reasoning_output_tokens       = reasoning tokens (Codex/acode/every-code/OmO/Cline fold them into output_tokens for cost)
-total_tokens                  = input + output + cache_creation + cache_read (+ reasoning_output when output excludes reasoning); Codex/acode/every-code/OmO/Cline keep reasoning as an informational subset because it is already included in output_tokens
+reasoning_output_tokens       = reasoning tokens (Codex/acode/every-code/OmO/Cline/Muse fold them into output_tokens for cost)
+total_tokens                  = input + output + cache_creation + cache_read (+ reasoning_output when output excludes reasoning); Codex/acode/every-code/OmO/Cline/Muse keep reasoning as an informational subset because it is already included in output_tokens
 ```
 
 **Cost is computed from `input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens` only — never `total_tokens`** (`computeRowCost` in `src/lib/pricing/index.js`). If a new provider only fills `total_tokens` with input=0/output=0, the dashboard renders **$0 cost** regardless of pricing entries. Distribute the total across columns or extend `computeRowCost`.
@@ -119,6 +119,7 @@ When the user says "release" or "发 release", that is explicit approval for the
 1. Bump the version in **one** place — `package.json` is the single source of truth. Run `npm version <X.Y.Z|patch|minor>` (or, if you edited `package.json` by hand, `npm run sync-versions`): the `version` npm-lifecycle hook runs `scripts/sync-versions.cjs`, which syncs the version into every file listed in `scripts/version-files.cjs` (`project.yml`'s two `MARKETING_VERSION` entries, the Windows `<Version>`, and the Linux `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `tauri.conf.json` / `PKGBUILD`), then `git add`s them so they land in the version commit. They all stay in lockstep automatically — don't hand-edit any of them. (`npm version` also creates a local `vX.Y.Z` tag and a `vX.Y.Z`-style commit message rather than `chore(release): vX.Y.Z`; CI triggers on the package.json version change, not the message.)
 2. `git commit && git push origin main` → the canonical `CI` workflow runs. Only after that exact main-branch commit passes the full Linux validators + macOS tests + Windows build does `npm-publish.yml` check out the tested SHA and publish when the version is new. A failed or cancelled CI never reaches npm. **Never push the local `vX.Y.Z` tag (no `--follow-tags`)** — the release workflow creates the tag itself, and a pre-existing tag makes its `create-release` job fail with "version already consumed" (recovery: delete the remote tag, re-dispatch).
 3. For DMG-eligible changes: `gh workflow run "release (macOS + Windows + Linux)" -f version=X.Y.Z` → the macOS, Windows and Linux jobs run **in parallel**, producing the DMG, the Windows zip + installer, and — from the Linux job's single `tauri build` — the three Linux packages, each job attaching its own assets to the GitHub Release.
+   For pre-publication acceptance, add `-f publish=false`: the same six-asset and downloaded-byte `SHA256SUMS` verification runs, but the release stays a draft and Homebrew is not notified. This reserves the version tag at the workflow commit; only that exact commit can resume the draft. After acceptance, publish that verified draft under the user's release authorization; never silently move its tag or reuse the version for different code.
 4. Homebrew tap `xiufengsun/homebrew-tokentracker` self-updates via dispatch (~40s if `HOMEBREW_DISPATCH_TOKEN` set) or hourly cron (≤1h fallback). **Never edit the tap repo manually for routine releases.**
 
 Release notes: one English line, no markdown sections (`Fix token stats inflation caused by duplicate queue entries`).

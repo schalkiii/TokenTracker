@@ -50,6 +50,9 @@ internal sealed class PetWindow : Window
     private long _rageUntil;          // TickCount until which the overheated "error" gag shows
     private bool _rage;
     private bool _coreReady;
+    private WebViewActivity? _activity;
+    private bool _contextQueued;
+    private readonly DocumentScriptCache _contextCache = new();
     private bool _exiting;
     private nint _hwnd;
     private string _curSymbol = "$";
@@ -58,6 +61,7 @@ internal sealed class PetWindow : Window
     private string _tokenUnitSystem = TokenUnits.Current;
     private bool _syncing;
     private JsonNode? _limits;
+    private string? _limitsJson;
     private string _character = CurrentCharacter;
     private string _botColor = CurrentBotColor;
     private UsagePoller.UsageStats _stats;
@@ -158,6 +162,11 @@ internal sealed class PetWindow : Window
         _clickThroughTimer.Tick += (_, _) => ClickThroughTick();
 
         Loaded += OnLoaded;
+        IsVisibleChanged += (_, _) =>
+        {
+            _activity?.Update(IsVisible);
+            if (IsVisible) PushContext();
+        };
         _server.StatusChanged += OnServerStatusChanged;
     }
 
@@ -262,6 +271,9 @@ internal sealed class PetWindow : Window
         _webView.DefaultBackgroundColor = System.Drawing.Color.FromArgb(0, 0, 0, 0);
 
         var core = _webView.CoreWebView2;
+        _activity = new WebViewActivity(
+            visible => _webView.Visibility = visible ? Visibility.Visible : Visibility.Collapsed,
+            core.Resume, core.TrySuspendAsync, message => Diag.Log("pet", message));
         core.Settings.AreDefaultContextMenusEnabled = false;
         core.Settings.IsStatusBarEnabled = false;
         core.Settings.AreDevToolsEnabled = false;
@@ -332,9 +344,16 @@ internal sealed class PetWindow : Window
 
         // Re-push currency + locale after every (re)load so the bubble + quips match
         // the app's unit/language even across navigations.
-        core.NavigationCompleted += (_, _) => PushContext();
+        core.NavigationStarting += (_, _) => _contextCache.Invalidate();
+        core.NavigationCompleted += (_, _) =>
+        {
+            _contextCache.Invalidate();
+            PushContext();
+            _activity?.Update(IsVisible);
+        };
 
         NavigateWhenServerReady();
+        _activity.Update(IsVisible);
     }
 
     private void OnServerStatusChanged(ServerManager.ServerStatus status)
@@ -368,13 +387,17 @@ internal sealed class PetWindow : Window
         _clickThroughTimer.Stop();
         StopEdgeAnimation();
         SetClickThrough(false);
-        Hide();
         _hoverTimer.Stop();
         _lastHover = false;
         PushHover(false);
         _typing = false; // re-evaluated on next show
         _rage = false;
         _typingStreakStart = 0;
+        PushState("Typing", false);
+        PushState("Rage", false);
+        // Reset transient animation state before sleeping the renderer. It must
+        // not reopen in an old typing/hover pose with no new event to clear it.
+        Hide();
     }
 
     private void HoverTick()
@@ -494,7 +517,7 @@ internal sealed class PetWindow : Window
 
     private void PushHover(bool hovering)
     {
-        if (!_coreReady) return;
+        if (!_coreReady || !IsVisible) return;
         try
         {
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
@@ -533,7 +556,7 @@ internal sealed class PetWindow : Window
 
     private void PushBubbleBand()
     {
-        if (!_coreReady) return;
+        if (!_coreReady || !IsVisible) return;
         try
         {
             var value = _bubbleBand.ToString(CultureInfo.InvariantCulture);
@@ -555,7 +578,7 @@ internal sealed class PetWindow : Window
 
     private void PushDragState(string? state)
     {
-        if (!_coreReady) return;
+        if (!_coreReady || !IsVisible) return;
         try
         {
             var value = System.Text.Json.JsonSerializer.Serialize(state);
@@ -619,7 +642,7 @@ internal sealed class PetWindow : Window
     /// <summary>Set a boolean <c>window.__ttPet&lt;name&gt;</c> flag + dispatch <c>pet:&lt;name lower&gt;</c>.</summary>
     private void PushState(string name, bool value)
     {
-        if (!_coreReady) return;
+        if (!_coreReady || !IsVisible) return;
         try
         {
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
@@ -653,15 +676,20 @@ internal sealed class PetWindow : Window
     /// </summary>
     public void ApplyCurrency(string symbol, decimal rate)
     {
-        _curSymbol = string.IsNullOrEmpty(symbol) ? "$" : symbol;
-        _curRate = rate > 0 ? rate : 1m;
+        var nextSymbol = string.IsNullOrEmpty(symbol) ? "$" : symbol;
+        var nextRate = rate > 0 ? rate : 1m;
+        if (_curSymbol == nextSymbol && _curRate == nextRate) return;
+        _curSymbol = nextSymbol;
+        _curRate = nextRate;
         PushContext();
     }
 
     /// <summary>Push the resolved UI locale so the pet's tap quips match the app's language.</summary>
     public void ApplyLocale(string locale)
     {
-        _locale = string.IsNullOrWhiteSpace(locale) ? "en" : locale;
+        var next = string.IsNullOrWhiteSpace(locale) ? "en" : locale;
+        if (_locale == next) return;
+        _locale = next;
         PushContext();
     }
 
@@ -676,6 +704,7 @@ internal sealed class PetWindow : Window
     /// <summary>Push whether a sync is in progress (drives the "typing" animation, like macOS).</summary>
     public void ApplySyncing(bool syncing)
     {
+        if (_syncing == syncing) return;
         _syncing = syncing;
         PushContext();
     }
@@ -683,9 +712,13 @@ internal sealed class PetWindow : Window
     /// <summary>Push the native usage-limits snapshot without letting raw JSON become executable script.</summary>
     public void ApplyLimits(string? json)
     {
+        if (_limitsJson == json) return;
         try
         {
-            _limits = string.IsNullOrWhiteSpace(json) ? null : JsonNode.Parse(json);
+            var next = string.IsNullOrWhiteSpace(json) ? null : JsonNode.Parse(json);
+            _limitsJson = json;
+            if (JsonNode.DeepEquals(_limits, next)) return;
+            _limits = next;
         }
         catch
         {
@@ -704,6 +737,7 @@ internal sealed class PetWindow : Window
     /// </summary>
     public void ApplyStats(UsagePoller.UsageStats stats)
     {
+        if (_stats.Equals(stats)) return;
         var prevTokens = _stats.TodayTokens;
         var prevCost = _stats.TodayCostUsd;
         _stats = stats;
@@ -711,7 +745,7 @@ internal sealed class PetWindow : Window
         {
             long tokensDelta = stats.TodayTokens - prevTokens;
             decimal costDelta = stats.TodayCostUsd - prevCost;
-            if (_coreReady)
+            if (_coreReady && IsVisible)
             {
                 var modelName = "AI Model";
                 var costDeltaJs = costDelta.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -725,13 +759,24 @@ internal sealed class PetWindow : Window
     /// <summary>Push whether the local server is reachable (drives the disconnected animation).</summary>
     public void ApplyConnected(bool connected)
     {
+        if (_connected == connected) return;
         _connected = connected;
         PushContext();
     }
 
     private void PushContext()
     {
-        if (!_coreReady) return;
+        if (!_coreReady || !IsVisible || _contextQueued || _exiting) return;
+        _contextQueued = true;
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, new Action(() =>
+        {
+            _contextQueued = false;
+            if (_coreReady && IsVisible && !_exiting) _ = FlushContextAsync();
+        }));
+    }
+
+    private async Task FlushContextAsync()
+    {
         var inv = System.Globalization.CultureInfo.InvariantCulture;
         var sym = System.Text.Json.JsonSerializer.Serialize(_curSymbol);
         var rate = _curRate.ToString(inv);
@@ -766,7 +811,7 @@ internal sealed class PetWindow : Window
         var lookDirection = _lastLookDirection >= 0 ? _lastLookDirection.ToString() : "null";
         try
         {
-            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+            var script =
                 $"window.__ttPetCurrency={{symbol:{sym},rate:{rate}}};" +
                 $"window.__ttPetLocale={loc};" +
                 $"window.__ttPetTokenUnitSystem={unitSystem};" +
@@ -793,7 +838,16 @@ internal sealed class PetWindow : Window
                 "window.dispatchEvent(new Event('pet:limits'));" +
                 "window.dispatchEvent(new Event('pet:bubble-band'));" +
                 "window.dispatchEvent(new Event('pet:connected'));" +
-                "window.dispatchEvent(new Event('pet:minimode'));");
+                "window.dispatchEvent(new Event('pet:minimode'));";
+            // One tray tick updates several fields. Send one complete snapshot,
+            // and let an unchanged snapshot leave the renderer idle.
+            if (!_contextCache.TryStart(script, out var ticket)) return;
+            try
+            {
+                await _webView.CoreWebView2.ExecuteScriptAsync(script);
+                _contextCache.Complete(ticket, true);
+            }
+            catch { _contextCache.Complete(ticket, false); }
         }
         catch { /* page mid-navigation */ }
     }
@@ -901,6 +955,7 @@ internal sealed class PetWindow : Window
         _hoverTimer.Stop();
         _clickThroughTimer.Stop();
         _server.StatusChanged -= OnServerStatusChanged;
+        _activity?.Dispose();
         base.OnClosing(e);
     }
 

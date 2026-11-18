@@ -3,6 +3,7 @@
  * 用 device token（SHA-256 hash）验证身份，用 service role key 写 DB。
  */
 import { createClient } from "npm:@insforge/sdk";
+import { cloudRpc, cloudFailure } from "./cloud/access.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -42,7 +43,12 @@ export default async function (req: Request): Promise<Response> {
   const deviceToken = authHeader?.replace(/^Bearer\s+/i, "");
   if (!deviceToken) return json({ error: "Missing bearer token" }, 401);
 
-  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  // Bound bytes before parsing; clients retain their queue offset on rejection.
+  if (Number(req.headers.get("Content-Length") || 0) > 1_048_576) return json({ error: "Upload too large" }, 413);
+  const rawBody = await req.text();
+  if (new TextEncoder().encode(rawBody).byteLength > 1_048_576) return json({ error: "Upload too large" }, 413);
+  let body: Record<string, unknown> | null = null;
+  try { body = JSON.parse(rawBody); } catch { /* malformed request */ }
   if (!body) return json({ error: "Invalid JSON body" }, 400);
 
   const baseUrl = Deno.env.get("INSFORGE_BASE_URL")!;
@@ -188,44 +194,39 @@ export default async function (req: Request): Promise<Response> {
   }));
 
   // Dedupe within the batch by (hour_start, source, model), keeping the row
-  // with the largest total_tokens. The CLI's queue.jsonl is append-only and
-  // re-emits the same logical bucket multiple times as a session fills out
-  // (each emission carries the cumulative running total, so MAX wins). Two
-  // rows sharing the conflict key in one upsert make Postgres throw
+  // with the largest total_tokens, ties broken by conversations. The CLI's
+  // queue.jsonl is append-only and re-emits the same logical bucket multiple
+  // times as a session fills out (each emission carries the cumulative running
+  // total, so MAX wins). The conversations tie-break matters for request-only
+  // sources whose emissions all carry 0 tokens (#990): a pure `>` kept the
+  // first 0-token row even when a later emission carried a higher request
+  // count, and the DB upsert only heals across batches.
+  // Two rows sharing the conflict key in one upsert make Postgres throw
   // "ON CONFLICT DO UPDATE command cannot affect row a second time" and
   // reject the entire batch — which stalled all clients until this dedupe.
   const dedupedMap = new Map<string, typeof mappedRows[number]>();
   for (const r of mappedRows) {
     const key = `${r.hour_start}|${r.source}|${r.model}`;
     const prev = dedupedMap.get(key);
-    if (!prev || (Number(r.total_tokens) || 0) > (Number(prev.total_tokens) || 0)) {
+    if (!prev
+      || (Number(r.total_tokens) || 0) > (Number(prev.total_tokens) || 0)
+      || ((Number(r.total_tokens) || 0) === (Number(prev.total_tokens) || 0)
+        && (Number(r.conversations) || 0) > (Number(prev.conversations) || 0))) {
       dedupedMap.set(key, r);
     }
   }
   const rows = Array.from(dedupedMap.values());
 
-  const { error: upsertErr } = await client.database
-    .from("tokentracker_hourly")
-    .upsert(rows, {
-      onConflict: "user_id,device_id,hour_start,source,model",
+  try {
+    const result = await cloudRpc(client, "cloud_ingest_usage", {
+      p_token_hash: tokenHash, p_rows: rows, p_states: stateRows,
+      p_upload_id: typeof body.upload_id === "string" && /^[0-9a-f-]{36}$/i.test(body.upload_id)
+        ? body.upload_id : null,
     });
-
-  if (upsertErr) return json({ error: upsertErr.message }, 500);
-
-  if (stateRows.length > 0) {
-    // Write AFTER the bucket rows of the same upload landed, so canonical
-    // session state never advances for an upload whose device-level rows
-    // failed. The rpc applies a STRICTLY-newer LWW guard
-    // (EXCLUDED.snapshot_verified_at > stored): replays are idempotent and
-    // a transport retry of an older observation can never displace a newer
-    // one. Equal-stamp conflicts keep the first-applied row (stable under
-    // retries).
-    const { error: stateErr } = await client.database.rpc(
-      "tokentracker_upsert_account_session_states",
-      { p_user_id: userId, p_states: stateRows },
-    );
-    if (stateErr) return json({ error: stateErr.message }, 500);
+    if (!result.ok) return cloudFailure(result, corsHeaders);
+    return json(result);
+  } catch (error) {
+    console.error("cloud ingest transaction failed", (error as Error).message);
+    return json({ error: "Cloud access unavailable", code: "cloud_access_unavailable" }, 503);
   }
-
-  return json({ ok: true, inserted: rows.length, skipped: 0 });
 }

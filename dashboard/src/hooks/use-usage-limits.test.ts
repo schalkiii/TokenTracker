@@ -115,7 +115,7 @@ describe("useUsageLimits", () => {
 
     // Mount fetch reads the server cache (no forced upstream refresh).
     expect(getUsageLimits).toHaveBeenCalledTimes(1);
-    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: false });
+    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: false, hiddenProviders: [] });
     expect(result.current.data?.codex.reset_credits).toEqual(freshLimits.codex.reset_credits);
     expect(publishUsageLimitsPreloadState).toHaveBeenCalledWith(freshLimits, {
       source: "page-load",
@@ -133,7 +133,7 @@ describe("useUsageLimits", () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
     expect(getUsageLimits).toHaveBeenCalledTimes(1);
-    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: false });
+    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: false, hiddenProviders: [] });
     expect(result.current.data).toEqual(freshLimits);
     expect(result.current.data?.codex.reset_credits).toEqual(freshLimits.codex.reset_credits);
     expect(result.current.error).toBeNull();
@@ -179,11 +179,56 @@ describe("useUsageLimits", () => {
     });
 
     expect(getUsageLimits).toHaveBeenCalledTimes(1);
-    expect(getUsageLimits).toHaveBeenCalledWith({ refresh: true, devinEnabled: false });
+    expect(getUsageLimits).toHaveBeenCalledWith({ refresh: true, devinEnabled: false, hiddenProviders: [] });
     expect(result.current.data).toEqual(freshLimits);
     expect(publishUsageLimitsPreloadState).toHaveBeenCalledWith(freshLimits, {
       source: "manual-refresh",
     });
+  });
+
+  it("resolves a manual refresh with the payload it applied", async () => {
+    vi.mocked(getUsageLimits).mockResolvedValue(freshLimits);
+
+    const { result } = renderHook(() =>
+      useUsageLimits({
+        initialRefresh: false,
+        initialState: { data: existingLimits },
+        publishToPreloadCache: true,
+      }),
+    );
+
+    let refreshed: unknown;
+    await act(async () => {
+      refreshed = await result.current.refresh();
+    });
+
+    // The applied payload — with fetched_at — is what lets the UI report the
+    // data update time instead of guessing.
+    expect(refreshed).toEqual(freshLimits);
+    expect((refreshed as { fetched_at?: string }).fetched_at).toBe(freshLimits.fetched_at);
+  });
+
+  it("returns null and keeps the previous data when the manual refresh fails", async () => {
+    vi.mocked(getUsageLimits).mockRejectedValue(new Error("upstream down"));
+
+    const { result } = renderHook(() =>
+      useUsageLimits({
+        initialRefresh: false,
+        initialState: { data: existingLimits },
+        publishToPreloadCache: true,
+      }),
+    );
+
+    let refreshed: unknown = "unset";
+    await act(async () => {
+      refreshed = await result.current.refresh();
+    });
+
+    // Null means "nothing new was applied" — the caller must not report success.
+    expect(refreshed).toBeNull();
+    expect(result.current.data).toBe(existingLimits);
+    expect(result.current.error).toBe("upstream down");
+    expect(publishUsageLimitsPreloadState).not.toHaveBeenCalled();
   });
 
   it("does not let a slow mount read overwrite a newer manual refresh", async () => {
@@ -201,7 +246,9 @@ describe("useUsageLimits", () => {
     );
     await waitFor(() => expect(getUsageLimits).toHaveBeenCalledTimes(1));
 
-    let manualRefresh: Promise<void>;
+    // refresh() resolves with the applied payload since the manual-refresh
+    // feedback landed; this test only tracks the promise itself.
+    let manualRefresh: Promise<unknown>;
     await act(async () => {
       manualRefresh = result.current.refresh();
     });
@@ -247,7 +294,7 @@ describe("useUsageLimits Devin opt-in selection", () => {
     const { result } = renderHook(() => useUsageLimits({ initialRefresh: true }));
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
-    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: true });
+    expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: true, hiddenProviders: [] });
     expect(result.current.data?.devin.configured).toBe(true);
     expect(result.current.data?.devin.primary_window?.used_percent).toBe(40);
   });
@@ -264,7 +311,7 @@ describe("useUsageLimits Devin opt-in selection", () => {
     });
 
     await waitFor(() => expect(result.current.data?.devin.configured).toBe(true));
-    expect(getUsageLimits).toHaveBeenLastCalledWith({ devinEnabled: true });
+    expect(getUsageLimits).toHaveBeenLastCalledWith({ devinEnabled: true, hiddenProviders: [] });
   });
 
   it("turning the switch off drops retained Devin rows before the refetch lands", async () => {
@@ -282,7 +329,7 @@ describe("useUsageLimits Devin opt-in selection", () => {
     // Retained Devin rows are gone immediately, without waiting for the network.
     expect(result.current.data?.devin).toEqual({ configured: false });
     await waitFor(() => expect(result.current.data).toEqual(existingLimits));
-    expect(getUsageLimits).toHaveBeenLastCalledWith({ devinEnabled: false });
+    expect(getUsageLimits).toHaveBeenLastCalledWith({ devinEnabled: false, hiddenProviders: [] });
   });
 
   it("a response in flight when the switch turns off cannot republish Devin", async () => {
@@ -296,7 +343,7 @@ describe("useUsageLimits Devin opt-in selection", () => {
 
     const { result } = renderHook(() => useUsageLimits({ initialRefresh: true }));
     await waitFor(() =>
-      expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: true }),
+      expect(getUsageLimits).toHaveBeenCalledWith({ devinEnabled: true, hiddenProviders: [] }),
     );
 
     await act(async () => {
@@ -369,5 +416,85 @@ describe("usage limits on a public host", () => {
     await act(async () => { await result.current.refresh(); });
     expect(getUsageLimits).not.toHaveBeenCalled();
     expect(result.current).toMatchObject({ data: null, error: null, isLoading: false });
+  });
+});
+
+describe("useUsageLimits visibility gating (issue 956)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.mocked(getUsageLimits).mockReset();
+    vi.mocked(publishUsageLimitsPreloadState).mockReset();
+  });
+  afterEach(() => {
+    window.localStorage.clear();
+    vi.mocked(getUsageLimits).mockReset();
+    vi.mocked(publishUsageLimitsPreloadState).mockReset();
+  });
+
+  it("forwards the prefs-derived hidden list on every request", async () => {
+    window.localStorage.setItem(VISIBILITY_KEY, JSON.stringify({ claude: false, zcode: false }));
+    vi.mocked(getUsageLimits).mockResolvedValue(existingLimits);
+
+    const { result } = renderHook(() => useUsageLimits({ initialRefresh: true }));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // Devin is excluded: its opt-in flag remains the single gating fact, so a
+    // default profile still sends no hidden list at all.
+    expect(getUsageLimits).toHaveBeenCalledWith({
+      devinEnabled: false,
+      hiddenProviders: ["claude", "zcode"],
+    });
+  });
+
+  it("lets the caller getter override the prefs-derived hidden set (subscription exception)", async () => {
+    window.localStorage.setItem(VISIBILITY_KEY, JSON.stringify({ claude: false, zcode: false }));
+    vi.mocked(getUsageLimits).mockResolvedValue(existingLimits);
+
+    // A hand-entered subscription keeps zcode's row on screen, so the caller
+    // subtracts it from the gate; the row must keep receiving data.
+    const { result } = renderHook(() => useUsageLimits({
+      initialRefresh: true,
+      getHiddenProviders: () => ["claude"],
+    }));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(getUsageLimits).toHaveBeenCalledWith({
+      devinEnabled: false,
+      hiddenProviders: ["claude"],
+    });
+  });
+
+  it("strips retained hidden rows immediately, before the refetch lands", async () => {
+    window.localStorage.setItem(VISIBILITY_KEY, JSON.stringify({ claude: false }));
+    vi.mocked(getUsageLimits).mockResolvedValue(existingLimits);
+    const retained = {
+      ...existingLimits,
+      claude: { configured: true, error: "Claude token expired" },
+    };
+
+    const { result } = renderHook(() => useUsageLimits({
+      initialRefresh: true,
+      initialState: { data: retained },
+    }));
+
+    expect(result.current.data?.claude).toEqual({ configured: false });
+  });
+
+  it("re-reads limits with the new hidden set after a visibility toggle", async () => {
+    vi.mocked(getUsageLimits).mockResolvedValue(existingLimits);
+    const { result } = renderHook(() => useUsageLimits({ initialRefresh: true }));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await act(async () => {
+      window.localStorage.setItem(VISIBILITY_KEY, JSON.stringify({ claude: false }));
+      dispatchPrefsChanged();
+    });
+
+    await waitFor(() =>
+      expect(getUsageLimits).toHaveBeenLastCalledWith({
+        devinEnabled: false,
+        hiddenProviders: ["claude"],
+      }),
+    );
   });
 });

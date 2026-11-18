@@ -65,8 +65,23 @@ enum Strings {
     static var allProvidersHidden: String { t("All providers hidden", "所有提供方均已隐藏", "所有提供方均已隱藏", "すべてのプロバイダーが非表示です", "모든 제공자가 숨겨졌습니다") }
     static var cursorPlanLabel: String { t("Plan", "套餐", "套餐", "プラン", "플랜") }
     static var cursorAutoLabel: String { t("Auto", "自动", "自動", "自動", "자동") }
-    static var cursorGrokBotLabel: String { t("Grok Bot", "Grok 机器人", "Grok 機器人", "Grokボット", "Grok 봇") }
+    static var cursorGrokBotLabel: String { t("Grok Bot", "Grok Bot", "Grok Bot", "Grok Bot", "Grok Bot") }
     static var codexCreditsLabel: String { t("Credits", "额度", "額度", "クレジット", "크레딧") }
+
+    static func limitCreditsDetail(used: Double, total: Double, remaining: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: loc)
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
+        func amount(_ value: Double) -> String { formatter.string(from: NSNumber(value: value)) ?? String(value) }
+        let used = amount(used), total = amount(total), remaining = amount(remaining)
+        return t("\(used) / \(total) credits used · \(remaining) left",
+                 "已用 \(used) / \(total) 点额度 · 剩余 \(remaining)",
+                 "已用 \(used) / \(total) 點額度 · 剩餘 \(remaining)",
+                 "\(used) / \(total) クレジット使用 · 残り \(remaining)",
+                 "\(used) / \(total) 크레딧 사용 · \(remaining) 남음")
+    }
     static var kimiWeeklyLabel: String { t("Weekly", "周", "周", "週間", "주간") }
     static var kimiFiveHourLabel: String { t("5h", "5h", "5h", "5h", "5h") }
     static var kimiTotalLabel: String { t("Total", "总量", "總量", "合計", "총량") }
@@ -76,7 +91,12 @@ enum Strings {
     // (UsageLimitsView) and the reset notification detector so both surfaces
     // render the same label.
     static var qoderPlanLabel: String { t("Plan", "套餐", "套餐", "プラン", "플랜") }
+    static var workbuddyPlanLabel: String { t("Plan", "套餐", "套餐", "プラン", "플랜") }
+    // WorkBuddy resource packages: every non-plan credit group (gift, top-up
+    // and platform rewards) pooled into one window, as the desktop app shows.
+    static var workbuddyAddonLabel: String { t("Add-on", "资源包", "資源包", "リソースパック", "리소스 팩") }
     static var qoderBonusLabel: String { t("Bonus", "奖励", "獎勵", "ボーナス", "보너스") }
+    static var qoderAddonLabel: String { t("Add-on", "资源包", "資源包", "リソースパック", "리소스 팩") }
     static var grokMonthLabel: String { t("Month", "月度", "月度", "月間", "월간") }
     static var grokWeekLabel: String { t("Weekly", "周", "週", "週間", "주간") }
     static var grokDayLabel: String { t("Daily", "日", "日", "日", "일") }
@@ -90,12 +110,77 @@ enum Strings {
         default: return grokMonthLabel
         }
     }
+
+    /// Product-share row. Known billing ids use the same names as the dashboard;
+    /// anything else falls back to the server label.
+    static func grokProductLabel(product: String, fallback: String?) -> String {
+        switch product {
+        case "GrokBuild": return t("Grok Build", "Grok Build", "Grok Build", "Grok Build", "Grok Build")
+        case "GrokBot": return cursorGrokBotLabel
+        case "GrokChat": return t("Chat", "聊天", "聊天", "チャット", "채팅")
+        case "GrokImagine": return t("Imagine", "Imagine", "Imagine", "Imagine", "Imagine")
+        case "GrokVoice": return t("Voice", "语音", "語音", "ボイス", "음성")
+        case "Cursor": return t("Cursor", "Cursor", "Cursor", "Cursor", "Cursor")
+        default:
+            let trimmed = fallback?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? product : trimmed
+        }
+    }
+
+    /// Shown under the product legend in Remaining mode. The shares are points
+    /// of the amount used, so they do not add up to the remaining headline.
+    static var grokSharesAreUsed: String {
+        t(
+            "Product shares are portions of the amount used.",
+            "各产品百分比是已用部分的份额。",
+            "各產品百分比是已用部分的份額。",
+            "各製品の割合は、使用した分の内訳です。",
+            "제품별 비율은 사용한 양의 몫입니다."
+        )
+    }
     static var limitResetNow: String { t("now", "现在", "現在", "今", "지금") }
     static func kimiParallelLabel(_ count: Int) -> String {
         t("Parallel: \(count)", "并发：\(count)", "併發：\(count)", "並列：\(count)", "병렬: \(count)")
     }
+    // MARK: DeepSeek balance card (pay-as-you-go, no quota windows — #960)
+    static func deepseekBalanceLabel(_ currency: String) -> String {
+        t("Balance (\(currency))", "余额（\(currency)）", "餘額（\(currency)）", "残高（\(currency)）", "잔액 (\(currency))")
+    }
+    static func deepseekGrantedDetail(_ amount: String) -> String {
+        t("incl. grant \(amount)", "含赠款 \(amount)", "含贈款 \(amount)", "付与クレジット込 \(amount)", "증정 크레딧 포함 \(amount)")
+    }
+    static var deepseekUnavailable: String {
+        t(
+            "DeepSeek reports this account as unavailable — the balance may be exhausted or the account under review.",
+            "DeepSeek 报告该账号暂不可用——余额可能已耗尽或账号受限。",
+            "DeepSeek 回報該帳號暫不可用——餘額可能已耗盡或帳號受限。",
+            "DeepSeek がこのアカウントを利用不可と報告しています。残高を使い切ったか、アカウントが審査中の可能性があります。",
+            "DeepSeek에서 이 계정을 사용할 수 없다고 보고했습니다. 잔액이 소진되었거나 계정이 심사 중일 수 있습니다."
+        )
+    }
     static var codexResetBankSectionTitle: String {
         t("Resets", "重置权益", "重置權益", "リセット", "리셋")
+    }
+    static var zcodeResetBankSectionTitle: String {
+        t("Quota resets", "额度重置", "額度重設", "使用枠のリセット", "한도 초기화")
+    }
+    static func zcodeResetBankCount(_ count: Int) -> String {
+        t("\(count) available", "\(count) 次可用", "\(count) 次可用", "\(count) 回利用可能", "\(count)회 사용 가능")
+    }
+    static func zcodeResetBankEarliest(_ time: String) -> String {
+        t("Earliest expiry: \(time)", "最早 \(time) 到期", "最早 \(time) 到期", "最も早い有効期限: \(time)", "가장 빠른 만료: \(time)")
+    }
+    static var zcodeStartGrantsTitle: String {
+        t("Start Plan", "Start 套餐", "Start 方案", "Start プラン", "Start 플랜")
+    }
+    static func zcodeGrantAmount(remaining: String, total: String) -> String {
+        t(
+            "\(remaining) / \(total) tokens remaining",
+            "剩余 \(remaining) / \(total) Token",
+            "剩餘 \(remaining) / \(total) Token",
+            "残り \(remaining) / \(total) トークン",
+            "남은 토큰 \(remaining) / \(total)"
+        )
     }
     static func codexResetBankLabel(_ index: Int) -> String {
         t("Reset \(index)", "重置 \(index)", "重置 \(index)", "リセット \(index)", "리셋 \(index)")
@@ -396,6 +481,18 @@ enum Strings {
     static var fileDownloadFailed: String { t("File download failed. This may be a network issue.", "文件下载失败，可能是网络问题。", "檔案下載失敗，可能是網路問題。", "ファイルのダウンロードに失敗しました。ネットワークの問題の可能性があります。", "파일 다운로드에 실패했습니다. 네트워크 문제일 수 있습니다.") }
     static func installFailed(_ reason: String) -> String { t("Installation failed: \(reason)", "安装失败：\(reason)", "安裝失敗：\(reason)", "インストールに失敗しました：\(reason)", "설치에 실패했습니다: \(reason)") }
     static var noReleaseAvailable: String { t("No release available.", "暂无可用发布版本。", "暫無可用釋出版本。", "利用可能なリリースがありません。", "사용 가능한 릴리스가 없습니다.") }
+    static var updateRateLimitedStatus: String {
+        t("GitHub API rate limited. Try again later.", "GitHub API 已限流，请稍后重试。", "GitHub API 已限流，請稍後重試。", "GitHub API がレート制限中のため、しばらくしてから再試行してください。", "GitHub API 사용량이 제한되었습니다. 잠시 후 다시 시도하세요.")
+    }
+    static func updateRateLimitedRetryAt(_ time: String) -> String {
+        t("GitHub API can be retried after: \(time)", "GitHub 接口可重试时间：\(time)", "GitHub 介面可重試時間：\(time)", "GitHub API の再試行可能日時：\(time)", "GitHub API 재시도 가능 시간: \(time)")
+    }
+    static var updateUnexpectedRedirect: String {
+        t("The update server returned an unexpected redirect.", "更新服务器返回了意外的跳转。", "更新伺服器回傳了意外的跳轉。", "アップデートサーバーが予期しないリダイレクトを返しました。", "업데이트 서버가 예상치 못한 리디렉션을 반환했습니다.")
+    }
+    static var updateAssetSizeUnavailable: String {
+        t("The update file size is unavailable.", "无法获取更新文件大小。", "無法取得更新檔案大小。", "更新ファイルのサイズを取得できません。", "업데이트 파일 크기를 가져올 수 없습니다.")
+    }
 
     static func minutesAgo(_ n: Int) -> String { t("\(n)m ago", "\(n) 分钟前", "\(n) 分鐘前", "\(n)分前", "\(n)분 전") }
     static func hoursAgo(_ n: Int) -> String { t("\(n)h ago", "\(n) 小时前", "\(n) 小時前", "\(n)時間前", "\(n)시간 전") }

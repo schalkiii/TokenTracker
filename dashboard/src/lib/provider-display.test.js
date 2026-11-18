@@ -27,6 +27,11 @@ describe("formatProviderDisplayName", () => {
     expect(formatProviderDisplayName("ACODE")).toBe("AStudio");
   });
 
+  it("uses the Muse Code product name", () => {
+    expect(formatProviderDisplayName("muse")).toBe("Muse Code");
+    expect(formatProviderDisplayName("MUSE")).toBe("Muse Code");
+  });
+
   it("gives Pi routed providers distinct readable names", () => {
     expect(formatProviderDisplayName("pi-anthropic")).toBe("Pi · Anthropic");
     expect(formatProviderDisplayName("PI-GITHUB-COPILOT")).toBe("Pi · GitHub Copilot");
@@ -54,6 +59,15 @@ describe("formatProviderDisplayName", () => {
   it("formats omp as oh-my-pi", () => {
     expect(formatProviderDisplayName("omp")).toBe("oh-my-pi");
     expect(formatProviderDisplayName("OMP")).toBe("oh-my-pi");
+  });
+
+  it("formats pi as Pi without swallowing the routed pi-<provider> sources", () => {
+    expect(formatProviderDisplayName("pi")).toBe("Pi");
+    expect(formatProviderDisplayName("PI")).toBe("Pi");
+    // Router sources must keep naming the backend, or the pi filter would read
+    // as one provider on the leaderboard.
+    expect(formatProviderDisplayName("pi-anthropic")).toBe("Pi · Anthropic");
+    expect(formatProviderDisplayName("pi-github-copilot")).not.toBe(formatProviderDisplayName("pi"));
   });
 
   it("formats omo as OmO without colliding with omp", () => {

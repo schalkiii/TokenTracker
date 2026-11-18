@@ -24,31 +24,31 @@ const README_EXPECTATIONS = [
     "README.md",
     () => new RegExp(`${TOOL_COUNT} AI coding tools`),
     () => new RegExp(`\\|\\s+\\*\\*AI tools supported\\*\\*\\s+\\|\\s+\\*\\*${TOOL_COUNT}\\*\\*`),
-    /Rate-limit tracking.*✅ 17 providers/,
+    /Rate-limit tracking.*✅ 18 providers/,
   ],
   [
     "README.zh-CN.md",
     () => new RegExp(`${TOOL_COUNT} 款 AI 编码工具`),
     () => new RegExp(`\\|\\s+\\*\\*支持的 AI 工具数\\*\\*\\s+\\|\\s+\\*\\*${TOOL_COUNT}\\*\\*`),
-    /限额追踪.*✅ 17 家 provider/,
+    /限额追踪.*✅ 18 家 provider/,
   ],
   [
     "README.ja.md",
     () => new RegExp(`${TOOL_COUNT} 種類の AI コーディングツール`),
     () => new RegExp(`\\|\\s+\\*\\*対応 AI ツール数\\*\\*\\s+\\|\\s+\\*\\*${TOOL_COUNT}\\*\\*`),
-    /レート制限トラッキング.*✅ 17 プロバイダー/,
+    /レート制限トラッキング.*✅ 18 プロバイダー/,
   ],
   [
     "README.ko.md",
     () => new RegExp(`${TOOL_COUNT}개의 AI 코딩 도구`),
     () => new RegExp(`\\|\\s+\\*\\*지원하는 AI 도구 수\\*\\*\\s+\\|\\s+\\*\\*${TOOL_COUNT}\\*\\*`),
-    /레이트 제한 추적.*✅ 17개 프로바이더/,
+    /레이트 제한 추적.*✅ 18개 프로바이더/,
   ],
   [
     "README.de.md",
     () => new RegExp(`${TOOL_COUNT} KI-Coding-Tools`),
     () => new RegExp(`\\|\\s+\\*\\*Unterstützte KI-Tools\\*\\*\\s+\\|\\s+\\*\\*${TOOL_COUNT}\\*\\*`),
-    /Rate-Limit-Tracking.*✅ 17 Provider/,
+    /Rate-Limit-Tracking.*✅ 18 Provider/,
   ],
 ];
 
@@ -76,6 +76,8 @@ test("public discovery surfaces describe every supported tool", () => {
     assert.match(source, /Cline/, `${file} preserves the upstream Cline integration`);
     assert.match(source, /MiniMax Code/, `${file} lists MiniMax Code`);
     assert.match(source, /Command Code/, `${file} lists Command Code`);
+    assert.match(source, /DuMate/, `${file} lists DuMate`);
+    assert.match(source, /TOKENTRACKER_DUMATE_HOME/, `${file} documents the DuMate directory override`);
     assert.match(source, limitCountPattern, `${file} rate-limit row carries the current usage-limits provider count`);
   }
 
@@ -87,12 +89,13 @@ test("public discovery surfaces describe every supported tool", () => {
   assert.doesNotMatch(index, /\bAcode\b/);
   assert.match(index, /Devin CLI/);
   assert.match(index, /Cline/);
+  assert.match(index, /DuMate/);
   assert.match(index, /Desktop pet/);
   assert.match(index, /Four desktop widgets/);
   assert.match(index, /Achievements/);
   assert.match(index, /Service Status page/);
   assert.match(index, /__TOKENTRACKER_DISCOVERY_TRACKED_USAGE__/);
-  assert.match(read("dashboard/src/content/copy.csv"), /landing\.discovery\.tracked_usage,.*usage limits for 17 providers/i);
+  assert.match(read("dashboard/src/content/copy.csv"), /landing\.discovery\.tracked_usage,.*usage limits for 18 providers/i);
 
   const llms = read("dashboard/public/llms.txt");
   assert.match(llms, new RegExp(`Supported AI coding tools \\(${TOOL_COUNT}\\)`));
@@ -101,6 +104,7 @@ test("public discovery surfaces describe every supported tool", () => {
   assert.doesNotMatch(llms, /\bAcode\b/);
   assert.match(llms, /Devin CLI/);
   assert.match(llms, /Cline/);
+  assert.match(llms, /DuMate/);
   assert.match(llms, /desktop pet/i);
   assert.match(llms, /four desktop widgets/i);
   assert.match(llms, /achievements/i);
@@ -120,7 +124,7 @@ test("marketing logo wall includes the same supported product integrations", () 
   assert.equal(ids.length, TOOL_COUNT);
   assert.equal(new Set(ids).size, TOOL_COUNT, "merged integrations keep unique carousel IDs");
 
-  for (const provider of ["every-code", "acode", "reasonix", "kilocode", "roocode", "zed", "goose", "droid", "qoder", "anythingllm", "dsh", "prime-agent", "trae-cn", "dots", "lmstudio", "unsloth", "devin", "cline", "minimax-code", "command-code"]) {
+  for (const provider of ["every-code", "acode", "reasonix", "kilocode", "roocode", "zed", "goose", "droid", "qoder", "anythingllm", "dsh", "prime-agent", "trae-cn", "dots", "lmstudio", "unsloth", "devin", "cline", "minimax-code", "command-code", "dumate", "muse"]) {
     assert.ok(providers.includes(provider), `logo wall includes ${provider}`);
   }
 });
@@ -134,6 +138,7 @@ test("CLI onboarding advertises the same supported integrations", () => {
   assert.ok(SUPPORTED_PROVIDERS.includes("AnythingLLM Desktop"));
   assert.ok(SUPPORTED_PROVIDERS.includes("Qoder"));
   assert.ok(SUPPORTED_PROVIDERS.includes("Reasonix"));
+  assert.ok(SUPPORTED_PROVIDERS.includes("Muse Code"));
   assert.ok(SUPPORTED_PROVIDERS.includes("DeepSeek Harness"));
   assert.ok(SUPPORTED_PROVIDERS.includes("Prime Agent"));
   assert.ok(SUPPORTED_PROVIDERS.includes("TRAE Work CN"));
@@ -145,6 +150,7 @@ test("CLI onboarding advertises the same supported integrations", () => {
   assert.ok(SUPPORTED_PROVIDERS.includes("Cline"));
   assert.ok(SUPPORTED_PROVIDERS.includes("MiniMax Code"));
   assert.ok(SUPPORTED_PROVIDERS.includes("Command Code"));
+  assert.ok(SUPPORTED_PROVIDERS.includes("DuMate"));
 });
 
 test("npm metadata carries the current product hook", () => {
@@ -191,6 +197,7 @@ test("dashboard JSON-LD scripts parse as valid JSON", () => {
   assert.ok(tools.itemListElement.some((item) => item.name === "Cline"));
   assert.ok(tools.itemListElement.some((item) => item.name === "MiniMax Code"));
   assert.ok(tools.itemListElement.some((item) => item.name === "Command Code"));
+  assert.ok(tools.itemListElement.some((item) => item.name === "DuMate"));
   assert.match(supportedClis.acceptedAnswer.text, new RegExp(`${TOOL_COUNT} AI coding tools`));
   assert.match(supportedClis.acceptedAnswer.text, /AStudio/);
   assert.match(supportedClis.acceptedAnswer.text, /Devin CLI/);

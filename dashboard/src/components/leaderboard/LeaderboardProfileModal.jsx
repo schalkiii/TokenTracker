@@ -12,6 +12,7 @@ import { getLeaderboardProfile } from "../../lib/api";
 import { resolveAuthAccessTokenWithRetry } from "../../lib/auth-token";
 import { buildActivityHeatmap } from "../../lib/activity-heatmap";
 import { LeaderboardAvatar } from "../LeaderboardAvatar.jsx";
+import { LeaderboardProBadge } from "../LeaderboardProBadge.jsx";
 import { ProviderIcon } from "../../ui/dashboard/components/ProviderIcon.jsx";
 import { ActivityHeatmap } from "../../ui/dashboard/components/ActivityHeatmap.jsx";
 import { cn } from "../../lib/cn";
@@ -207,7 +208,7 @@ function SectionLabel({ children }) {
 }
 
 /** Stat number stacked over caption label. */
-function Stat({ value, label, title }) {
+function Stat({ value, label, title, labelTitle }) {
   return (
     <div>
       <div
@@ -220,7 +221,7 @@ function Stat({ value, label, title }) {
       >
         {value}
       </div>
-      <div className="mt-1.5 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">{label}</div>
+      <div title={labelTitle} className="mt-1.5 text-[11px] text-oai-gray-500 dark:text-oai-gray-400">{label}</div>
     </div>
   );
 }
@@ -246,6 +247,7 @@ function Header({ user, onClose }) {
         displayName={user?.display_name || ""}
         seed={user?.user_id || user?.display_name}
         size="lg"
+        proActive={user?.pro_active === true}
         className="shrink-0 ring-1 ring-oai-gray-200 dark:ring-oai-gray-800"
       />
       <div className="min-w-0 flex-1">
@@ -253,6 +255,7 @@ function Header({ user, onClose }) {
           <h2 className="truncate text-base font-semibold text-oai-black dark:text-white">
             {user?.display_name || "—"}
           </h2>
+          <LeaderboardProBadge proActive={user?.pro_active === true} />
           {user?.rank ? (
             <span className={cn(
               "shrink-0 inline-flex items-center px-2 py-0.5 rounded text-xs font-bold font-mono uppercase tracking-wider border shadow-sm",
@@ -322,6 +325,7 @@ function PageHero({ user, topBadge }) {
         displayName={user?.display_name || ""}
         seed={user?.user_id || user?.display_name}
         size="xl"
+        proActive={user?.pro_active === true}
         className="shrink-0 ring-1 ring-oai-gray-200 dark:ring-oai-gray-800 rounded-full"
       />
       <div className="min-w-0 flex-1 flex items-center justify-between gap-4">
@@ -330,6 +334,7 @@ function PageHero({ user, topBadge }) {
             <h1 className="truncate text-2xl sm:text-[28px] font-semibold tracking-tight leading-tight text-oai-black dark:text-white">
               {user?.display_name || "—"}
             </h1>
+            <LeaderboardProBadge proActive={user?.pro_active === true} />
             {user?.user_id && <LikeButton userId={user.user_id} />}
           </div>
           {handle ? (
@@ -450,6 +455,10 @@ export function ProfileContent({ data, currency, rate, onClose, variant = "modal
     period,
   } = data;
   const isPage = variant === "page";
+  const lifetimeTotals = totals?.source === "leaderboard_snapshot";
+  const windowDays = period?.from && period?.to
+    ? Math.round((Date.parse(period.to) - Date.parse(period.from)) / 86400000) + 1
+    : null;
   const heatmapData = useMemo(() => buildHeatmapForModal(heatmap), [heatmap]);
   const favoriteName = models?.favorite?.model_name;
   const modelCount = Number(models?.count) || 0;
@@ -480,12 +489,12 @@ export function ProfileContent({ data, currency, rate, onClose, variant = "modal
         {/* Stat strip — flat row, no nested cards */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-4">
           <Stat
-            value={formatTokens(totals?.total_tokens)}
+            value={totals?.total_tokens == null ? copy("shared.placeholder.short") : formatTokens(totals.total_tokens)}
             title={formatTokensTooltip(totals?.total_tokens)}
             label={copy("leaderboard.profile_modal.stat.total_tokens")}
           />
           <Stat
-            value={formatCostCompact(totals?.estimated_cost_usd, currency, rate)}
+            value={totals?.estimated_cost_usd == null ? copy("shared.placeholder.short") : formatCostCompact(totals.estimated_cost_usd, currency, rate)}
             label={copy("leaderboard.profile_modal.stat.total_cost")}
           />
           <Stat
@@ -495,8 +504,17 @@ export function ProfileContent({ data, currency, rate, onClose, variant = "modal
           <Stat
             value={formatCostCompact(totals?.avg_per_day_usd, currency, rate)}
             label={copy("leaderboard.profile_modal.stat.avg_per_day")}
+            labelTitle={windowDays > 0 ? copy("leaderboard.profile_modal.window.average", { days: windowDays }) : undefined}
           />
         </div>
+
+        {period?.from && period?.to && (
+          <p className="text-[11px] text-oai-gray-500 dark:text-oai-gray-400">
+            {copy(lifetimeTotals ? "leaderboard.profile_modal.window.lifetime" : "leaderboard.profile_modal.window.period", {
+              from: period.from, to: period.to,
+            })}
+          </p>
+        )}
 
         {/* Fact list — streak, best day, top model. Three lines, no card. */}
         <dl className="space-y-2 border-t border-oai-gray-200/70 dark:border-oai-gray-800/60 pt-5">
@@ -543,6 +561,32 @@ export function ProfileContent({ data, currency, rate, onClose, variant = "modal
             )}
           </FactRow>
         </dl>
+
+        {Array.isArray(models?.breakdown) && Boolean(models.breakdown.length) && (
+          <section className="border-t border-oai-gray-200/70 dark:border-oai-gray-800/60 pt-5">
+            <SectionLabel>{copy("usage.overview.all_models")}</SectionLabel>
+            {models.breakdown.map((model) => (
+              <details key={model.model_name} className="border-b border-oai-gray-100 py-2 text-xs dark:border-oai-gray-800">
+                <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500">
+                  <span className="font-medium">{model.model_name}</span>
+                  <span className="ml-3 tabular-nums" title={formatTokensTooltip(model.total_tokens)}>{formatTokens(model.total_tokens)}</span>
+                  <span className="ml-3 tabular-nums">{formatUsdCurrency(model.estimated_cost_usd, { currency, rate })}</span>
+                </summary>
+                <dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-oai-gray-500">
+                  {[
+                    ["input_tokens", "dashboard.projects.detail.comp_input"],
+                    ["cached_input_tokens", "dashboard.projects.detail.comp_cached"],
+                    ["cache_creation_input_tokens", "dashboard.projects.detail.comp_cache_write"],
+                    ["output_tokens", "dashboard.projects.detail.comp_output"],
+                    ["reasoning_output_tokens", "dashboard.projects.detail.comp_reasoning"],
+                  ].map(([field, label]) => (
+                    <div key={field} className="flex gap-1"><dt>{copy(label)}</dt><dd title={formatTokensTooltip(model[field])}>{formatTokens(model[field])}</dd></div>
+                  ))}
+                </dl>
+              </details>
+            ))}
+          </section>
+        )}
 
         {/* Achievements. The modal is space-constrained: one overlapping
             coin strip (click a coin for details). The standalone /u/ page has

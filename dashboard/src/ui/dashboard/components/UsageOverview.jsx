@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { Info, Loader2, RefreshCw, SquareArrowOutUpRight } from "lucide-react";
+import { ChevronDown, Info, Loader2, RefreshCw, SquareArrowOutUpRight } from "lucide-react";
 
 // Solid (fill-based) monochrome all-tools mark — matches the fill-based
 // mono provider icons, unlike lucide's stroke-only Layers3. Drawn bold and
@@ -33,7 +33,16 @@ import { formatProviderDisplayName } from "../../../lib/provider-display";
 import { DateRangePopover, formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
 import { ProviderIcon } from "./ProviderIcon.jsx";
 import { formatUsdCurrency } from "../../../lib/format";
-import { buildAllModels, hasModelTokenSplits } from "../../../lib/model-breakdown";
+import {
+  buildAllModels,
+  hasModelTokenSplits,
+  hasModelSpeedTiers,
+  MODEL_SPEED_TIER_KEYS,
+  modelSpeedTierMultiplier,
+  modelSpeedTierStandard,
+  modelTokenSplitsTotal,
+  isUnpricedModel,
+} from "../../../lib/model-breakdown";
 import { ContextBreakdownPanel } from "./ContextBreakdownPanel.jsx";
 
 const ALL_PROVIDERS_KEY = "__all__";
@@ -126,6 +135,28 @@ function formatProviderPercent(provider) {
   return value.toFixed(2);
 }
 
+// A request-only provider (issue 948) has conversation activity but no token
+// totals: it stays out of the card grid and surfaces in the notice row below.
+function isRequestOnlyProvider(provider) {
+  const requests = Number(provider?.requests) || 0;
+  return requests > 0 && !(Number(provider?.usage) > 0);
+}
+
+// Zero-token (request-only) model rows show their request count where a
+// token total would sit; rows with neither keep the legacy empty cell. A
+// merged row can carry BOTH (issue 948: token usage from one tool,
+// request-only activity from another) — show both instead of hiding the
+// requests behind the token total.
+function modelTokensCellLabel(model, formatTokens) {
+  const positive = formatPositiveTokens(formatTokens, model?.usage);
+  const requests = Math.max(0, Number(model?.requests) || 0);
+  if (positive && requests > 0) {
+    return `${positive} · ${copy("usage.overview.request_count", { count: requests })}`;
+  }
+  if (positive) return positive;
+  return requests > 0 ? copy("usage.overview.request_count", { count: requests }) : null;
+}
+
 const PERIOD_COPY_KEYS = {
   day: "usage.period.day",
   week: "usage.period.week",
@@ -203,6 +234,7 @@ function ProviderDistributionSkeleton() {
 }
 
 export function UsageOverview({
+  cloudNotice,
   period,
   periods,
   onPeriodChange,
@@ -230,7 +262,10 @@ export function UsageOverview({
   to,
   deviceOptions = [],
   selectedDevice = "",
+  dataRevision = 0,
   onDeviceChange,
+  accountView = false,
+  accountScopeSwitchable = false,
 }) {
   const tabs = normalizePeriods(periods);
   const dateLocale = getDateFnsLocale(getCopyLocale());
@@ -238,14 +273,15 @@ export function UsageOverview({
   // Weeks run Monday–Sunday, so a week selected near a month boundary can
   // hold more usage than the month-to-date it overlaps. Spell out the covered
   // dates and flag the straddle so the week/month totals read as different
-  // windows, not as a miscount.
+  // windows, not as a miscount. Day is a single calendar date, so a
+  // "Oct 13 — Oct 13" range under the summary is redundant — hide it.
   const showCrossMonthHint =
     period === "week" &&
     typeof from === "string" &&
     typeof to === "string" &&
     from.slice(0, 7) !== to.slice(0, 7);
   const periodRangeLabel =
-    from && to
+    period !== "day" && from && to
       ? `${formatDateShort(from, dateLocale)} — ${formatDateShort(to, dateLocale)}`
       : null;
   // The digit-by-digit Counter renders at a fixed 72px and would clip on
@@ -290,7 +326,7 @@ export function UsageOverview({
   // stays an explicit user action rather than a forced default.
   useEffect(() => {
     setExpandedProvider(null);
-  }, [period, from, to, selectedDevice]);
+  }, [period, from, to, selectedDevice, dataRevision]);
 
   const handleTablistKeyDown = (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -330,8 +366,14 @@ export function UsageOverview({
     summaryValue
   );
 
-  // FleetData is already grouped by provider.
-  const providers = fleetData.filter((f) => f.models?.length > 0);
+  // FleetData is already grouped by provider. Request-only providers
+  // (issue 948: zero tokens, activity as conversation_count) stay out of the
+  // card grid — the grid's visual language is token share — and surface in a
+  // slim notice row below it instead.
+  const providers = fleetData.filter((f) => f.models?.length > 0 && !isRequestOnlyProvider(f));
+  const requestOnlyProviders = fleetData.filter(
+    (f) => f.models?.length > 0 && isRequestOnlyProvider(f),
+  );
   // Devin contributes real token counts but its models (swe-2, swe-2-high,
   // compactor) ship without pricing data, so the dollar figure silently
   // under-reports whenever Devin is in view — surface the notice on both the
@@ -340,12 +382,9 @@ export function UsageOverview({
     (provider) =>
       String(provider?.source || provider?.label || "").trim().toLowerCase() === "devin",
   );
-  // TRAE cost leaves out input without a cache split (docs/trae.md). Keep the
-  // caveat visible with the combined totals, including cloud data, which has
-  // no per-bucket marker.
-  const traeContributes = providers.some(
+  const kiroContributes = providers.some(
     (provider) =>
-      String(provider?.source || provider?.label || "").trim().toLowerCase() === "trae",
+      String(provider?.source || provider?.label || "").trim().toLowerCase() === "kiro",
   );
   const allModels = useMemo(() => buildAllModels(fleetData), [fleetData]);
   const allUsage = allModels.reduce((sum, model) => sum + (Number(model.usage) || 0), 0);
@@ -438,12 +477,30 @@ export function UsageOverview({
             })}
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
+            {/* Data-scope labeling (issue 979 / unify with device filter):
+                When both local and account scopes are live, DashboardPage folds
+                This device / Account-wide into the device Select below — no
+                separate segmented control. On public hosts (pinned cloud) keep
+                the static Account-wide badge so the card still names its scope.
+                Local scope stays unlabeled for signed-out / share views. */}
+            {!accountScopeSwitchable && accountView ? (
+              <span
+                title={copy("usage.overview.scope_account_tip")}
+                className="inline-flex shrink-0 items-center h-8 px-2.5 text-xs font-medium rounded-md bg-oai-gray-100 dark:bg-oai-gray-800 text-oai-gray-700 dark:text-oai-gray-300"
+              >
+                {copy("usage.overview.scope_account")}
+              </span>
+            ) : null}
             {deviceOptions.length > 1 ? (
               <Select
                 value={selectedDevice}
                 onValueChange={onDeviceChange}
                 options={deviceOptions}
-                ariaLabel={copy("dashboard.device_filter.aria")}
+                ariaLabel={
+                  accountScopeSwitchable
+                    ? copy("usage.overview.scope_switch_aria")
+                    : copy("dashboard.device_filter.aria")
+                }
                 matchTriggerWidth
                 className="h-8 px-3 text-xs font-medium rounded-md border-oai-gray-300 dark:border-oai-gray-700 bg-oai-white dark:bg-oai-gray-900 text-oai-black dark:text-oai-white hover:border-oai-brand hover:text-oai-brand hover:[&_svg]:text-oai-brand transition-colors duration-200"
               />
@@ -464,6 +521,8 @@ export function UsageOverview({
             )}
           </div>
         </div>
+
+        {cloudNotice}
 
         {/* Main Stats */}
         <div className="text-center mb-8">
@@ -505,12 +564,6 @@ export function UsageOverview({
               )}
             </div>
           )}
-          {traeContributes && (
-            <p className="mx-auto mt-3 max-w-xl text-[11px] leading-snug text-oai-gray-500 dark:text-oai-gray-400">
-              <span className="font-medium">{copy("usage.overview.trae_notice_title")}.</span>{" "}
-              {copy("usage.overview.trae_notice_body")}
-            </p>
-          )}
           {periodRangeLabel ? (
             <div className="mt-3 flex flex-col items-center gap-1 text-[11px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
               <span className="tabular-nums">{periodRangeLabel}</span>
@@ -525,40 +578,45 @@ export function UsageOverview({
         <div className={showProviderSkeleton ? undefined : "hidden"}>
           <ProviderDistributionSkeleton />
         </div>
-        {providers.length > 0 && (
+        {/* The All card (and the All-models detail behind it) must stay reachable
+            even when no provider has tokens — a Qoder-only user would otherwise
+            lose the request-only model rows entirely (issue 948 review). */}
+        {(providers.length > 0 || requestOnlyProviders.length > 0) && (
           <div className="space-y-6">
             {/* Distribution Bar */}
-            <div
-              role="img"
-              aria-label={copy("usage.overview.distribution_aria", {
-                items: providers
-                  .map((provider) =>
-                    copy("usage.overview.distribution_item", {
-                      label: formatProviderDisplayName(provider.label),
-                      percent: formatProviderPercent(provider),
-                    }),
-                  )
-                  .join("，"),
-              })}
-              className="h-1.5 w-full bg-oai-gray-100 dark:bg-oai-gray-800 rounded-full overflow-hidden flex"
-            >
-              {providers.map((provider, idx) => {
-                const color = getProviderColor(provider.label, idx);
-                const displayLabel = formatProviderDisplayName(provider.label);
-                const percentLabel = formatProviderPercent(provider);
-                return (
-                  <motion.div
-                    key={provider.label}
-                    initial={{ width: 0 }}
-                    animate={{ width: `${getProviderPercentValue(provider)}%` }}
-                    transition={{ duration: 0.5, delay: 0.45 + idx * 0.04, ease: [0.16, 1, 0.3, 1] }}
-                    className="h-full"
-                    style={{ backgroundColor: color }}
-                    title={`${displayLabel}: ${percentLabel}%`}
-                  />
-                );
-              })}
-            </div>
+            {providers.length > 0 && (
+              <div
+                role="img"
+                aria-label={copy("usage.overview.distribution_aria", {
+                  items: providers
+                    .map((provider) =>
+                      copy("usage.overview.distribution_item", {
+                        label: formatProviderDisplayName(provider.label),
+                        percent: formatProviderPercent(provider),
+                      }),
+                    )
+                    .join("，"),
+                })}
+                className="h-1.5 w-full bg-oai-gray-100 dark:bg-oai-gray-800 rounded-full overflow-hidden flex"
+              >
+                {providers.map((provider, idx) => {
+                  const color = getProviderColor(provider.label, idx);
+                  const displayLabel = formatProviderDisplayName(provider.label);
+                  const percentLabel = formatProviderPercent(provider);
+                  return (
+                    <motion.div
+                      key={provider.label}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${getProviderPercentValue(provider)}%` }}
+                      transition={{ duration: 0.5, delay: 0.45 + idx * 0.04, ease: [0.16, 1, 0.3, 1] }}
+                      className="h-full"
+                      style={{ backgroundColor: color }}
+                      title={`${displayLabel}: ${percentLabel}%`}
+                    />
+                  );
+                })}
+              </div>
+            )}
 
             {/* Provider Cards — responsive grid keeps cells equal-width so the
                 last row never stretches when the count doesn't divide evenly. */}
@@ -647,6 +705,7 @@ export function UsageOverview({
                 className="mt-2"
               >
                 {devinContributes && <DevinPricingNotice />}
+                {kiroContributes && <KiroEstimateNotice />}
                 <AllModelsSection models={allModels} />
               </div>
             )}
@@ -678,6 +737,7 @@ export function UsageOverview({
                         color={color}
                         providerHeading={providerHeading}
                         contextSource={contextSource}
+                        deviceId={selectedDevice}
                         from={from}
                         to={to}
                         sortedModels={sortedModels}
@@ -688,6 +748,9 @@ export function UsageOverview({
             )}
 
           </div>
+        )}
+        {requestOnlyProviders.length > 0 && (
+          <RequestOnlyNotice providers={requestOnlyProviders} />
         )}
       </div>
       </Card>
@@ -705,10 +768,10 @@ const MODEL_SPLIT_DEFS = [
 ];
 
 // Narrow containers drop the fixed value-column minimums so the row wraps
-// instead of overflowing; sm+ restores the aligned columns and widens the
-// share column to fit the expand/collapse label.
+// instead of overflowing; sm+ restores the aligned columns. The share column
+// only needs room for the percent plus a chevron affordance.
 const MODEL_ROW_GRID =
-  "grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-baseline gap-x-3 mb-1.5 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,max-content)_minmax(5.5rem,max-content)_minmax(7rem,max-content)]";
+  "grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-baseline gap-x-3 mb-1.5 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,max-content)_minmax(5.5rem,max-content)_minmax(4.5rem,max-content)]";
 
 /**
  * Renders the five token-type split values (input / cached / cache write /
@@ -737,10 +800,67 @@ function ModelTokenSplits({ tokens }) {
 }
 
 /**
- * Grid cells of one model row: name, token total, cost and share. The share
- * cell carries the expand/collapse hint when the row has token splits.
+ * Speed-tier sub-rows (issue 886): under an expanded model row, one line per
+ * Codex speed tier — Standard (the residual), Fast and Ultrafast — with the
+ * tier's tokens and the backend-allocated cost. Rendered only when the backend
+ * reported tier subsets; the multiplier suffix comes from the model's pricing
+ * info so the label never hardcodes 2x/6x.
  */
-function ModelRowHeader({ model, tokensLabel, costLabel, expandable, isExpanded }) {
+function speedTierRowLabel(tier, model) {
+  const base = copy(
+    tier === "priority"
+      ? "usage.overview.tier_fast"
+      : tier === "ultrafast"
+        ? "usage.overview.tier_ultrafast"
+        : "usage.overview.tier_standard",
+  );
+  const multiplier = tier === "standard" ? 0 : modelSpeedTierMultiplier(model, tier);
+  if (!(multiplier > 1)) return base;
+  const rate = Number.isInteger(multiplier) ? String(multiplier) : String(Math.round(multiplier * 100) / 100);
+  return copy("usage.overview.tier_rate_label", { label: base, rate });
+}
+
+function ModelSpeedTierRows({ model }) {
+  const { currency, rate } = useCurrency();
+  const { formatTokens, formatTokensTooltip } = useTokenFormat();
+  if (!hasModelSpeedTiers(model)) return null;
+  const rows = [
+    { key: "standard", split: modelSpeedTierStandard(model) },
+    ...MODEL_SPEED_TIER_KEYS.map((tier) => ({ key: tier, split: model?.tiers?.[tier] || null })),
+  ].filter((row) => row.split && (modelTokenSplitsTotal(row.split.tokens) > 0 || row.split.cost > 0));
+  if (!rows.length) return null;
+  return (
+    <div className="mb-1.5 flex flex-col gap-y-1" data-model-speed-tiers>
+      {rows.map((row) => {
+        const tokensTotal = modelTokenSplitsTotal(row.split.tokens);
+        return (
+          <div key={row.key} className="flex flex-wrap items-baseline gap-x-3 text-[11px] tabular-nums">
+            <span className="min-w-[8rem] text-oai-gray-500 dark:text-oai-gray-400">
+              {speedTierRowLabel(row.key, model)}
+            </span>
+            <span
+              title={formatTokensTooltip(tokensTotal)}
+              className="text-oai-gray-600 dark:text-oai-gray-300"
+            >
+              {formatTokens(tokensTotal)}
+            </span>
+            <span className="text-oai-gray-600 dark:text-oai-gray-300">
+              {formatCost(row.split.cost, currency, rate)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Grid cells of one model row: name, token total, cost and share. The share
+ * cell carries a rotating chevron when the row has token splits. A token-
+ * backed row with no computable cost shows the unpriced label instead of an
+ * empty cell, matching the cost analysis modal's wording.
+ */
+function ModelRowHeader({ model, tokensLabel, costLabel, unpricedLabel, costHint, expandable, isExpanded }) {
   const { formatTokensTooltip } = useTokenFormat();
   return (
     <>
@@ -756,15 +876,27 @@ function ModelRowHeader({ model, tokensLabel, costLabel, expandable, isExpanded 
       >
         {tokensLabel}
       </span>
-      <span className="col-start-3 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums">
-        {costLabel}
+      <span
+        title={unpricedLabel ? costHint : undefined}
+        className="col-start-3 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums"
+      >
+        {costLabel ?? unpricedLabel}
       </span>
-      <span className="col-start-4 row-start-1 text-right whitespace-nowrap text-sm text-oai-black dark:text-oai-white tabular-nums">
+      <span className="col-start-4 row-start-1 flex w-full items-center justify-end gap-1 whitespace-nowrap text-sm text-oai-black dark:text-oai-white tabular-nums">
         {model.share}%
         {expandable && (
-          <span className="ml-1 align-middle text-[11px] font-normal text-oai-gray-400 dark:text-oai-gray-500">
-            {copy(isExpanded ? "usage.overview.collapse" : "usage.overview.expand")}
-          </span>
+          <>
+            <span className="sr-only">
+              {copy(isExpanded ? "usage.overview.collapse" : "usage.overview.expand")}
+            </span>
+            <ChevronDown
+              size={14}
+              aria-hidden
+              className={`shrink-0 text-oai-gray-400 transition-transform duration-200 ease-out motion-reduce:transition-none dark:text-oai-gray-500 ${
+                isExpanded ? "rotate-180" : ""
+              }`}
+            />
+          </>
         )}
       </span>
     </>
@@ -774,7 +906,8 @@ function ModelRowHeader({ model, tokensLabel, costLabel, expandable, isExpanded 
 /**
  * Renders the per-model usage rows for one provider (or the all-models list).
  * Rows whose backend entry carries token-type splits become expandable; the
- * expanded state shows the five split values under the row.
+ * expanded state shows the five split values under the row, plus the
+ * Standard/Fast/Ultrafast speed-tier lines when the backend reported them.
  */
 function ModelUsageRows({ models, color }) {
   const { currency, rate } = useCurrency();
@@ -784,8 +917,17 @@ function ModelUsageRows({ models, color }) {
   return (
     <div className="space-y-3">
       {models.map((model) => {
-        const tokensLabel = formatPositiveTokens(formatTokens, model.usage);
+        const tokensLabel = modelTokensCellLabel(model, formatTokens);
         const costLabel = formatCost(model.cost, currency, rate);
+        // A blank cost cell on a token-backed row means "no published rate",
+        // not "free" — spell it out instead of leaving an empty column that
+        // reads as broken. Request-only rows (no tokens) keep the blank cell:
+        // their missing cost means "nothing booked", not "unpriced".
+        const subscriptionUsage = model.pricing?.source === "cursor_subscription";
+        const unpricedLabel = !costLabel && Number(model.usage) > 0 && isUnpricedModel(model)
+          ? copy(subscriptionUsage ? "dashboard.cost_breakdown.subscription_usage" : "dashboard.cost_breakdown.unpriced_label")
+          : null;
+        const costHint = copy(subscriptionUsage ? "dashboard.cost_breakdown.subscription_usage_hint" : "dashboard.cost_breakdown.unpriced");
         const clampedShare = Math.max(0, Math.min(100, Number(model.share) || 0));
         const rowKey = model.id || model.name;
         // A row expands only when the backend supplied token-type splits;
@@ -795,7 +937,7 @@ function ModelUsageRows({ models, color }) {
         const expandable = hasModelTokenSplits(model);
         const isExpanded = expandable && expandedModel === rowKey;
         const gridClassName = MODEL_ROW_GRID;
-        const headerProps = { model, tokensLabel, costLabel, expandable, isExpanded };
+        const headerProps = { model, tokensLabel, costLabel, unpricedLabel, costHint, expandable, isExpanded };
         return (
           <div key={rowKey} data-model-rank-row>
             {expandable ? (
@@ -812,7 +954,12 @@ function ModelUsageRows({ models, color }) {
                 <ModelRowHeader {...headerProps} />
               </div>
             )}
-            {isExpanded && <ModelTokenSplits tokens={model.tokens} />}
+            {isExpanded && (
+              <>
+                <ModelTokenSplits tokens={model.tokens} />
+                <ModelSpeedTierRows model={model} />
+              </>
+            )}
             <div
               className="h-[3px] bg-oai-gray-100 dark:bg-oai-gray-800 rounded-full overflow-hidden"
               role="progressbar"
@@ -864,16 +1011,49 @@ function DevinPricingNotice() {
   );
 }
 
+function KiroEstimateNotice() {
+  return (
+    <p className="mb-3 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
+      <span className="font-medium text-oai-gray-500 dark:text-oai-gray-400">
+        {copy("usage.overview.kiro_notice_title")}.
+      </span>{" "}
+      {copy("usage.overview.kiro_notice_body")}
+    </p>
+  );
+}
+
+// Request-only providers (issue 948: Qoder-style credit-billed transcripts
+// with zero tokens) render as one slim notice under the card grid — the grid
+// itself stays a pure token-share visualization. Per-model detail lives in
+// the All-models list, which already carries their request counts.
+function RequestOnlyNotice({ providers }) {
+  const items = providers
+    .map((provider) =>
+      copy("usage.overview.request_only_item", {
+        label: formatProviderDisplayName(provider.label),
+        count: Math.max(0, Number(provider.requests) || 0),
+      }),
+    )
+    .join(copy("usage.overview.request_only_separator"));
+  return (
+    <p className="mb-3 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
+      {copy("usage.overview.request_only_note", { items })}
+    </p>
+  );
+}
+
 // Renders a single expanded provider section. Hosts loading state for the
 // inline Context Breakdown so the spinner can sit next to the heading instead
 // of taking its own row.
-function ProviderExpandedSection({ provider, color, providerHeading, contextSource, from, to, sortedModels }) {
+function ProviderExpandedSection({ provider, color, providerHeading, contextSource, from, to, sortedModels, deviceId }) {
   const { formatTokens } = useTokenFormat();
   const [breakdownLoading, setBreakdownLoading] = useState(false);
   const isAntigravity =
     String(provider?.source || provider?.label || "").trim().toLowerCase() === "antigravity";
   const isDevin =
     String(provider?.source || provider?.label || "").trim().toLowerCase() === "devin";
+  const isKiro =
+    String(provider?.source || provider?.label || "").trim().toLowerCase() === "kiro";
 
   return (
                       <div>
@@ -927,6 +1107,7 @@ function ProviderExpandedSection({ provider, color, providerHeading, contextSour
                             verified pricing, so the dollar figure excludes them —
                             a $0 estimate is not evidence of free usage. */}
                         {isDevin && <DevinPricingNotice />}
+                        {isKiro && <KiroEstimateNotice />}
 
                         {/* Context Breakdown drill-down.
                             Claude: category-based (approx /context).
@@ -937,6 +1118,7 @@ function ProviderExpandedSection({ provider, color, providerHeading, contextSour
                               from={from}
                               to={to}
                               source={contextSource}
+                              deviceId={deviceId}
                               referenceTotalTokens={provider.usage}
                               onLoadingChange={setBreakdownLoading}
                             />

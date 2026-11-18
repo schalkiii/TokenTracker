@@ -264,6 +264,29 @@ function grokEntryAccessToken(entry) {
   return entry && typeof entry.key === "string" ? entry.key.trim() : "";
 }
 
+// Non-secret account id for cache partitioning: the OIDC `sub` claim inside the
+// access token, read with an unverified decode (only "who is this token for" —
+// never trusted for auth). Opaque tokens return null.
+function grokTokenSubject(token) {
+  if (typeof token !== "string" || !token.trim()) return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const subject = payload?.sub;
+    return typeof subject === "string" && subject.trim() ? subject.trim() : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+// Errors that tell the user to re-login. They are actionable and must surface
+// instead of being masked by the stale disk-cache fallback (opencode-go
+// auth_error precedent).
+function isGrokAuthErrorCode(error) {
+  return error?.code === "GROK_AUTH_REQUIRED" || error?.code === "GROK_REAUTH_REQUIRED";
+}
+
 /**
  * Public xAI OIDC client refresh (auth method "none").
  * Matches Grok Build CLI's refresh against https://auth.x.ai/oauth2/token.
@@ -529,6 +552,60 @@ function deriveGrokPlanLabel(rawTier) {
   return GROK_PLAN_TIERS.get(key) ?? null;
 }
 
+// Billing product ids → the name grok.com shows in the usage legend.
+// Unknown ids are humanized below so a new product still gets a row.
+const GROK_PRODUCT_LABELS = new Map([
+  ["GrokBuild", "Grok Build"],
+  ["GrokBot", "Grok Bot"],
+  ["GrokChat", "Chat"],
+  ["GrokImagine", "Imagine"],
+  ["GrokVoice", "Voice"],
+  ["Cursor", "Cursor"],
+]);
+
+function normalizeGrokProductId(value) {
+  if (typeof value !== "string") return null;
+  const id = value.trim();
+  if (!/^[A-Za-z][A-Za-z0-9]{0,31}$/.test(id)) return null;
+  return id;
+}
+
+function humanizeGrokProductId(productId) {
+  const spaced = productId
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return spaced.slice(0, 40) || null;
+}
+
+/**
+ * Per-product shares of the same pool as creditUsagePercent.
+ * A 12% Grok Bot row is 12 points of the weekly cap, not its own 100% quota.
+ * Zero and non-finite rows are omitted (grok.com hides unused products).
+ * API order is preserved; a repeated product id keeps the first finite row.
+ */
+function normalizeGrokProductUsage(productUsage, resetAt) {
+  if (!Array.isArray(productUsage)) return [];
+  const seen = new Set();
+  const products = [];
+  for (const entry of productUsage) {
+    if (!entry || typeof entry !== "object") continue;
+    const product = normalizeGrokProductId(entry.product);
+    if (!product || seen.has(product)) continue;
+    const raw = Number(entry.usagePercent);
+    if (!Number.isFinite(raw) || raw <= 0) continue;
+    const window = buildWindow({ usedPercent: raw, resetAt });
+    if (!window || !(window.used_percent > 0)) continue;
+    const label = GROK_PRODUCT_LABELS.get(product) || humanizeGrokProductId(product);
+    if (!label) continue;
+    seen.add(product);
+    products.push({ product, label, window });
+  }
+  return products;
+}
+
 /**
  * Parse either:
  *   - Unified billing (`?format=credits`): weekly/monthly period + creditUsagePercent
@@ -614,6 +691,8 @@ function normalizeGrokBillingResponse(body) {
     billing_period_start: periodStart,
     primary_window: primaryWindow,
     secondary_window: secondaryWindow,
+    // Shares of primary_window. Do not add these on top of credit_usage_percent.
+    products: normalizeGrokProductUsage(config.productUsage, resetAt),
   };
 }
 
@@ -720,6 +799,10 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
     return {
       configured: true,
       error: error?.message || "Unknown error",
+      // A rejected refresh is actionable (re-login) and must not be hidden
+      // behind the stale disk-cache fallback. Internal marker — stripped
+      // before the payload is served.
+      ...(isGrokAuthErrorCode(error) ? { auth_error: true } : {}),
     };
   }
 
@@ -730,13 +813,16 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
     return {
       configured: true,
       error: resolved.error?.message || grokAuthError().message,
+      ...(isGrokAuthErrorCode(resolved.error) ? { auth_error: true } : {}),
     };
   }
 
   const startedAtMs = Date.now();
+  // Hoisted so the catch below can still derive the cache identity from the
+  // token the failing attempt used.
+  let accessToken = resolved.accessToken;
   try {
     let body;
-    let accessToken = resolved.accessToken;
     try {
       body = await fetchGrokBilling(resolved.accessToken, { fetchImpl, env, timeoutMs });
     } catch (error) {
@@ -775,11 +861,19 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
       configured: true,
       error: null,
       ...limits,
+      // Internal cache-partition key (stripped before the payload is served).
+      // An opaque token yields null → the cache write/read is refused, so an
+      // unattributable login can never pin another account's bars (no token
+      // fingerprint fallback: credentials must not enter even a label hash —
+      // CodeQL js/insufficient-password-hash precedent).
+      cache_identity: grokTokenSubject(accessToken),
     };
   } catch (error) {
     return {
       configured: true,
       error: error?.message || "Unknown error",
+      ...(isGrokAuthErrorCode(error) ? { auth_error: true } : {}),
+      cache_identity: grokTokenSubject(accessToken),
     };
   }
 }
@@ -793,6 +887,7 @@ module.exports = {
   loadGrokAuthEntry,
   readGrokAccessToken,
   isGrokAccessTokenExpired,
+  grokTokenSubject,
   resolveGrokOidcClientId,
   resolveGrokOidcIssuer,
   resolveGrokTokenEndpoint,
@@ -803,6 +898,7 @@ module.exports = {
   inferGrokPeriodTypeFromDates,
   sumProductUsagePercent,
   deriveGrokPlanLabel,
+  normalizeGrokProductUsage,
   normalizeGrokBillingResponse,
   fetchGrokBilling,
   fetchGrokLimits,

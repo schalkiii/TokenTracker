@@ -108,9 +108,9 @@ test("Windows background sync cannot hold the single-flight slot forever", () =>
   const minutes = Number(
     /private static readonly TimeSpan BackgroundSyncDeadline = TimeSpan\.FromMinutes\((\d+)\)/.exec(source)[1],
   );
-  // The local API kills its sync child at SYNC_TIMEOUT_MS (120s), and macOS
-  // caps the same exchange at 130s. Stay above that so a slow but live publish
-  // is never cut short.
+  // The local API answers within SYNC_RESPONSE_WAIT_MS (120s), and macOS caps
+  // the same exchange at 130s. Stay above that so a slow but live publish is
+  // never cut short.
   assert.ok(minutes >= 3, `BackgroundSyncDeadline must exceed the server's own 120s budget, got ${minutes}m`);
 
   const trigger = source.slice(
@@ -122,4 +122,16 @@ test("Windows background sync cannot hold the single-flight slot forever", () =>
     /cts = new CancellationTokenSource\(\);\n\s*cts\.CancelAfter\(BackgroundSyncDeadline\);/,
     "every background sync token must carry the deadline before the slot is claimed",
   );
+});
+
+test("Windows startup timeout clears first-run init + first sync before listen (#961)", () => {
+  const constants = fs
+    .readFileSync(path.join(repoRoot, "TokenTrackerWin/Constants.cs"), "utf8")
+    .replace(/\r\n/g, "\n");
+  const match = /StartupTimeoutSeconds = (\d+)/.exec(constants);
+  assert.ok(match, "StartupTimeoutSeconds must be defined");
+  const seconds = Number(match[1]);
+  // serve runs init before/around bind; init waits up to FIRST_SYNC_TIMEOUT_MS
+  // (15s) after ~several seconds of config. 20s was racing the bind (#961).
+  assert.ok(seconds >= 60, `StartupTimeoutSeconds must be >= 60s for first-run, got ${seconds}`);
 });

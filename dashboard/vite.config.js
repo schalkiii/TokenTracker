@@ -8,6 +8,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig, loadEnv } from "vite";
 import os from "node:os";
 import { copyRegistryPlugin } from "./scripts/copy-registry-plugin.mjs";
+import { validateInsforgeBuildEnv } from "./src/lib/insforge-deployment-config.mjs";
 
 const COPY_REQUIRED_KEYS = [
   "landing.meta.title",
@@ -510,7 +511,19 @@ async function runLocalSyncCommand(extraEnv = {}, opts = {}) {
 // at require-time, so dev-server mocks still get LiteLLM-backed cost data.
 const __viteRequire = createRequire(import.meta.url);
 const __pricing = __viteRequire(path.resolve(REPO_ROOT, "src/lib/pricing"));
-const { getModelPricing, computeRowCost } = __pricing;
+const { getModelPricing, computeRowCost, computeRowTierCosts } = __pricing;
+
+// Speed-tier subset columns the real /usage-model-breakdown sums per model
+// (issue 886); the dev mock mirrors that shape so the dashboard tier UI gets
+// exercised in dev too.
+const SPEED_TIER_SUBSET_PREFIXES = ["priority_", "ultrafast_"];
+const SPEED_TIER_SUBSET_TOKEN_FIELDS = [
+  "input_tokens",
+  "cached_input_tokens",
+  "cache_creation_input_tokens",
+  "output_tokens",
+  "reasoning_output_tokens",
+];
 
 async function handleLocalApi(req, res, url) {
   // Honor the dashboard's tz / tz_offset_minutes params so hourly/daily
@@ -952,7 +965,7 @@ async function handleLocalApi(req, res, url) {
     const maxValue = allValues.length > 0 ? allValues[allValues.length - 1] : 0;
 
     // 根据最大值计算 level (0-4)
-    function calcLevel(value) {
+    const calcLevel = (value) => {
       if (value <= 0) return 0;
       if (maxValue === 0) return 1;
       const ratio = value / maxValue;
@@ -960,7 +973,7 @@ async function handleLocalApi(req, res, url) {
       if (ratio <= 0.5) return 2;
       if (ratio <= 0.75) return 3;
       return 4;
-    }
+    };
 
     while (cursor <= end) {
       const day = cursor.toISOString().slice(0, 10);
@@ -1043,6 +1056,15 @@ async function handleLocalApi(req, res, url) {
       modelAgg.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
       modelAgg.totals.total_cost_usd = Number(modelAgg.totals.total_cost_usd || 0)
         + (Number(row.total_cost_usd) || 0);
+      const tierCosts = computeRowTierCosts(row);
+      modelAgg.totals.priority_cost_usd = Number(modelAgg.totals.priority_cost_usd || 0) + tierCosts.priority;
+      modelAgg.totals.ultrafast_cost_usd = Number(modelAgg.totals.ultrafast_cost_usd || 0) + tierCosts.ultrafast;
+      for (const prefix of SPEED_TIER_SUBSET_PREFIXES) {
+        for (const field of SPEED_TIER_SUBSET_TOKEN_FIELDS) {
+          const key = `${prefix}${field}`;
+          modelAgg.totals[key] = (modelAgg.totals[key] || 0) + (Number(row[key]) || 0);
+        }
+      }
     }
 
     // 转换为最终格式
@@ -1053,7 +1075,15 @@ async function handleLocalApi(req, res, url) {
           model: m.model,
           source: s.source,
         });
-        return { ...m, totals: { ...m.totals, total_cost_usd: cost.toFixed(6) } };
+        return {
+          ...m,
+          totals: {
+            ...m.totals,
+            total_cost_usd: cost.toFixed(6),
+            priority_cost_usd: Number(m.totals.priority_cost_usd || 0).toFixed(6),
+            ultrafast_cost_usd: Number(m.totals.ultrafast_cost_usd || 0).toFixed(6),
+          },
+        };
       }).sort((a, b) => b.totals.total_tokens - a.totals.total_tokens);
       const sourceCost = s.models.reduce((sum, m) => sum + Number(m.totals.total_cost_usd), 0);
       s.totals.total_cost_usd = sourceCost.toFixed(6);
@@ -1239,7 +1269,12 @@ function localDataApiPlugin() {
         // Serve the checkout implementation so a stale packaged desktop app (or
         // Windows DoSvc occupying :7680) cannot hide newly supported tool roots.
         const isRepoSkillsApi = url.pathname === "/functions/tokentracker-skills";
-        if (isRepoPetApi || isRepoProjectUsageApi || isRepoSessionAnalyticsApi || isRepoSkillsApi) {
+        // DeepSeek/OpenCode statuses are proxied by this checkout's local API
+        // (no public JSON/CORS upstream), so serve them from the current
+        // source in dev too.
+        const isRepoProviderStatusApi =
+          url.pathname === "/api/deepseek-status" || url.pathname === "/api/opencode-status";
+        if (isRepoPetApi || isRepoProjectUsageApi || isRepoSessionAnalyticsApi || isRepoSkillsApi || isRepoProviderStatusApi) {
           Promise.resolve(handleRepoLocalApi(req, res, url))
             .then((handled) => { if (!handled) next(); })
             .catch(next);
@@ -1263,6 +1298,9 @@ function localDataApiPlugin() {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ROOT_DIR, "VITE_");
+  const backendConfiguration = validateInsforgeBuildEnv(env);
+  if (backendConfiguration.errorCode)
+    throw new Error(`InsForge frontend configuration rejected: ${backendConfiguration.errorCode}. Values were not logged.`);
   const fallbackVersion = loadAppVersion();
   const define = {};
 
@@ -1288,6 +1326,16 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [
       copyRegistryPlugin(),
+      {
+        name: "tokentracker-third-party-notices",
+        apply: "build",
+        generateBundle() {
+          // dist is shared by the web deployment, npm package and all desktop
+          // EmbeddedServer bundles, so licenses travel with the shipped code.
+          this.emitFile({ type: "asset", fileName: "THIRD_PARTY_NOTICES.txt",
+            source: fs.readFileSync(path.join(REPO_ROOT, "THIRD_PARTY_NOTICES.md"), "utf8") });
+        },
+      },
       react(),
       richLinkMetaPlugin(),
       routeSeoPagesPlugin(),
@@ -1322,15 +1370,15 @@ export default defineConfig(({ mode }) => {
             rewrite: (p) => p.replace(/^\/proxy\/ipcheck/, ""),
           },
         };
-        const insforge = loadEnv("development", ROOT_DIR, "VITE_").VITE_INSFORGE_BASE_URL;
-        if (insforge) {
-          proxies["/api/auth"] = {
-            target: insforge,
-            changeOrigin: true,
-            secure: true,
-            cookieDomainRewrite: "localhost",
-          };
-        }
+        // Match the frontend's validated configuration, including its official
+        // default. Otherwise the SDK receives SPA HTML as a successful config.
+        proxies["/api/auth"] = {
+          target: backendConfiguration.baseUrl,
+          changeOrigin: true,
+          secure: true,
+          // Host-only cookies work on both localhost and 127.0.0.1.
+          cookieDomainRewrite: "",
+        };
         return proxies;
       })(),
     },

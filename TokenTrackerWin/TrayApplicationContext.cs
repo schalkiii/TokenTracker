@@ -79,9 +79,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private UpdateStrings _updateStrings = UpdateStrings.For(NativeLocalization.CurrentResolvedLocale);
     private bool _updateBalloonShown;
 
-    // Lightweight UI-thread tick so the tooltip follows a currency change within a
-    // couple of seconds without needing a right-click. Cheap: it only touches the
-    // WebView (to read the currency) once the dashboard has been opened.
+    // Theme and tray state refresh independently of WebView script execution.
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _syncTimer = new() { Interval = 5 * 60 * 1000 };
     // Tray apps stay resident for days, so the launch-time update check alone can
@@ -92,12 +90,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         Interval = UpdateCheckIntervalMinutes * 60 * 1000,
     };
-    // WebView currency reads are asynchronous. Timer ticks, menu opens, and
-    // poller callbacks can arrive while one read is still pending; keep one
-    // pass active and request one follow-up pass for the newest stats instead
-    // of stacking ExecuteScript calls on the WebView renderer.
+    // Coalesce timer, menu, and poller callbacks into the latest summary.
     private Task? _summaryRefreshTask;
     private bool _summaryRefreshRequested;
+    private (string Symbol, decimal Rate) _summaryCurrency = Currency.ReadPersisted() ?? ("$", 1m);
+    private int _currencyReadRevision;
 
     public TrayApplicationContext(bool showPetOnLaunch = false)
     {
@@ -258,13 +255,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _updateChecker.IntegrityCheckFailed += () => PostToUi(() =>
             _trayIcon.ShowBalloonTip(8000, _updateStrings.IntegrityErrorTitle,
                 _updateStrings.IntegrityErrorMessage, ToolTipIcon.Warning));
-        _ = _updateChecker.CheckAsync(silent: true);
-        _updateCheckTimer.Tick += (_, _) => _ = _updateChecker.CheckAsync(silent: true);
+        _ = Task.Run(() => _updateChecker.CheckAsync(silent: true));
+        _updateCheckTimer.Tick += (_, _) => _ = Task.Run(() => _updateChecker.CheckAsync(silent: true));
         _updateCheckTimer.Start();
 
-        // The desktop pet is the app's visible presence now — the dashboard no longer
-        // auto-opens. A stored preference (user toggled the pet at least once) always
-        // wins; only first launches fall back to the show-on-manual-run default.
+        // A stored preference (user toggled the pet at least once) always wins;
+        // only first launches fall back to the show-on-manual-run default.
         // Deferred onto the dispatcher so it shows once the message pump is running.
         _quotaWindow = new QuotaWidgetWindow(_server, OpenDashboard, _widgetWebViewEnvironment);
         _quotaWindow.EnabledChanged += () => { _quotaItem.Checked = _quotaWindow.Enabled; UpdateLimitsPolling(); };
@@ -464,6 +460,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         NativeLocalization.StorePreference(preference);
         ApplyLocaleToMenu();
     }
+
+    public void ActivateDashboard() => PostToUi(OpenDashboard);
 
     private void OpenDashboard()
     {
@@ -670,7 +668,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // it natively so a future cold-launched pet shows the same unit before the
         // dashboard exists. CurrencyChanged only fires once the page is loaded, so the
         // read here is real (never the transient USD default).
-        _dashboard.CurrencyChanged += () => PostToUi(() => { RefreshSummary(); PersistCurrencyFromDashboard(); });
+        _dashboard.CurrencyChanged += () => PostToUi(PersistCurrencyFromDashboard);
         _dashboard.LocaleChanged += () => PostToUi(RefreshLocaleFromDashboard);
         _dashboard.ThemeChanged += () => PostToUi(RefreshThemeFromDashboard);
         _dashboard.PetSettingsRequested += () => PostToUi(PushDashboardPetSettings);
@@ -824,33 +822,29 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     /// <summary>
     /// Handle a <c>tokentracker://</c> deep link (forwarded from a second launch, or a
-    /// cold start argument). Currently only the OAuth callback
-    /// <c>tokentracker://auth/callback?insforge_code=…</c> is used; the code is routed
-    /// into the dashboard WebView to finish the InsForge session exchange. Mirrors the
-    /// macOS <c>application(_:open:)</c> → <c>handleAuthCallback</c> path.
+    /// cold start argument). OAuth codes return to their callback page; billing
+    /// returns only open the order page, whose server request checks the current account.
     /// </summary>
     public void HandleDeepLink(string url)
     {
-        DiagLog($"HandleDeepLink url={url}");
-        string? code = null;
-        try
+        DiagLog($"HandleDeepLink present={!string.IsNullOrEmpty(url)} len={url?.Length ?? 0}");
+        if (NativeReturnUri.TryGetBillingOrder(url, out var order))
         {
-            var uri = new Uri(url);
-            if (!uri.Host.Equals("auth", StringComparison.OrdinalIgnoreCase)) return;
-            foreach (var pair in uri.Query.TrimStart('?').Split('&'))
+            DiagLog("HandleDeepLink type=billing");
+            PostToUi(() =>
             {
-                var i = pair.IndexOf('=');
-                if (i <= 0 || pair[..i] != "insforge_code") continue;
-                var raw = pair[(i + 1)..];
-                if (raw.Length > 0) code = Uri.UnescapeDataString(raw);
-                break;
-            }
+                EnsureDashboard();
+                _dashboard!.HandleBillingReturn(order);
+            });
+            return;
         }
-        catch { return; }
-
-        if (string.IsNullOrEmpty(code)) { DiagLog("HandleDeepLink no insforge_code in query"); return; }
+        if (!NativeReturnUri.TryGetAuthCode(url, out var code))
+        {
+            DiagLog("HandleDeepLink type=unsupported");
+            return;
+        }
         var resolved = code;
-        DiagLog($"HandleDeepLink resolved code.len={resolved.Length}");
+        DiagLog($"HandleDeepLink type=oauth code.len={resolved.Length}");
         PostToUi(() =>
         {
             EnsureDashboard();
@@ -877,7 +871,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         switch (_updateChecker.State)
         {
             case UpdateChecker.UpdateState.UpdateAvailable:
-                _ = _updateChecker.DownloadAndInstallAsync();
+                _ = Task.Run(() => _updateChecker.DownloadAndInstallAsync());
                 break;
             case UpdateChecker.UpdateState.Idle:
                 _ = RunManualCheckAsync();
@@ -896,7 +890,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     string.Format(_updateStrings.UpdateFoundPrompt, _updateChecker.LatestVersion, _updateChecker.CurrentVersion),
                     _updateStrings.UpdateFoundTitle,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                if (confirm == DialogResult.Yes) _ = _updateChecker.DownloadAndInstallAsync();
+                if (confirm == DialogResult.Yes) _ = Task.Run(() => _updateChecker.DownloadAndInstallAsync());
                 break;
             case UpdateChecker.CheckOutcome.UpToDate:
                 MessageBox.Show(
@@ -905,9 +899,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 break;
             case UpdateChecker.CheckOutcome.Failed:
-                MessageBox.Show(
-                    _updateStrings.ErrorMessage, _updateStrings.ErrorTitle,
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                var message = _updateStrings.ErrorMessage;
+                if (_updateChecker.ApiRetryAt is { } retryAt && retryAt > DateTimeOffset.UtcNow)
+                    message += "\n\n" + string.Format(_updateStrings.ApiRetryAtMessage,
+                        retryAt.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
+                message += "\n\n" + _updateStrings.OpenReleasePagePrompt;
+                var openReleasePage = MessageBox.Show(
+                    message, _updateStrings.ErrorTitle,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (openReleasePage == DialogResult.Yes)
+                    OpenInBrowser(UpdateReleaseClient.ReleasePageUrl);
                 break;
             // Skipped: nothing to report.
         }
@@ -1050,17 +1051,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private async Task RefreshSummaryOnceAsync()
+    private Task RefreshSummaryOnceAsync()
     {
-        // Convert USD → the dashboard's chosen currency. Reading the currency is a
-        // WebView2 ExecuteScript round-trip — the 2s _refreshTimer would otherwise
-        // poke the WebView forever, even while the window is hidden. Currency
-        // changes originate in the (visible) dashboard and already arrive via
-        // CurrencyChanged → persisted, so a hidden window can safely serve the
-        // natively-cached symbol/rate (which also covers a cold-launched pet).
-        var (symbol, rate) = IsDashboardOpen()
-            ? await _dashboard!.ReadCurrencyAsync()
-            : Currency.ReadPersisted() ?? ("$", 1m);
+        // CurrencyChanged reads once when the value changes or the page loads.
+        var (symbol, rate) = _summaryCurrency;
         // Push currency + language to the pet even before the first usage poll lands, so
         // a freshly launched pet never sits in default USD/English until polling finishes
         // (connection state is owned by OnServerStatusChanged).
@@ -1073,7 +1067,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _petWindow?.ApplyStats(default);
             _summaryItem.Text = $"{_strings.TodayTitle}: {_strings.NoData}";
-            return;
+            return Task.CompletedTask;
         }
 
         // Feed the floating pet the SAME numbers the tray shows (same poller, same moment).
@@ -1088,6 +1082,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // The tray-icon tooltip stays the app name (set once in the ctor). The floating
         // pet now surfaces live usage, so the hover tooltip no longer mirrors the summary.
         RefreshTrayIconForTheme();
+        return Task.CompletedTask;
     }
 
     /// <summary>Cache the dashboard's current currency natively so a cold-launched pet
@@ -1103,8 +1098,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         try
         {
             if (_dashboard is null) return;
-            var (symbol, rate) = await _dashboard.ReadCurrencyAsync();
+            var revision = ++_currencyReadRevision;
+            var currency = await _dashboard.ReadCurrencyAsync();
+            if (revision != _currencyReadRevision || currency is null) return;
+            var (symbol, rate) = currency.Value;
+            _summaryCurrency = (symbol, rate);
             Currency.Persist(symbol, rate);
+            RefreshSummary();
         }
         catch (Exception ex)
         {

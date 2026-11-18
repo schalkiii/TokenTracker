@@ -47,7 +47,10 @@ function normalizeAntigravityModel(model) {
   }
 
   if (/^gemini-3\.\d+-flash-lite/.test(lower)) return "gemini-2.5-flash-lite";
-  if (/^gemini-3\.\d+-flash/.test(lower)) return "gemini-2.5-flash";
+  // Gemini 3.x Flash models have their own published list rates (3.5 Flash
+  // and 3.6/3.7/3.8 Flash are curated so cloud edge stays in parity).
+  // Remapping the whole family to gemini-2.5-flash under-counted
+  // API-equivalent cost (#1063).
   if (/^gemini-3\.\d+-pro/.test(lower)) return "gemini-2.5-pro";
   if (/^claude-(sonnet|opus|haiku)-4\.\d+/.test(lower)) {
     return lower.replace(/^claude-(sonnet|opus|haiku)-4\.(\d+)/, "claude-$1-4-$2");
@@ -101,8 +104,8 @@ function normalizeClaudeModel(model) {
     .replace(/^-+|-+$/g, "")
     .replace(/-{2,}/g, "-");
 
-  if (/^claude-(sonnet|opus|haiku)-\d+\.\d+/.test(m)) {
-    return m.replace(/^(claude-(?:sonnet|opus|haiku)-\d+)\.(\d+)/, "$1-$2");
+  if (/^claude-(sonnet|opus|haiku|fable)-\d+\.\d+/.test(m)) {
+    return m.replace(/^(claude-(?:sonnet|opus|haiku|fable)-\d+)\.(\d+)/, "$1-$2");
   }
   if (/^(sonnet|opus|haiku)-\d+[.-]\d+/.test(m)) {
     return m
@@ -122,7 +125,9 @@ function normalizeClaudeModel(model) {
 
 // Cursor decorates model ids with reasoning effort and sometimes places the
 // Claude version before the tier. Normalize those lookup-only aliases while
-// preserving Grok 4.5's distinct Fast SKU (its rate is not the base rate).
+// preserving Cursor Grok Fast SKUs (4.5/4.6/4.7 Fast rates are not the base
+// rates). Gemini 4 Argon effort suffixes (-high/-medium/-low/-minimal) are
+// stripped with the shared decorations set below.
 function normalizeCursorModel(model) {
   if (!model || typeof model !== "string") return model;
   let m = model
@@ -135,6 +140,19 @@ function normalizeCursorModel(model) {
   const parts = m.split("-");
   const isFast = parts.includes("fast");
 
+  if (/^gemini-4[.-](argon|carbon|hydrogen)(?:-(minimal|low|medium|high|xhigh))?$/.test(m)) {
+    return m.replace(/^gemini-4\./, "gemini-4-").replace(/-(minimal|low|medium|high|xhigh)$/, "");
+  }
+  if (/^muse-wonder-1[.-]0(?:-(minimal|low|medium|high|xhigh|extra-high|max))?$/.test(m)) {
+    return "muse-wonder-1.0";
+  }
+
+  if (/^(?:cursor-)?grok-4[.-]7(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.7-fast" : "cursor-grok-4.7";
+  }
+  if (/^(?:cursor-)?grok-4[.-]6(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.6-fast" : "cursor-grok-4.6";
+  }
   if (/^(?:cursor-)?grok-4[.-]5(?:-|$)/.test(m)) {
     return isFast ? "cursor-grok-4.5-fast" : "cursor-grok-4.5";
   }
@@ -142,8 +160,8 @@ function normalizeCursorModel(model) {
   // `fast` can be a separately priced SKU (for example composer-2-fast and
   // claude-opus-5-fast). Preserve it for the exact lookups below; when it is
   // merely a decoration, lookupPricing's later suffix-strip still falls back
-  // to the base LiteLLM model.
-  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low"]);
+  // to the base LiteLLM model. Gemini Argon uses "minimal" as an effort level.
+  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low", "minimal"]);
   m = parts.filter((part) => !decorations.has(part)).join("-");
   if (m.startsWith("claude-")) return normalizeClaudeModel(m);
   return m;
@@ -238,7 +256,18 @@ function lookupContainedExactCaseInsensitive(table, model) {
   const lower = model.toLowerCase();
   const keys = Object.keys(table).sort((a, b) => b.length - a.length);
   for (const key of keys) {
-    if (lower.includes(key.toLowerCase())) return table[key];
+    const start = lower.indexOf(key.toLowerCase());
+    if (start < 0) continue;
+    // A model generation must not match a later numeric version (Opus 5.5
+    // is a separate SKU from Opus 5). Dated and provider suffixes still work.
+    const suffix = lower.slice(start + key.length);
+    if (/^[.\d]/.test(suffix)) continue;
+    // Alternate SKU markers (preview/next/exp/…) must not inherit the base
+    // exact rate, including when they follow a date snapshot
+    // (`qwen3.8-max-2026-09-02-preview`, `qwen3-8-max-0902-preview`).
+    // Plain dated (-0902 / -YYYY-MM-DD) and provider-qualified suffixes still match.
+    if (/(?:^|-)(?:preview|next|exp|experimental|beta|alpha)(?:-|$)/.test(suffix)) continue;
+    return table[key];
   }
   return null;
 }
@@ -256,6 +285,9 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   // 0. CURATED source exact. Source-specific prices apply only to their source,
   // preventing collisions with public prices for same-named models from other CLIs.
   const sourceKey = typeof source === "string" ? source.toLowerCase() : "";
+  if (sourceKey === "workbuddy-ai" && lower.trim() === "auto") {
+    return { hit: false, source: "miss", value: null };
+  }
   if (sourceKey === "cline" && lower.endsWith(":free")) {
     return {
       hit: true,
@@ -276,12 +308,8 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
     }
   }
 
-  // 1. CURATED exact
-  // Qwen Flash's provider-qualified and dated IDs share the reference SKU.
-  // Keep the boundary strict: Flash-Next and Max have independent prices.
-  if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim()) && curated.exact?.["qwen3.8-flash"]) {
-    return { hit: true, source: "curated:exact", value: curated.exact["qwen3.8-flash"] };
-  }
+  // 1. CURATED exact (before family regex aliases so a distinct dated exact
+  // entry cannot be overridden by the shared-SKU regex).
   if (curated.exact && curated.exact[lookupModel]) {
     return { hit: true, source: "curated:exact", value: curated.exact[lookupModel] };
   }
@@ -289,9 +317,16 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   if (curatedDotExact) {
     return { hit: true, source: "curated:exact-dot", value: curatedDotExact };
   }
-  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
-  if (curatedDotContainedExact) {
-    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
+
+  // Qwen Flash's provider-qualified and dated IDs share the reference SKU.
+  // Keep the boundary strict: Flash-Next and Max have independent prices.
+  if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim()) && curated.exact?.["qwen3.8-flash"]) {
+    return { hit: true, source: "curated:exact", value: curated.exact["qwen3.8-flash"] };
+  }
+  // Qwen Max (dated -0902 and ISO snapshot -YYYY-MM-DD) share Singapore International SKU.
+  // Keep the boundary strict vs Flash / Flash-Next / -preview (issue #744).
+  if (/(?:^|\/)qwen3[.-]8-max(?:-0902|-\d{4}-\d{2}-\d{2})?$/.test(lower.trim()) && curated.exact?.["qwen3.8-max"]) {
+    return { hit: true, source: "curated:exact", value: curated.exact["qwen3.8-max"] };
   }
 
   // 2. LiteLLM exact
@@ -301,6 +336,66 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   const litellmDotExact = lookupExactCaseInsensitive(litellm, dotForm);
   if (litellmDotExact) {
     return { hit: true, source: "litellm:exact-dot", value: litellmDotExact };
+  }
+
+  // Free gateway SKUs carry a `-free` suffix on the paid model id
+  // (`deepseek-v4.1-flash-free`, `minimax-m2.5-free`, Muse `*-contributor-free`).
+  // Runs AFTER curated/LiteLLM exact so an explicit paid exact entry still wins,
+  // and BEFORE alias/fuzzy/base-name matchers so `foo-free` cannot inherit `foo`
+  // list rates. OpenCode Zen established the convention; other sources reuse it
+  // when they emit the same suffix (issue #744).
+  if (lower.endsWith("-free")) {
+    return {
+      hit: true,
+      source: sourceKey === "opencode" ? "curated:opencode-free-suffix" : "curated:free-suffix",
+      value: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    };
+  }
+
+  // Floating Fable aliases (`claude-fable-latest` and every provider's
+  // `…/claude-fable-latest`) retarget on each release. Checked 2026-11-10: the
+  // Anthropic model overview and the Fable 5.2 pages do not document the alias,
+  // so nothing pins it to 5.2. Stop here, after exact lookups, so the
+  // fable-5.2 fuzzy needles and the broad fable matcher cannot price it, but
+  // an explicit exact entry added later still wins. Re-check on the next
+  // Fable release before pointing it anywhere.
+  if (/(?:^|\/)claude-fable-latest(?:$|[^a-z0-9])/.test(lower)) {
+    return { hit: false, source: "miss", value: null };
+  }
+
+  // Kimi Code K2.8 Preview aliases must not inherit fuzzy `kimi` → kimi-k2.5 rates (#766).
+  // Parser stores bare `k2.8`; raw `kimicoding` / `kimi-k2.8` / `kimicoding/k2.8` may still
+  // appear in lookups. `kimi-for-coding` keeps its curated exact entry (resolved above).
+  // Stay unpriced until an official per-token public rate exists.
+  if (
+    /(?:^|\/)(?:kimicoding(?:\/k2\.8)?|kimi-k2\.8|k2\.8)(?:-|\.|$)/.test(lower.trim()) ||
+    lower.trim() === "kimicoding"
+  ) {
+    return { hit: false, source: "miss", value: null };
+  }
+
+  // Gemini 4's Cyber Permissive SKU and future variants must not inherit
+  // the cheaper introductory Standard rate through contained-key matching.
+  const gemini4 = lower.trim().match(/(?:^|\/)gemini-4[.-](carbon|hydrogen)(.*)$/);
+  if (gemini4 && !/^(?:-(?:minimal|low|medium|high|xhigh))?$/.test(gemini4[2])) {
+    return { hit: false, source: "miss", value: null };
+  }
+  // General Astra/Sol and the specialist Astra Law have confirmed rates. Do not let
+  // unknown SKUs/snapshots inherit their rates via contained/fuzzy matching.
+  // Explicit curated/LiteLLM exact prices above remain authoritative.
+  const gpt62 = (dotForm || lower).trim().match(/gpt-6\.2(?:-(.*))?$/);
+  if (gpt62) {
+    if (lower.includes("cline-free/") || lower.includes("cline-pass/")) {
+      return { hit: true, source: "curated:cline-gateway", value: curated.exact["cline-gateway-models"] };
+    }
+    const known = /^(astra-law|astra|sol)(?:-?(?:low|medium|high|xhigh|max)(?:-fast)?|-fast)?$/.exec(gpt62[1] || "");
+    const value = known && curated.exact?.[`gpt-6.2-${known[1]}`];
+    return value ? { hit: true, source: "curated:gpt-6.2", value }
+      : { hit: false, source: "miss", value: null };
+  }
+  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
+  if (curatedDotContainedExact) {
+    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
   }
 
   // 3. CURATED alias (literal mapping like "auto" -> "composer-1")
@@ -324,10 +419,25 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
       if (!match || !ref) continue;
       const needle = match.toLowerCase();
       if (!curated.exact[ref]) continue;
-      if (lower.includes(needle)) {
+      // The Fable 5.2 needles are version-bounded. A plain substring lets the
+      // dot-restored form of a dated Fable 5 id through: claude-fable-5-20250901
+      // becomes claude-fable-5.20250901, which contains "fable-5.2". fable-5-20
+      // contains "fable-5-2" the same way. The minor must end the id or be
+      // followed by a non-digit, so -20261109 and -20 stay off the 5.2 rate.
+      const bounded = /^fable-5[.-]2(?:-fast)?$/.test(needle)
+        ? new RegExp(`${needle.replace(".", "\\.")}(?:$|[^0-9])`)
+        : null;
+      const matches = (value) => (bounded ? bounded.test(value) : value.includes(needle));
+      if (matches(lower)) {
         return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
       }
-      if (dotForm && dotForm.includes(needle)) {
+      if (dotForm && matches(dotForm)) {
+        return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
+      }
+      // Display names ("Claude Fable 5.2", "Fable 5.2 Fast") only reach this
+      // scan when no source normalizer ran. Fold spaces for the pinned 5.2
+      // needles only — a general fold would price unrelated display names.
+      if (bounded && bounded.test(lower.replace(/[^a-z0-9.]+/g, "-"))) {
         return { hit: true, source: "curated:fuzzy", value: curated.exact[ref] };
       }
     }
