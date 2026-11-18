@@ -79,7 +79,8 @@ set "PATH=%USERPROFILE%\.tokentracker\shim;%PATH%"
 
 Log through **both** `fs.appendFileSync` (machine-readable, TSD-encrypted at
 rest) and a bounded `cmd /c echo … >> log` (plaintext channel), never through
-stdout — see `scripts/cloud-device-rotate.cjs` for the pattern.
+stdout — the removed `scripts/cloud-device-rotate.cjs` (see git history)
+shows the pattern.
 
 ## What to tell IT
 

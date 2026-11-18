@@ -12,8 +12,8 @@
 - Thunderobot 上已注册隐藏计划任务 `tokentracker-device-rotate`，每天 00:10 调用仓库脚本 `scripts/rotate-cloud-devices.cjs`。
 - 本机目标：做**同样的部署**。脚本是幂等的（先判断目标设备是否已活跃），两台机器同时安装不会冲突；建议把本机执行时间设为 00:20，错开请求。
 
-> 注意：仓库里另有一份旧的每小时轮换方案 `scripts/cloud-device-rotate.cjs`（计划任务名 `TokenTrackerCloudRotate`）。
-> **两套逻辑不要同时启用**，会互相抢槽位。若本机已装旧任务，先执行第 3 步的停用命令。
+> 注意：旧的每小时轮换脚本（`cloud-device-rotate.cjs`）已从仓库移除。
+> 如果本机此前注册过它的计划任务 `TokenTrackerCloudRotate`，先执行第 3 步的停用命令，避免旧任务继续抢占槽位。
 
 ## 2. 前置条件（逐项确认，缺一不可）
 
