@@ -5,7 +5,8 @@
 
 ## 1. 背景与目标
 
-- TokenTracker 免费 / 已过期档的 Cloud 同步只有一个**活跃设备槽位**（`machine_limit=1`），上传额度是**账号级、每天 1 次**。
+- TokenTracker 免费 / 已过期档的 Cloud 同步只有一个**活跃设备槽位**
+  （`machine_limit=1`），上传额度是**账号级、每天 1 次**。
 - 两台机器轮流占用槽位：
   - **偶数日** → `Thunderobot`（machine slot id `ef3e91d5-0440-4305-903d-f1a595e422b6`）
   - **奇数日** → `QI-SHAO-L`（machine slot id `dd8ced79-08cd-4772-8709-1b5aa4b1c235`）
@@ -45,8 +46,8 @@ git checkout personal/main -- scripts/rotate-cloud-devices.cjs docs/ops/cloud-de
 停用旧的小时级轮换任务（存在才执行）：
 
 ```powershell
-Get-ScheduledTask -TaskName "TokenTrackerCloudRotate" -ErrorAction SilentlyContinue |
-  Unregister-ScheduledTask -Confirm:$false
+Get-ScheduledTask -TaskName "TokenTrackerCloudRotate" `
+  -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
 ```
 
 ## 4. Dry-run 验证（必须通过）
@@ -75,7 +76,11 @@ node scripts/rotate-cloud-devices.cjs `
 ```vbs
 ' TokenTracker cloud device rotation wrapper (hidden, runs daily).
 ' Even local date -> Thunderobot, odd local date -> QI-SHAO-L.
-CreateObject("WScript.Shell").Run """C:\CommonTools\scoop\apps\nodejs\current\node.exe"" ""D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" --parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 --parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235", 0, True
+cmd = """C:\CommonTools\scoop\apps\nodejs\current\node.exe"" " & _
+  """D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" " & _
+  "--parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 " & _
+  "--parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235"
+CreateObject("WScript.Shell").Run cmd, 0, True
 ```
 
 可用 `where.exe node` 确认绝对路径；若本机服务端口不是 7681，在脚本参数后追加 `--server http://127.0.0.1:<端口>`。
@@ -98,7 +103,8 @@ $trigger = New-ScheduledTaskTrigger -Daily -At "00:20"
 $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
   -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+$principal = New-ScheduledTaskPrincipal `
+  -UserId "$env:USERDOMAIN\$env:USERNAME" `
   -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName "tokentracker-device-rotate" `
@@ -122,7 +128,7 @@ node scripts/rotate-cloud-devices.cjs `
 
 期望输出包含：
 
-```
+```text
 本地 YYYY-MM-DD（N 号）为奇/偶数日，目标设备: <设备名>
 已暂停设备 <另一台>          # 需要切换时才会出现
 已恢复设备 <目标设备>
@@ -148,13 +154,13 @@ Get-ScheduledTaskInfo -TaskName "tokentracker-device-rotate" | Select-Object Nex
 ## 9. 故障排查
 
 | 现象 | 原因 / 处理 |
-|---|---|
-| `无法从本地服务换取 access token` | 浏览器未登录云账户，或本机 TokenTracker 服务未运行。先打开 `http://127.0.0.1:7681` 登录 |
-| `cloud_machine_limit` | 还有其他活跃设备未暂停；脚本会先暂停非目标活跃设备，仍失败说明存在第三台 active 设备，去云端设备列表手动处理 |
-| `cloud_machine_paused` | 本机被轮换暂停属正常状态；到目标日会自动恢复，或手动「恢复」 |
-| `另一个轮换进程正在运行` | 上一次运行未结束；等待 5 分钟后重试，确认无 node 进程后可删除 `.lock` |
-| 计划任务 `LastTaskResult` 非 0 | 看日志文件最后一行；常见为本地服务未启动或登录态失效 |
-| 月末连续两天同一台设备 | 日期奇偶在 31→1 时会出现同奇偶；这是按「日期奇偶」实现的已知边界 |
+| --- | --- |
+| `无法从本地服务换取 access token` | 未登录云账户，或本机 7681 服务未运行 |
+| `cloud_machine_limit` | 还有活跃设备未暂停；仍失败则去云端设备列表处理 |
+| `cloud_machine_paused` | 本机被轮换暂停，属正常状态；到目标日自动恢复 |
+| `另一个轮换进程正在运行` | 上次运行未结束；等待 5 分钟后重试 |
+| 任务 `LastTaskResult` 非 0 | 看日志末行；常见为服务未启动或登录态失效 |
+| 月末连续两天同一台设备 | 31→1 同奇偶，属按日期奇偶的已知边界 |
 
 ## 10. 安全边界（必须遵守）
 

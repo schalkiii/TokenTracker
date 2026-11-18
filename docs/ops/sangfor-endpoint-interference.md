@@ -61,7 +61,7 @@ longer freeze the boot.
 For a released CLI that still calls `lsof`/`ps`, drop instant-exit stand-ins
 into a directory and prepend it to PATH for the dashboard process:
 
-```
+```text
 %USERPROFILE%\.tokentracker\shim\lsof.exe   (copy of where.exe)
 %USERPROFILE%\.tokentracker\shim\ps.exe     (copy of where.exe)
 ```
