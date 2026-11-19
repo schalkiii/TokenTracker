@@ -433,13 +433,7 @@ This registers the hidden `TokenTrackerWebDavSync` scheduled task (catches up af
 0 */2 * * * cd /path/to/TokenTracker && node bin/tracker.js webdav push && node bin/tracker.js webdav pull
 ```
 
-**3. Optional — free-tier cloud rotation.** The cloud free tier keeps a single active machine per account. `scripts/setup-cloud-rotate-task.ps1` lets two machines take turns uploading instead of blocking each other:
-
-```powershell
-powershell -File scripts\setup-cloud-rotate-task.ps1 -StartHour 12
-```
-
-Every hour the task first honors the local daily upload window, then swaps the cloud's active device through the billing API and drains the queue. A deterministic per-hostname jitter (≤15 min), an account-wide ~20 h backoff after any `429`, and a graceful no-op when the swap race is lost keep the two machines alternating rather than thrashing. Give the two machines different `-StartHour` values here as well.
+**3. Optional — free-tier cloud rotation.** The cloud free tier keeps a single active machine per account. `scripts/rotate-cloud-devices.cjs` lets two machines take turns holding that slot by alternating on **local date parity** — even days activate one machine, odd days the other (e.g. even → Thunderobot, odd → QI-SHAO-L). It is idempotent: if the target already holds the slot it exits without changing anything, and a failed resume rolls the previous device back, so both machines can safely run the same daily task. The full step-by-step deployment guide (per-machine hidden scheduled tasks around 00:10/00:20, dry-run first, state/log files, troubleshooting) lives in [docs/ops/cloud-device-rotation.md](docs/ops/cloud-device-rotation.md).
 
 **Troubleshooting**
 
