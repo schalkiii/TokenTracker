@@ -56,6 +56,10 @@ $logFile = Join-Path $env:USERPROFILE ".tokentracker\webdav-sync.log"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $launcherCmd) | Out-Null
 @"
 @echo off
+rem orphan-audit's keeper task rewrites user NODE_OPTIONS with a backslash
+rem path that node's parser eats (MODULE_NOT_FOUND at preload); normalize
+rem separators so the audit hook still loads through forward slashes.
+if defined NODE_OPTIONS set "NODE_OPTIONS=%NODE_OPTIONS:\=/%"
 echo [%DATE% %TIME%] webdav sync start >> "$logFile"
 "$node" "$trackerBin" webdav push >> "$logFile" 2>&1
 "$node" "$trackerBin" webdav pull >> "$logFile" 2>&1
@@ -77,7 +81,8 @@ $trigger = New-ScheduledTaskTrigger -Once -At $start `
   -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-  -ExecutionTimeLimit (New-TimeSpan -Minutes 40) -MultipleInstances IgnoreNew
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 40) -MultipleInstances IgnoreNew `
+  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
   -Settings $settings -Description "TokenTracker: WebDAV backup push + cross-machine pull" -Force | Out-Null

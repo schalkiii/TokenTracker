@@ -76,11 +76,18 @@ node scripts/rotate-cloud-devices.cjs `
 ```vbs
 ' TokenTracker cloud device rotation wrapper (hidden, runs daily).
 ' Even local date -> Thunderobot, odd local date -> QI-SHAO-L.
-cmd = """C:\CommonTools\scoop\apps\nodejs\current\node.exe"" " & _
-  """D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" " & _
-  "--parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 " & _
-  "--parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235"
-CreateObject("WScript.Shell").Run cmd, 0, True
+' Normalizes NODE_OPTIONS separators (the orphan-audit keeper task writes a
+' backslash path that node's parser eats) and propagates the node exit code,
+' so Task Scheduler reports real failures instead of a swallowed 0.
+Option Explicit
+Dim sh, env, rc
+Set sh = CreateObject("WScript.Shell")
+Set env = sh.Environment("PROCESS")
+If env.Item("NODE_OPTIONS") <> "" Then
+  env.Item("NODE_OPTIONS") = Replace(env.Item("NODE_OPTIONS"), "\", "/")
+End If
+rc = sh.Run("""C:\CommonTools\scoop\apps\nodejs\current\node.exe"" ""D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" --parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 --parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235", 0, True)
+WScript.Quit rc
 ```
 
 可用 `where.exe node` 确认绝对路径；若本机服务端口不是 7681，在脚本参数后追加 `--server http://127.0.0.1:<端口>`。
