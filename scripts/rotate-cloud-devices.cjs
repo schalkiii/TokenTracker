@@ -13,6 +13,9 @@
 //   node scripts/rotate-cloud-devices.cjs --every-days 2 --force
 //   node scripts/rotate-cloud-devices.cjs --devices <id1>,<id2> --every-days 1
 //
+// 轮换后默认触发一次本机云上传（--sync，--no-sync 关闭）；只有本机是活跃设备
+// 时才会上传，被暂停的机器会打印跳过原因。
+//
 // 凭据直接从本地 dashboard 服务（默认 127.0.0.1:7681）的已登录会话换取，
 // 不落盘、不打印。
 
@@ -36,6 +39,8 @@ function usage() {
     "  --parity-odd <x>   奇偶模式：本地日期为奇数日时激活的设备（machine_id 或设备名）",
     "  --force            忽略时间间隔，立即轮换一次",
     "  --dry-run          只打印计划，不调用任何修改接口",
+    "  --sync             轮换后自动上传本机待同步数据（默认开启）",
+    "  --no-sync          关闭自动上传，只切换设备槽位",
     "  --server <url>     本地 dashboard 地址（默认 " + DEFAULT_SERVER + "）",
     "  --state <path>     状态文件路径（默认 ~/.tokentracker/tracker/" + STATE_FILE + "）",
     "  -h, --help         显示本帮助",
@@ -50,6 +55,7 @@ function parseArgs(argv) {
     oddDevice: null,
     force: false,
     dryRun: false,
+    sync: true,
     server: DEFAULT_SERVER,
     statePath: null,
     help: false,
@@ -62,6 +68,8 @@ function parseArgs(argv) {
     else if (token === "--parity-odd") args.oddDevice = String(argv[++i] || "").trim() || null;
     else if (token === "--force") args.force = true;
     else if (token === "--dry-run") args.dryRun = true;
+    else if (token === "--sync") args.sync = true;
+    else if (token === "--no-sync") args.sync = false;
     else if (token === "--server") args.server = String(argv[++i] || "");
     else if (token === "--state") args.statePath = argv[++i] || null;
     else if (token === "-h" || token === "--help") args.help = true;
@@ -137,6 +145,87 @@ async function resolveCloudSession(server) {
     baseUrl: String(runtime.baseUrl).replace(/\/+$/, ""),
     anonKey: runtime.anonKey,
   };
+}
+
+function decodeJwtSub(token) {
+  try {
+    const part = String(token || "").split(".")[1];
+    if (!part) return "";
+    const payload = JSON.parse(Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+    return typeof payload?.sub === "string" ? payload.sub : "";
+  } catch {
+    return "";
+  }
+}
+
+// 用本地服务持有的登录态换一次设备会话。本机被暂停时服务端会返回
+// cloud_machine_paused，这里视为"不是本机轮次"而不是错误。
+async function bridgeDeviceSession(session, server) {
+  const ownerId = decodeJwtSub(session.accessToken);
+  if (!ownerId) return { skipped: true, reason: "auth_invalid" };
+  const { res, data } = await fetchJson(`${server}/functions/tokentracker-cloud-session`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "x-tokentracker-local-auth": session.localToken,
+      Authorization: `Bearer ${session.accessToken}`,
+    },
+    body: JSON.stringify({ expectedOwnerId: ownerId, insforgeBaseUrl: session.baseUrl }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!res.ok || !data?.session_id) return { skipped: true, reason: data?.code || `HTTP ${res.status}` };
+  return { skipped: false, sessionId: data.session_id, ownerId };
+}
+
+async function runLocalCloudSync({ server, session, log }) {
+  const bridge = await bridgeDeviceSession(session, server);
+  if (bridge.skipped) {
+    const notActive = ["cloud_machine_paused", "cloud_machine_limit", "auth_rejected"].includes(bridge.reason);
+    log(notActive
+      ? `云同步跳过：本机当前不是活跃设备（${bridge.reason}）`
+      : `云同步跳过：${bridge.reason}`);
+    return;
+  }
+  const { res, data } = await fetchJson(`${server}/functions/tokentracker-local-sync`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "x-tokentracker-local-auth": session.localToken,
+    },
+    body: JSON.stringify({
+      cloudSessionId: bridge.sessionId,
+      expectedOwnerId: bridge.ownerId,
+      insforgeBaseUrl: session.baseUrl,
+      drain: true,
+      auto: true,
+    }),
+    signal: AbortSignal.timeout(240_000),
+  });
+  if (!res.ok) {
+    const code = data?.code || `HTTP ${res.status}`;
+    if (res.status === 429) {
+      log(`云同步受限：今日额度已用完${data?.next_allowed_at ? `，next_allowed_at=${data.next_allowed_at}` : ""}`);
+      return;
+    }
+    if (["auth_session_changed", "auth_session_required", "CLOUD_SYNC_DISABLED"].includes(code)) {
+      log(`云同步跳过：${code}`);
+      return;
+    }
+    throw new Error(`local-sync 失败: ${code}`);
+  }
+  log(`云同步完成：uploaded=${data?.uploaded === true} pending=${data?.pending === true}${data?.next_allowed_at ? ` next_allowed_at=${data.next_allowed_at}` : ""}`);
+}
+
+// 上传失败不应影响已经完成的槽位轮换，只记录并在下一次任务重试。
+async function syncAfterRotation(args, session, log) {
+  if (!args.sync || args.dryRun) return;
+  try {
+    await runLocalCloudSync({ server: args.server, session, log });
+  } catch (error) {
+    log(`云同步失败：${error.message}`);
+  }
 }
 
 async function billingRequest(session, action, { method = "GET", body } = {}) {
@@ -230,6 +319,7 @@ async function main() {
     const machines = Array.isArray(listing?.machines) ? listing.machines : [];
     if (machines.length < 2) {
       log(`仅注册了 ${machines.length} 台设备，无需轮换`);
+      await syncAfterRotation(args, session, log);
       return;
     }
 
@@ -248,6 +338,7 @@ async function main() {
       log(`本地 ${localDateKey()}（${dayOfMonth} 号）为${isOddDay ? "奇" : "偶"}数日，目标设备: ${target.name || target.machine_id}`);
       if (activeNow.length === 1 && activeNow[0].machine_id === target.machine_id) {
         log("当前活跃设备已是目标设备，无需切换");
+        await syncAfterRotation(args, session, log);
         return;
       }
       if (args.dryRun) {
@@ -292,6 +383,7 @@ async function main() {
         lastAppliedDate: localDateKey(),
         lastActiveMachineId: target.machine_id,
       });
+      await syncAfterRotation(args, session, log);
       return;
     }
 
@@ -314,11 +406,13 @@ async function main() {
     const due = args.force || !state || now >= dueAt;
     if (!due) {
       log(`未到轮换时间：每 ${everyDays} 天一次，下次 ${formatTime(new Date(dueAt).toISOString())}`);
+      await syncAfterRotation(args, session, log);
       return;
     }
 
     if (!nextId || nextId === previousActiveId) {
       log("目标设备与当前活跃设备相同，跳过");
+      await syncAfterRotation(args, session, log);
       return;
     }
 
@@ -365,6 +459,7 @@ async function main() {
     };
     writeState(statePath, nextState);
     log(`下次轮换时间：${formatTime(new Date(now + everyDays * DAY_MS).toISOString())}（每 ${everyDays} 天）`);
+    await syncAfterRotation(args, session, log);
   } finally {
     try { fs.closeSync(lockFd); } catch { /* 已关闭 */ }
     try { fs.unlinkSync(lockPath); } catch { /* 锁文件可能已不存在 */ }

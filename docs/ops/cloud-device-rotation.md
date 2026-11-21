@@ -86,7 +86,11 @@ Set env = sh.Environment("PROCESS")
 If env.Item("NODE_OPTIONS") <> "" Then
   env.Item("NODE_OPTIONS") = Replace(env.Item("NODE_OPTIONS"), "\", "/")
 End If
-rc = sh.Run("""C:\CommonTools\scoop\apps\nodejs\current\node.exe"" ""D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" --parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 --parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235", 0, True)
+rc = sh.Run( _
+  """C:\CommonTools\scoop\apps\nodejs\current\node.exe"" " & _
+  """D:\workspace\TokenTracker\scripts\rotate-cloud-devices.cjs"" " & _
+  "--parity-even ef3e91d5-0440-4305-903d-f1a595e422b6 " & _
+  "--parity-odd dd8ced79-08cd-4772-8709-1b5aa4b1c235", 0, True)
 WScript.Quit rc
 ```
 
@@ -140,7 +144,12 @@ node scripts/rotate-cloud-devices.cjs `
 已暂停设备 <另一台>          # 需要切换时才会出现
 已恢复设备 <目标设备>
 校验：目标状态=active，活跃设备数=1
+云同步完成：uploaded=true pending=false next_allowed_at=...   # 本机为活跃设备时
+云同步跳过：本机当前不是活跃设备（cloud_machine_paused）      # 本机被暂停时
 ```
+
+轮换完成后默认会触发一次本机云上传（`--sync`，可用 `--no-sync` 关闭）：
+本机是活跃设备时才会上传；被暂停的机器会打印跳过原因并正常退出，轮换本身不受影响。
 
 再验证计划任务：
 
@@ -155,6 +164,8 @@ Get-ScheduledTaskInfo -TaskName "tokentracker-device-rotate" | Select-Object Nex
 - 日志文件：`%USERPROFILE%\.tokentracker\tracker\cloud-device-rotation.log`
 - 并发锁：`cloud-device-rotation.json.lock`（正常情况下运行结束即删除）
 - 手动 dry-run / 强制切换：直接运行第 4 / 7 节命令
+- 只轮换不上传：命令追加 `--no-sync`
+- 每台机器都要部署本任务：奇数日由 QI-SHAO-L 上传，偶数日由 Thunderobot 上传；被暂停的机器会跳过上传
 - 停用轮换：`Unregister-ScheduledTask -TaskName "tokentracker-device-rotate" -Confirm:$false`
 - 恢复设备槽位：dashboard「设置 → 云服务 → 云端设备」里点「恢复 / 暂停」
 
